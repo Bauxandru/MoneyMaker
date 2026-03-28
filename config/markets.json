@@ -1,0 +1,22 @@
+{
+  "autoPairs": [
+    {
+      "idPrefix": "fed_mar_2026",
+      "polymarketEventSlug": "fed-decision-in-march-885",
+      "kalshiEventTicker": "KXFEDDECISION-26MAR"
+    }
+  ],
+  "pairs": [
+    {
+      "id": "polymarket_will-george-santos-attend-the-2026-state-of-the-union-address__kalshi_KXATTENDSOTU-GSAN",
+      "polymarket": {
+        "marketSlug": "will-george-santos-attend-the-2026-state-of-the-union-address"
+      },
+      "kalshi": {
+        "ticker": "KXATTENDSOTU-GSAN",
+        "side": "YES"
+      },
+      "notes": "Manual focus trade pair for SOTU George Santos"
+    }
+  ]
+}

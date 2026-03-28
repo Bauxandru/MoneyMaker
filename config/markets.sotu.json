@@ -1,0 +1,458 @@
+{
+    "autoPairs":  [
+
+                  ],
+    "pairs":  [
+                  {
+                      "id":  "polymarket_will-alexandria-ocasio-cortez-attend-the-2026-state-of-the-union-address__kalshi_KXATTENDSOTU-AOC",
+                      "polymarket":  {
+                                         "marketSlug":  "will-alexandria-ocasio-cortez-attend-the-2026-state-of-the-union-address"
+                                     },
+                      "kalshi":  {
+                                     "ticker":  "KXATTENDSOTU-AOC",
+                                     "side":  "YES"
+                                 },
+                      "notes":  "SOTU attendee pair"
+                  },
+                  {
+                      "id":  "polymarket_will-al-green-attend-the-2026-state-of-the-union-address__kalshi_KXATTENDSOTU-AGRE",
+                      "polymarket":  {
+                                         "marketSlug":  "will-al-green-attend-the-2026-state-of-the-union-address"
+                                     },
+                      "kalshi":  {
+                                     "ticker":  "KXATTENDSOTU-AGRE",
+                                     "side":  "YES"
+                                 },
+                      "notes":  "SOTU attendee pair"
+                  },
+                  {
+                      "id":  "polymarket_will-amy-coney-barrett-attend-the-2026-state-of-the-union-address__kalshi_KXATTENDSOTU-ACB",
+                      "polymarket":  {
+                                         "marketSlug":  "will-amy-coney-barrett-attend-the-2026-state-of-the-union-address"
+                                     },
+                      "kalshi":  {
+                                     "ticker":  "KXATTENDSOTU-ACB",
+                                     "side":  "YES"
+                                 },
+                      "notes":  "SOTU attendee pair"
+                  },
+                  {
+                      "id":  "polymarket_will-anthony-kennedy-attend-the-2026-state-of-the-union-address__kalshi_KXATTENDSOTU-AKEN",
+                      "polymarket":  {
+                                         "marketSlug":  "will-anthony-kennedy-attend-the-2026-state-of-the-union-address"
+                                     },
+                      "kalshi":  {
+                                     "ticker":  "KXATTENDSOTU-AKEN",
+                                     "side":  "YES"
+                                 },
+                      "notes":  "SOTU attendee pair"
+                  },
+                  {
+                      "id":  "polymarket_will-barron-trump-attend-the-2026-state-of-the-union-address__kalshi_KXATTENDSOTU-BTRU",
+                      "polymarket":  {
+                                         "marketSlug":  "will-barron-trump-attend-the-2026-state-of-the-union-address"
+                                     },
+                      "kalshi":  {
+                                     "ticker":  "KXATTENDSOTU-BTRU",
+                                     "side":  "YES"
+                                 },
+                      "notes":  "SOTU attendee pair"
+                  },
+                  {
+                      "id":  "polymarket_will-benjamin-netanyahu-attend-the-2026-state-of-the-union-address__kalshi_KXATTENDSOTU-BNET",
+                      "polymarket":  {
+                                         "marketSlug":  "will-benjamin-netanyahu-attend-the-2026-state-of-the-union-address"
+                                     },
+                      "kalshi":  {
+                                     "ticker":  "KXATTENDSOTU-BNET",
+                                     "side":  "YES"
+                                 },
+                      "notes":  "SOTU attendee pair"
+                  },
+                  {
+                      "id":  "polymarket_will-brilyn-hollyhand-attend-the-2026-state-of-the-union-address__kalshi_KXATTENDSOTU-BHOL",
+                      "polymarket":  {
+                                         "marketSlug":  "will-brilyn-hollyhand-attend-the-2026-state-of-the-union-address"
+                                     },
+                      "kalshi":  {
+                                     "ticker":  "KXATTENDSOTU-BHOL",
+                                     "side":  "YES"
+                                 },
+                      "notes":  "SOTU attendee pair"
+                  },
+                  {
+                      "id":  "polymarket_will-brooke-rollins-attend-the-2026-state-of-the-union-address__kalshi_KXATTENDSOTU-BROL",
+                      "polymarket":  {
+                                         "marketSlug":  "will-brooke-rollins-attend-the-2026-state-of-the-union-address"
+                                     },
+                      "kalshi":  {
+                                     "ticker":  "KXATTENDSOTU-BROL",
+                                     "side":  "YES"
+                                 },
+                      "notes":  "SOTU attendee pair"
+                  },
+                  {
+                      "id":  "polymarket_will-chris-murphy-attend-the-2026-state-of-the-union-address__kalshi_KXATTENDSOTU-CMUR",
+                      "polymarket":  {
+                                         "marketSlug":  "will-chris-murphy-attend-the-2026-state-of-the-union-address"
+                                     },
+                      "kalshi":  {
+                                     "ticker":  "KXATTENDSOTU-CMUR",
+                                     "side":  "YES"
+                                 },
+                      "notes":  "SOTU attendee pair"
+                  },
+                  {
+                      "id":  "polymarket_will-chris-wright-attend-the-2026-state-of-the-union-address__kalshi_KXATTENDSOTU-CWRI",
+                      "polymarket":  {
+                                         "marketSlug":  "will-chris-wright-attend-the-2026-state-of-the-union-address"
+                                     },
+                      "kalshi":  {
+                                     "ticker":  "KXATTENDSOTU-CWRI",
+                                     "side":  "YES"
+                                 },
+                      "notes":  "SOTU attendee pair"
+                  },
+                  {
+                      "id":  "polymarket_will-dana-white-attend-the-2026-state-of-the-union-address__kalshi_KXATTENDSOTU-DWHI",
+                      "polymarket":  {
+                                         "marketSlug":  "will-dana-white-attend-the-2026-state-of-the-union-address"
+                                     },
+                      "kalshi":  {
+                                     "ticker":  "KXATTENDSOTU-DWHI",
+                                     "side":  "YES"
+                                 },
+                      "notes":  "SOTU attendee pair"
+                  },
+                  {
+                      "id":  "polymarket_will-david-ellison-attend-the-2026-state-of-the-union-address__kalshi_KXATTENDSOTU-DELL",
+                      "polymarket":  {
+                                         "marketSlug":  "will-david-ellison-attend-the-2026-state-of-the-union-address"
+                                     },
+                      "kalshi":  {
+                                     "ticker":  "KXATTENDSOTU-DELL",
+                                     "side":  "YES"
+                                 },
+                      "notes":  "SOTU attendee pair"
+                  },
+                  {
+                      "id":  "polymarket_will-delcy-rodriguez-attend-the-2026-state-of-the-union-address__kalshi_KXATTENDSOTU-DROD",
+                      "polymarket":  {
+                                         "marketSlug":  "will-delcy-rodriguez-attend-the-2026-state-of-the-union-address"
+                                     },
+                      "kalshi":  {
+                                     "ticker":  "KXATTENDSOTU-DROD",
+                                     "side":  "YES"
+                                 },
+                      "notes":  "SOTU attendee pair"
+                  },
+                  {
+                      "id":  "polymarket_will-doug-burgum-attend-the-2026-state-of-the-union-address__kalshi_KXATTENDSOTU-DBUR",
+                      "polymarket":  {
+                                         "marketSlug":  "will-doug-burgum-attend-the-2026-state-of-the-union-address"
+                                     },
+                      "kalshi":  {
+                                     "ticker":  "KXATTENDSOTU-DBUR",
+                                     "side":  "YES"
+                                 },
+                      "notes":  "SOTU attendee pair"
+                  },
+                  {
+                      "id":  "polymarket_will-elon-musk-attend-the-2026-state-of-the-union-address__kalshi_KXATTENDSOTU-EMUS",
+                      "polymarket":  {
+                                         "marketSlug":  "will-elon-musk-attend-the-2026-state-of-the-union-address"
+                                     },
+                      "kalshi":  {
+                                     "ticker":  "KXATTENDSOTU-EMUS",
+                                     "side":  "YES"
+                                 },
+                      "notes":  "SOTU attendee pair"
+                  },
+                  {
+                      "id":  "polymarket_will-erika-kirk-attend-the-2026-state-of-the-union-address__kalshi_KXATTENDSOTU-EKIR",
+                      "polymarket":  {
+                                         "marketSlug":  "will-erika-kirk-attend-the-2026-state-of-the-union-address"
+                                     },
+                      "kalshi":  {
+                                     "ticker":  "KXATTENDSOTU-EKIR",
+                                     "side":  "YES"
+                                 },
+                      "notes":  "SOTU attendee pair"
+                  },
+                  {
+                      "id":  "polymarket_will-gavin-newsom-attend-the-2026-state-of-the-union-address__kalshi_KXATTENDSOTU-GNEW",
+                      "polymarket":  {
+                                         "marketSlug":  "will-gavin-newsom-attend-the-2026-state-of-the-union-address"
+                                     },
+                      "kalshi":  {
+                                     "ticker":  "KXATTENDSOTU-GNEW",
+                                     "side":  "YES"
+                                 },
+                      "notes":  "SOTU attendee pair"
+                  },
+                  {
+                      "id":  "polymarket_will-george-santos-attend-the-2026-state-of-the-union-address__kalshi_KXATTENDSOTU-GSAN",
+                      "polymarket":  {
+                                         "marketSlug":  "will-george-santos-attend-the-2026-state-of-the-union-address"
+                                     },
+                      "kalshi":  {
+                                     "ticker":  "KXATTENDSOTU-GSAN",
+                                     "side":  "YES"
+                                 },
+                      "notes":  "SOTU attendee pair"
+                  },
+                  {
+                      "id":  "polymarket_will-gianni-infantino-attend-the-2026-state-of-the-union-address__kalshi_KXATTENDSOTU-GINF",
+                      "polymarket":  {
+                                         "marketSlug":  "will-gianni-infantino-attend-the-2026-state-of-the-union-address"
+                                     },
+                      "kalshi":  {
+                                     "ticker":  "KXATTENDSOTU-GINF",
+                                     "side":  "YES"
+                                 },
+                      "notes":  "SOTU attendee pair"
+                  },
+                  {
+                      "id":  "polymarket_will-ilhan-omar-attend-the-2026-state-of-the-union-address__kalshi_KXATTENDSOTU-IOMA",
+                      "polymarket":  {
+                                         "marketSlug":  "will-ilhan-omar-attend-the-2026-state-of-the-union-address"
+                                     },
+                      "kalshi":  {
+                                     "ticker":  "KXATTENDSOTU-IOMA",
+                                     "side":  "YES"
+                                 },
+                      "notes":  "SOTU attendee pair"
+                  },
+                  {
+                      "id":  "polymarket_will-ivanka-trump-attend-the-2026-state-of-the-union-address__kalshi_KXATTENDSOTU-ITRU",
+                      "polymarket":  {
+                                         "marketSlug":  "will-ivanka-trump-attend-the-2026-state-of-the-union-address"
+                                     },
+                      "kalshi":  {
+                                     "ticker":  "KXATTENDSOTU-ITRU",
+                                     "side":  "YES"
+                                 },
+                      "notes":  "SOTU attendee pair"
+                  },
+                  {
+                      "id":  "polymarket_will-jared-kushner-attend-the-2026-state-of-the-union-address__kalshi_KXATTENDSOTU-JKUS",
+                      "polymarket":  {
+                                         "marketSlug":  "will-jared-kushner-attend-the-2026-state-of-the-union-address"
+                                     },
+                      "kalshi":  {
+                                     "ticker":  "KXATTENDSOTU-JKUS",
+                                     "side":  "YES"
+                                 },
+                      "notes":  "SOTU attendee pair"
+                  },
+                  {
+                      "id":  "polymarket_will-jensen-huang-attend-the-2026-state-of-the-union-address__kalshi_KXATTENDSOTU-JHUA",
+                      "polymarket":  {
+                                         "marketSlug":  "will-jensen-huang-attend-the-2026-state-of-the-union-address"
+                                     },
+                      "kalshi":  {
+                                     "ticker":  "KXATTENDSOTU-JHUA",
+                                     "side":  "YES"
+                                 },
+                      "notes":  "SOTU attendee pair"
+                  },
+                  {
+                      "id":  "polymarket_will-john-fetterman-attend-the-2026-state-of-the-union-address__kalshi_KXATTENDSOTU-JFET",
+                      "polymarket":  {
+                                         "marketSlug":  "will-john-fetterman-attend-the-2026-state-of-the-union-address"
+                                     },
+                      "kalshi":  {
+                                     "ticker":  "KXATTENDSOTU-JFET",
+                                     "side":  "YES"
+                                 },
+                      "notes":  "SOTU attendee pair"
+                  },
+                  {
+                      "id":  "polymarket_will-jon-ossoff-attend-the-2026-state-of-the-union-address__kalshi_KXATTENDSOTU-JOSS",
+                      "polymarket":  {
+                                         "marketSlug":  "will-jon-ossoff-attend-the-2026-state-of-the-union-address"
+                                     },
+                      "kalshi":  {
+                                     "ticker":  "KXATTENDSOTU-JOSS",
+                                     "side":  "YES"
+                                 },
+                      "notes":  "SOTU attendee pair"
+                  },
+                  {
+                      "id":  "polymarket_will-judy-shelton-attend-the-2026-state-of-the-union-address__kalshi_KXATTENDSOTU-JSHE",
+                      "polymarket":  {
+                                         "marketSlug":  "will-judy-shelton-attend-the-2026-state-of-the-union-address"
+                                     },
+                      "kalshi":  {
+                                     "ticker":  "KXATTENDSOTU-JSHE",
+                                     "side":  "YES"
+                                 },
+                      "notes":  "SOTU attendee pair"
+                  },
+                  {
+                      "id":  "polymarket_will-kash-patel-attend-the-2026-state-of-the-union-address__kalshi_KXATTENDSOTU-KPAT",
+                      "polymarket":  {
+                                         "marketSlug":  "will-kash-patel-attend-the-2026-state-of-the-union-address"
+                                     },
+                      "kalshi":  {
+                                     "ticker":  "KXATTENDSOTU-KPAT",
+                                     "side":  "YES"
+                                 },
+                      "notes":  "SOTU attendee pair"
+                  },
+                  {
+                      "id":  "polymarket_will-ketanji-brown-jackson-attend-the-2026-state-of-the-union-address__kalshi_KXATTENDSOTU-KBJ",
+                      "polymarket":  {
+                                         "marketSlug":  "will-ketanji-brown-jackson-attend-the-2026-state-of-the-union-address"
+                                     },
+                      "kalshi":  {
+                                     "ticker":  "KXATTENDSOTU-KBJ",
+                                     "side":  "YES"
+                                 },
+                      "notes":  "SOTU attendee pair"
+                  },
+                  {
+                      "id":  "polymarket_will-kevin-warsh-attend-the-2026-state-of-the-union-address__kalshi_KXATTENDSOTU-KWAR",
+                      "polymarket":  {
+                                         "marketSlug":  "will-kevin-warsh-attend-the-2026-state-of-the-union-address"
+                                     },
+                      "kalshi":  {
+                                     "ticker":  "KXATTENDSOTU-KWAR",
+                                     "side":  "YES"
+                                 },
+                      "notes":  "SOTU attendee pair"
+                  },
+                  {
+                      "id":  "polymarket_will-kristi-noem-attend-the-2026-state-of-the-union-address__kalshi_KXATTENDSOTU-KNOE",
+                      "polymarket":  {
+                                         "marketSlug":  "will-kristi-noem-attend-the-2026-state-of-the-union-address"
+                                     },
+                      "kalshi":  {
+                                     "ticker":  "KXATTENDSOTU-KNOE",
+                                     "side":  "YES"
+                                 },
+                      "notes":  "SOTU attendee pair"
+                  },
+                  {
+                      "id":  "polymarket_will-mara-corina-machado-attend-the-2026-state-of-the-union-address__kalshi_KXATTENDSOTU-MCM",
+                      "polymarket":  {
+                                         "marketSlug":  "will-mara-corina-machado-attend-the-2026-state-of-the-union-address"
+                                     },
+                      "kalshi":  {
+                                     "ticker":  "KXATTENDSOTU-MCM",
+                                     "side":  "YES"
+                                 },
+                      "notes":  "SOTU attendee pair"
+                  },
+                  {
+                      "id":  "polymarket_will-mitch-mcconnell-attend-the-2026-state-of-the-union-address__kalshi_KXATTENDSOTU-MMCC",
+                      "polymarket":  {
+                                         "marketSlug":  "will-mitch-mcconnell-attend-the-2026-state-of-the-union-address"
+                                     },
+                      "kalshi":  {
+                                     "ticker":  "KXATTENDSOTU-MMCC",
+                                     "side":  "YES"
+                                 },
+                      "notes":  "SOTU attendee pair"
+                  },
+                  {
+                      "id":  "polymarket_will-nancy-pelosi-attend-the-2026-state-of-the-union-address__kalshi_KXATTENDSOTU-NPEL",
+                      "polymarket":  {
+                                         "marketSlug":  "will-nancy-pelosi-attend-the-2026-state-of-the-union-address"
+                                     },
+                      "kalshi":  {
+                                     "ticker":  "KXATTENDSOTU-NPEL",
+                                     "side":  "YES"
+                                 },
+                      "notes":  "SOTU attendee pair"
+                  },
+                  {
+                      "id":  "polymarket_will-neil-gorsuch-attend-the-2026-state-of-the-union-address__kalshi_KXATTENDSOTU-NGOR",
+                      "polymarket":  {
+                                         "marketSlug":  "will-neil-gorsuch-attend-the-2026-state-of-the-union-address"
+                                     },
+                      "kalshi":  {
+                                     "ticker":  "KXATTENDSOTU-NGOR",
+                                     "side":  "YES"
+                                 },
+                      "notes":  "SOTU attendee pair"
+                  },
+                  {
+                      "id":  "polymarket_will-nicki-minaj-attend-the-2026-state-of-the-union-address__kalshi_KXATTENDSOTU-NMIN",
+                      "polymarket":  {
+                                         "marketSlug":  "will-nicki-minaj-attend-the-2026-state-of-the-union-address"
+                                     },
+                      "kalshi":  {
+                                     "ticker":  "KXATTENDSOTU-NMIN",
+                                     "side":  "YES"
+                                 },
+                      "notes":  "SOTU attendee pair"
+                  },
+                  {
+                      "id":  "polymarket_will-nick-shirley-attend-the-2026-state-of-the-union-address__kalshi_KXATTENDSOTU-NSHI",
+                      "polymarket":  {
+                                         "marketSlug":  "will-nick-shirley-attend-the-2026-state-of-the-union-address"
+                                     },
+                      "kalshi":  {
+                                     "ticker":  "KXATTENDSOTU-NSHI",
+                                     "side":  "YES"
+                                 },
+                      "notes":  "SOTU attendee pair"
+                  },
+                  {
+                      "id":  "polymarket_will-pete-hegseth-attend-the-2026-state-of-the-union-address__kalshi_KXATTENDSOTU-PHEG",
+                      "polymarket":  {
+                                         "marketSlug":  "will-pete-hegseth-attend-the-2026-state-of-the-union-address"
+                                     },
+                      "kalshi":  {
+                                     "ticker":  "KXATTENDSOTU-PHEG",
+                                     "side":  "YES"
+                                 },
+                      "notes":  "SOTU attendee pair"
+                  },
+                  {
+                      "id":  "polymarket_will-scott-bessent-attend-the-2026-state-of-the-union-address__kalshi_KXATTENDSOTU-SBES",
+                      "polymarket":  {
+                                         "marketSlug":  "will-scott-bessent-attend-the-2026-state-of-the-union-address"
+                                     },
+                      "kalshi":  {
+                                     "ticker":  "KXATTENDSOTU-SBES",
+                                     "side":  "YES"
+                                 },
+                      "notes":  "SOTU attendee pair"
+                  },
+                  {
+                      "id":  "polymarket_will-susan-collins-attend-the-2026-state-of-the-union-address__kalshi_KXATTENDSOTU-SCOL",
+                      "polymarket":  {
+                                         "marketSlug":  "will-susan-collins-attend-the-2026-state-of-the-union-address"
+                                     },
+                      "kalshi":  {
+                                     "ticker":  "KXATTENDSOTU-SCOL",
+                                     "side":  "YES"
+                                 },
+                      "notes":  "SOTU attendee pair"
+                  },
+                  {
+                      "id":  "polymarket_will-tucker-carlson-attend-the-2026-state-of-the-union-address__kalshi_KXATTENDSOTU-TCAR",
+                      "polymarket":  {
+                                         "marketSlug":  "will-tucker-carlson-attend-the-2026-state-of-the-union-address"
+                                     },
+                      "kalshi":  {
+                                     "ticker":  "KXATTENDSOTU-TCAR",
+                                     "side":  "YES"
+                                 },
+                      "notes":  "SOTU attendee pair"
+                  },
+                  {
+                      "id":  "polymarket_will-viktor-orbn-attend-the-2026-state-of-the-union-address__kalshi_KXATTENDSOTU-VORB",
+                      "polymarket":  {
+                                         "marketSlug":  "will-viktor-orbn-attend-the-2026-state-of-the-union-address"
+                                     },
+                      "kalshi":  {
+                                     "ticker":  "KXATTENDSOTU-VORB",
+                                     "side":  "YES"
+                                 },
+                      "notes":  "SOTU attendee pair"
+                  }
+              ]
+}

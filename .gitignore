@@ -1,0 +1,27 @@
+node_modules/
+dist/
+
+# Secrets — never push these
+.env
+.env.*
+secrets/
+settings.csv
+certs/
+
+# Runtime data
+data/
+discovery_cache.json
+
+# Temp / debug / logs
+.tmp/
+logs/
+_NUL
+_check.cjs
+_debug.cjs
+_debug.js
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.vscode/
+*.swp

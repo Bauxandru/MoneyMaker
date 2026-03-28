@@ -1,0 +1,105 @@
+# ============================================
+# Arb Bot Settings
+# ============================================
+# 1. Copy this file and rename it to "settings.csv" (same folder as arb-bot.exe)
+# 2. Fill in your values below
+# 3. Place your kalshi_key.pem file in the same folder
+# 4. Install Tailscale (https://tailscale.com/download) and log in
+# 5. Run arb-bot.exe
+#
+# Format: SETTING,value  (no spaces around the comma)
+# Lines starting with # are comments.
+#
+# =============================================
+# LICENSE (you will receive these from the admin)
+# =============================================
+# LICENSE_TOKEN  — Your unique token. The admin will give this to you.
+# LICENSE_SERVER — The admin's license server address (Tailscale IP).
+# DASHBOARD_PUSH_URL — The admin's dashboard address (Tailscale IP).
+#
+LICENSE_TOKEN,your-token-here
+LICENSE_SERVER,http://100.x.x.x:3457
+DASHBOARD_PUSH_URL,http://100.x.x.x:3456
+#
+# =============================================
+# KALSHI CREDENTIALS
+# =============================================
+# 1. Create an account at https://kalshi.com
+# 2. Go to Settings > API Keys > Create API Key
+# 3. Copy the "API Key ID" below
+# 4. For the private key, choose ONE of these options:
+#
+#    OPTION A (easier): Paste the key content directly below.
+#      Open the .pem file in Notepad, select all, and paste it as one line
+#      replacing every line break with \n
+#      Example: -----BEGIN RSA PRIVATE KEY-----\nMIIE...\nABC...\n-----END RSA PRIVATE KEY-----
+#
+#    OPTION B: Place the .pem file next to arb-bot.exe as "kalshi_key.pem"
+#      and use: KALSHI_PRIVATE_KEY_PATH,./kalshi_key.pem
+#
+KALSHI_API_KEY_ID,your-kalshi-api-key-id
+# Option A: paste key content (one line, \n for line breaks):
+KALSHI_PRIVATE_KEY,-----BEGIN RSA PRIVATE KEY-----\nPASTE-YOUR-KEY-HERE\n-----END RSA PRIVATE KEY-----
+# Option B: or use a file path (delete the line above if using this):
+# KALSHI_PRIVATE_KEY_PATH,./kalshi_key.pem
+#
+# =============================================
+# POLYMARKET CREDENTIALS
+# =============================================
+# 1. Create a Polymarket account at https://polymarket.com
+# 2. Deposit USDC on Polygon into your Polymarket wallet
+# 3. Export your wallet private key from your browser wallet (MetaMask etc.)
+#    - MetaMask: Settings > Security > Reveal Private Key
+#    - Must be the wallet connected to Polymarket
+# 4. For API credentials (API_KEY, API_SECRET, PASSPHRASE):
+#    - These are auto-derived on first run if left empty
+#    - OR get them from https://clob.polymarket.com (API section)
+# 5. POLY_FUNDER is your Polymarket proxy/funder wallet address
+#    - Find it at: https://polymarket.com > Profile > Settings > Wallet
+#    - It's the "Proxy Wallet" or "Trading Address"
+#
+POLY_WALLET_PRIVATE_KEY,0x...your-private-key...
+POLY_API_KEY,
+POLY_API_SECRET,
+POLY_PASSPHRASE,
+POLY_CLOB_URL,https://clob.polymarket.com
+POLY_CHAIN_ID,137
+POLY_RPC_URL,https://polygon-rpc.com
+POLY_SIGNATURE_TYPE,0
+POLY_FUNDER,0x...your-proxy-wallet-address...
+#
+# =============================================
+# TRADING PARAMETERS
+# =============================================
+# DRY_RUN=true means NO real orders (safe testing mode)
+# Set to false ONLY when you're ready to trade with real money!
+#
+# TRADE_USD    — How much $ per trade (each side)
+# MIN_EDGE     — Minimum arbitrage edge to trade (0.02 = 2%)
+# MAX_CONTRACTS — Max contracts per order
+#
+DRY_RUN,true
+TRADE_USD,11
+MIN_EDGE,0.02
+MAX_CONTRACTS,5
+TRADE_COOLDOWN_MS,60000
+POLL_INTERVAL_MS,0
+MIN_DEPTH_MULT,2
+POLY_ORDER_TYPE,FOK
+KALSHI_FEE_RATE,0.07
+PM_FEE_RATE,0
+HEDGE_TARGET,payout
+STRICT_HEDGE,true
+#
+# =============================================
+# ADVANCED (optional — defaults are fine)
+# =============================================
+# KAL_MAKER_MODE  — Use limit orders on Kalshi (slower but saves fees)
+# MAX_HEDGE_POSITIONS — Max simultaneous open hedge positions
+#
+KAL_MAKER_MODE,false
+KAL_MAKER_WAIT_MS,5000
+MAX_CONSECUTIVE_ERRORS,5
+MAX_HEDGE_POSITIONS,8
+LICENSE_REVALIDATE_INTERVAL_MS,900000
+DASHBOARD_PUSH_INTERVAL_MS,300000

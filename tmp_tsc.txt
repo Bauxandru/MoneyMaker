@@ -1,0 +1,74 @@
+node_modules/ethers/lib.commonjs/abi/abi-coder.d.ts(21,5): error TS18028: Private identifiers are only available when targeting ECMAScript 2015 and higher.
+node_modules/ethers/lib.commonjs/abi/coders/abstract-coder.d.ts(14,5): error TS18028: Private identifiers are only available when targeting ECMAScript 2015 and higher.
+node_modules/ethers/lib.commonjs/abi/coders/abstract-coder.d.ts(99,5): error TS18028: Private identifiers are only available when targeting ECMAScript 2015 and higher.
+node_modules/ethers/lib.commonjs/abi/coders/abstract-coder.d.ts(112,5): error TS18028: Private identifiers are only available when targeting ECMAScript 2015 and higher.
+node_modules/ethers/lib.commonjs/abi/fragments.d.ts(109,5): error TS18028: Private identifiers are only available when targeting ECMAScript 2015 and higher.
+node_modules/ethers/lib.commonjs/abi/interface.d.ts(171,5): error TS18028: Private identifiers are only available when targeting ECMAScript 2015 and higher.
+node_modules/ethers/lib.commonjs/abi/typed.d.ts(78,5): error TS18028: Private identifiers are only available when targeting ECMAScript 2015 and higher.
+node_modules/ethers/lib.commonjs/contract/wrappers.d.ts(55,5): error TS18028: Private identifiers are only available when targeting ECMAScript 2015 and higher.
+node_modules/ethers/lib.commonjs/contract/wrappers.d.ts(71,5): error TS18028: Private identifiers are only available when targeting ECMAScript 2015 and higher.
+node_modules/ethers/lib.commonjs/crypto/signature.d.ts(34,5): error TS18028: Private identifiers are only available when targeting ECMAScript 2015 and higher.
+node_modules/ethers/lib.commonjs/crypto/signing-key.d.ts(14,5): error TS18028: Private identifiers are only available when targeting ECMAScript 2015 and higher.
+node_modules/ethers/lib.commonjs/hash/typed-data.d.ts(50,5): error TS18028: Private identifiers are only available when targeting ECMAScript 2015 and higher.
+node_modules/ethers/lib.commonjs/providers/abstract-provider.d.ts(253,5): error TS18028: Private identifiers are only available when targeting ECMAScript 2015 and higher.
+node_modules/ethers/lib.commonjs/providers/abstract-signer.d.ts(53,5): error TS18028: Private identifiers are only available when targeting ECMAScript 2015 and higher.
+node_modules/ethers/lib.commonjs/providers/ens-resolver.d.ts(90,5): error TS18028: Private identifiers are only available when targeting ECMAScript 2015 and higher.
+node_modules/ethers/lib.commonjs/providers/network.d.ts(28,5): error TS18028: Private identifiers are only available when targeting ECMAScript 2015 and higher.
+node_modules/ethers/lib.commonjs/providers/plugins-network.d.ts(130,5): error TS18028: Private identifiers are only available when targeting ECMAScript 2015 and higher.
+node_modules/ethers/lib.commonjs/providers/plugins-network.d.ts(146,5): error TS18028: Private identifiers are only available when targeting ECMAScript 2015 and higher.
+node_modules/ethers/lib.commonjs/providers/provider-browser.d.ts(86,5): error TS18028: Private identifiers are only available when targeting ECMAScript 2015 and higher.
+node_modules/ethers/lib.commonjs/providers/provider-etherscan.d.ts(83,5): error TS18028: Private identifiers are only available when targeting ECMAScript 2015 and higher.
+node_modules/ethers/lib.commonjs/providers/provider-fallback.d.ts(84,5): error TS18028: Private identifiers are only available when targeting ECMAScript 2015 and higher.
+node_modules/ethers/lib.commonjs/providers/provider-ipcsocket.d.ts(12,5): error TS18028: Private identifiers are only available when targeting ECMAScript 2015 and higher.
+node_modules/ethers/lib.commonjs/providers/provider-jsonrpc.d.ts(223,5): error TS18028: Private identifiers are only available when targeting ECMAScript 2015 and higher.
+node_modules/ethers/lib.commonjs/providers/provider-jsonrpc.d.ts(337,5): error TS18028: Private identifiers are only available when targeting ECMAScript 2015 and higher.
+node_modules/ethers/lib.commonjs/providers/provider-jsonrpc.d.ts(355,5): error TS18028: Private identifiers are only available when targeting ECMAScript 2015 and higher.
+node_modules/ethers/lib.commonjs/providers/provider-socket.d.ts(21,5): error TS18028: Private identifiers are only available when targeting ECMAScript 2015 and higher.
+node_modules/ethers/lib.commonjs/providers/provider-socket.d.ts(71,5): error TS18028: Private identifiers are only available when targeting ECMAScript 2015 and higher.
+node_modules/ethers/lib.commonjs/providers/provider-socket.d.ts(88,5): error TS18028: Private identifiers are only available when targeting ECMAScript 2015 and higher.
+node_modules/ethers/lib.commonjs/providers/provider-websocket.d.ts(31,5): error TS18028: Private identifiers are only available when targeting ECMAScript 2015 and higher.
+node_modules/ethers/lib.commonjs/providers/provider.d.ts(304,5): error TS18028: Private identifiers are only available when targeting ECMAScript 2015 and higher.
+node_modules/ethers/lib.commonjs/providers/provider.d.ts(554,5): error TS18028: Private identifiers are only available when targeting ECMAScript 2015 and higher.
+node_modules/ethers/lib.commonjs/providers/provider.d.ts(727,5): error TS18028: Private identifiers are only available when targeting ECMAScript 2015 and higher.
+node_modules/ethers/lib.commonjs/providers/signer-noncemanager.d.ts(11,5): error TS18028: Private identifiers are only available when targeting ECMAScript 2015 and higher.
+node_modules/ethers/lib.commonjs/transaction/transaction.d.ts(177,5): error TS18028: Private identifiers are only available when targeting ECMAScript 2015 and higher.
+node_modules/ethers/lib.commonjs/utils/events.d.ts(58,5): error TS18028: Private identifiers are only available when targeting ECMAScript 2015 and higher.
+node_modules/ethers/lib.commonjs/utils/fetch.d.ts(45,5): error TS18028: Private identifiers are only available when targeting ECMAScript 2015 and higher.
+node_modules/ethers/lib.commonjs/utils/fetch.d.ts(66,5): error TS18028: Private identifiers are only available when targeting ECMAScript 2015 and higher.
+node_modules/ethers/lib.commonjs/utils/fetch.d.ts(294,5): error TS18028: Private identifiers are only available when targeting ECMAScript 2015 and higher.
+node_modules/ethers/lib.commonjs/utils/fixednumber.d.ts(63,5): error TS18028: Private identifiers are only available when targeting ECMAScript 2015 and higher.
+node_modules/ethers/lib.commonjs/wallet/base-wallet.d.ts(18,5): error TS18028: Private identifiers are only available when targeting ECMAScript 2015 and higher.
+node_modules/ethers/lib.commonjs/wallet/hdwallet.d.ts(27,5): error TS18028: Private identifiers are only available when targeting ECMAScript 2015 and higher.
+node_modules/ethers/lib.commonjs/wallet/wallet.d.ts(17,5): error TS18028: Private identifiers are only available when targeting ECMAScript 2015 and higher.
+node_modules/ethers/lib.commonjs/wordlists/wordlist-owl.d.ts(15,5): error TS18028: Private identifiers are only available when targeting ECMAScript 2015 and higher.
+node_modules/ethers/lib.commonjs/wordlists/wordlist-owla.d.ts(15,5): error TS18028: Private identifiers are only available when targeting ECMAScript 2015 and higher.
+src/kalshiTrade.ts(1,8): error TS1192: Module '"crypto"' has no default export.
+src/kalshiTrade.ts(2,8): error TS1192: Module '"fs"' has no default export.
+src/tradeTennis.ts(47,8): error TS1192: Module '"C:/Users/Zighy/Desktop/mIHAI/Polymarket germania/programu/node_modules/dotenv/lib/main"' has no default export.
+src/tradeTennis.ts(48,8): error TS1192: Module '"fs"' has no default export.
+src/tradeTennis.ts(49,8): error TS1259: Module '"path"' can only be default-imported using the 'esModuleInterop' flag
+src/tradeTennis.ts(701,14): error TS1252: Function declarations are not allowed inside blocks in strict mode when targeting 'ES5'. Modules are automatically in strict mode.
+src/tradeTennis.ts(968,30): error TS2802: Type 'Set<string>' can only be iterated through when using the '--downlevelIteration' flag or with a '--target' of 'es2015' or higher.
+src/tradeTennis.ts(1009,32): error TS2802: Type 'Set<string>' can only be iterated through when using the '--downlevelIteration' flag or with a '--target' of 'es2015' or higher.
+src/tradeTennis.ts(1157,14): error TS1252: Function declarations are not allowed inside blocks in strict mode when targeting 'ES5'. Modules are automatically in strict mode.
+src/tradeTennis.ts(1230,24): error TS2802: Type 'Set<string>' can only be iterated through when using the '--downlevelIteration' flag or with a '--target' of 'es2015' or higher.
+src/tradeTennis.ts(1645,27): error TS2802: Type 'MapIterator<[string, HedgeOrder]>' can only be iterated through when using the '--downlevelIteration' flag or with a '--target' of 'es2015' or higher.
+src/tradeTennis.ts(2197,31): error TS2802: Type 'Map<string, { yesCount: number; noCount: number; avgPriceCents: number; }>' can only be iterated through when using the '--downlevelIteration' flag or with a '--target' of 'es2015' or higher.
+src/tradeTennis.ts(3204,27): error TS2802: Type 'Map<string, HedgeOrder>' can only be iterated through when using the '--downlevelIteration' flag or with a '--target' of 'es2015' or higher.
+src/tradeTennis.ts(3279,31): error TS2802: Type 'Map<string, HedgeOrder>' can only be iterated through when using the '--downlevelIteration' flag or with a '--target' of 'es2015' or higher.
+src/tradeTennis.ts(3365,33): error TS2802: Type 'Map<string, HedgeOrder>' can only be iterated through when using the '--downlevelIteration' flag or with a '--target' of 'es2015' or higher.
+src/tradeTennis.ts(3384,27): error TS2802: Type 'Map<string, HedgeOrder>' can only be iterated through when using the '--downlevelIteration' flag or with a '--target' of 'es2015' or higher.
+src/tradeTennis.ts(3426,37): error TS2802: Type 'Map<string, HedgeOrder>' can only be iterated through when using the '--downlevelIteration' flag or with a '--target' of 'es2015' or higher.
+src/tradeTennis.ts(3430,37): error TS2802: Type 'Map<string, HedgeOrder>' can only be iterated through when using the '--downlevelIteration' flag or with a '--target' of 'es2015' or higher.
+src/tradeTennis.ts(3579,34): error TS2802: Type 'MapIterator<[string, HedgeOrder]>' can only be iterated through when using the '--downlevelIteration' flag or with a '--target' of 'es2015' or higher.
+src/tradeTennis.ts(3605,32): error TS2802: Type 'MapIterator<HedgeOrder>' can only be iterated through when using the '--downlevelIteration' flag or with a '--target' of 'es2015' or higher.
+src/tradeTennis.ts(3650,47): error TS2802: Type 'Map<string, HedgeOrder>' can only be iterated through when using the '--downlevelIteration' flag or with a '--target' of 'es2015' or higher.
+src/tradeTennis.ts(3700,47): error TS2802: Type 'Map<string, HedgeOrder>' can only be iterated through when using the '--downlevelIteration' flag or with a '--target' of 'es2015' or higher.
+src/tradeTennis.ts(3733,29): error TS2802: Type 'MapIterator<HedgeOrder>' can only be iterated through when using the '--downlevelIteration' flag or with a '--target' of 'es2015' or higher.
+src/tradeTennis.ts(3847,36): error TS2802: Type 'MapIterator<[string, HedgeOrder]>' can only be iterated through when using the '--downlevelIteration' flag or with a '--target' of 'es2015' or higher.
+src/tradeTennis.ts(3870,34): error TS2802: Type 'MapIterator<HedgeOrder>' can only be iterated through when using the '--downlevelIteration' flag or with a '--target' of 'es2015' or higher.
+src/tradeTennis.ts(3909,47): error TS2802: Type 'Map<string, HedgeOrder>' can only be iterated through when using the '--downlevelIteration' flag or with a '--target' of 'es2015' or higher.
+src/tradeTennis.ts(3957,47): error TS2802: Type 'Map<string, HedgeOrder>' can only be iterated through when using the '--downlevelIteration' flag or with a '--target' of 'es2015' or higher.
+src/tradeTennis.ts(3987,30): error TS2802: Type 'MapIterator<HedgeOrder>' can only be iterated through when using the '--downlevelIteration' flag or with a '--target' of 'es2015' or higher.
+src/tradeTennis.ts(4156,29): error TS2802: Type 'Map<string, { yesCount: number; noCount: number; avgPriceCents: number; }>' can only be iterated through when using the '--downlevelIteration' flag or with a '--target' of 'es2015' or higher.
+src/tradeTennis.ts(4304,29): error TS2802: Type 'Map<string, HedgeOrder>' can only be iterated through when using the '--downlevelIteration' flag or with a '--target' of 'es2015' or higher.
