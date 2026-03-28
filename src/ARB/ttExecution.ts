@@ -2510,6 +2510,14 @@ export async function monitorLoop(watchlist: WatchEntry[]): Promise<void> {
   while (true) {
     const cycleStart = Date.now();
     cycle++;
+    let _step = "start";
+
+    // Watchdog: log if cycle hangs for >60s
+    const watchdog = setTimeout(() => {
+      console.error(`[WATCHDOG] cycle=${cycle} STUCK at step="${_step}" for >60s!`);
+    }, 60_000);
+
+    try {
 
     // ── MID-SESSION RECOVERY: pick up auto-recovered trades from reconciliation ──
     // reconcilePositions may create "hedging" trades mid-session. Without this,
@@ -2597,6 +2605,7 @@ export async function monitorLoop(watchlist: WatchEntry[]): Promise<void> {
       }
     }
 
+    _step = "hedge-check";
     // ── HEDGE CHECK: process unhedged positions, then CONTINUE to arb scanning ──
     // Hedge orders are GTC — they rest on the book. We only need to:
     //  1) Place orders that aren't placed yet (first cycle after detection)
@@ -2688,6 +2697,7 @@ export async function monitorLoop(watchlist: WatchEntry[]): Promise<void> {
       // Fall through to normal arb scanning — don't block!
     }
 
+    _step = "canc-monitor";
     // ── CANCELLATION MONITOR: detect scalar settlements & emergency-sell PM ──
     // Runs every 60s. Checks Kalshi market status for all open positions.
     // If a market settled as "scalar" (cancelled/voided), immediately sells PM tokens.
@@ -2697,6 +2707,7 @@ export async function monitorLoop(watchlist: WatchEntry[]): Promise<void> {
       console.warn(`[CANC-MON] Monitor error: ${(err as Error).message}`);
     }
 
+    _step = "kal-prices";
     // ── 1. Refresh Kalshi prices: WS primary, REST every 30 cycles (~12s) ──
     // WS gives real-time best ask; REST is only needed for markets without WS data
     // or as a periodic fallback to catch any WS drift.
@@ -2728,6 +2739,7 @@ export async function monitorLoop(watchlist: WatchEntry[]): Promise<void> {
       }
     }
 
+    _step = "pm-prices";
     // ── 2. Fetch PM prices + compute edges ────────────────────────────────
     let bestEdge = -Infinity;
     let bestEntry: WatchEntry | null = null;
@@ -3026,6 +3038,7 @@ export async function monitorLoop(watchlist: WatchEntry[]): Promise<void> {
       }
     }
 
+    _step = "status";
     // ── 3. Status line ─────────────────────────────────────────────────────
     process.stdout.write(
       `\r${ts()} cycle=${cycle}  best=${fmtPct(bestEdge)}` +
@@ -3215,13 +3228,24 @@ export async function monitorLoop(watchlist: WatchEntry[]): Promise<void> {
       } // end circuit breaker / inflight / pm-down checks
     }
 
+    _step = "sleep";
     // ── 5. Wait — yield event loop, then immediately scan again ─────────────
     // With WS feeds, poll cycles are pure Map reads (no API calls).
     // POLL_INTERVAL_MS=0 → max speed; >0 → throttle to save CPU on slower machines.
     const elapsed = Date.now() - cycleStart;
+    if (elapsed > 30_000) {
+      console.warn(`[SLOW CYCLE] cycle=${cycle} took ${(elapsed / 1000).toFixed(1)}s (step=${_step})`);
+    }
     const wait = Math.max(0, POLL_INTERVAL_MS - elapsed);
     if (wait > 0) await sleep(wait);
     else await sleep(0); // yield to event loop even at max speed (process WS messages)
+
+    } catch (cycleErr) {
+      console.error(`[CYCLE ERROR] cycle=${cycle} step=${_step}: ${(cycleErr as Error).message}`);
+      await sleep(2000); // prevent tight error loop
+    } finally {
+      clearTimeout(watchdog);
+    }
   }
 }
 
