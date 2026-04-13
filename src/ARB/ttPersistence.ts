@@ -65,8 +65,12 @@ let _arbTradesCacheTs = 0;
 const ARB_CACHE_TTL = 2000; // 2s -- covers a full poll cycle
 
 // --- Mutex for arb trades read-modify-write cycles --------------------------
-// Prevents concurrent async operations (execution + reconciliation) from
-// interleaving load→modify→save and losing each other's changes.
+// logArbTrade() and resolveArbTrade() are fully synchronous (no awaits between
+// load and save), so they're safe in Node's single-threaded model. However,
+// reconciliation is async (load → await API calls → save) and SHOULD use
+// withArbTrades() to prevent interleaving with execution writes.
+// Callers: reconcilePositions() in ttReconcile.ts should wrap its trade
+// modifications with withArbTrades() for safety.
 let _arbTradesMutexQueue: (() => void)[] = [];
 let _arbTradesMutexLocked = false;
 

@@ -1536,8 +1536,11 @@ export async function executeArb(
           if (totalPmBal >= pmShares) {
             // Count PM shares already claimed by other active/resolved trades for this token
             const existingTrades = loadArbTrades();
+            // Count PM shares claimed by trades that actually filled on PM:
+            // - pmCost > 0: PM leg confirmed filled
+            // - status === "hedging" AND initialExchange === "pm": PM was the initial leg (we hold PM shares)
             const claimedPmShares = existingTrades
-              .filter(t => t.pmTokenId === pmLeg.tokenId && (t.pmCost > 0 || t.status === "hedging"))
+              .filter(t => t.pmTokenId === pmLeg.tokenId && (t.pmCost > 0 || (t.status === "hedging" && t.initialExchange === "pm")))
               .reduce((s, t) => s + t.shares, 0);
             const unclaimedPm = totalPmBal - claimedPmShares;
             if (unclaimedPm >= pmShares) {
