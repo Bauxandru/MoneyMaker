@@ -13,7 +13,7 @@ import { fetchJson } from "./http.js";
 import dotenv from "dotenv";
 dotenv.config();
 
-// ─── ArbTradeRecord (same as tradeTennis.ts) ─────────────────────────────────
+// --- ArbTradeRecord (same as tradeTennis.ts) ---------------------------------
 
 type ArbTradeRecord = {
   id: string;
@@ -40,7 +40,7 @@ type ArbTradeRecord = {
 
 const ARB_LOG_PATH = path.join("data", "arb_trades.json");
 
-// ─── Kalshi auth (exact copy from checkPnL.ts) ──────────────────────────────
+// --- Kalshi auth (exact copy from checkPnL.ts) ------------------------------
 
 function loadPrivateKey(): string {
   if (process.env.KALSHI_PRIVATE_KEY) {
@@ -84,7 +84,7 @@ async function kalshiGet(apiPath: string): Promise<Record<string, unknown>> {
 
 function sleep(ms: number) { return new Promise(r => setTimeout(r, ms)); }
 
-// ─── Helpers (from tradeTennis.ts) ───────────────────────────────────────────
+// --- Helpers (from tradeTennis.ts) -------------------------------------------
 
 const MONTHS: Record<string, string> = {
   JAN: "01", FEB: "02", MAR: "03", APR: "04", MAY: "05", JUN: "06",
@@ -134,18 +134,18 @@ function namesMatch(a: string, b: string): boolean {
   return false;
 }
 
-/** Extract the series ticker from a full ticker, e.g. "KXATPMATCH-26FEB25VACMON-VAC" → "KXATPMATCH" */
+/** Extract the series ticker from a full ticker, e.g. "KXATPMATCH-26FEB25VACMON-VAC" -> "KXATPMATCH" */
 function extractSeries(ticker: string): string {
   return ticker.split("-")[0] ?? "";
 }
 
-/** Extract match code (ticker minus player suffix), e.g. "KXATPMATCH-26FEB25VACMON-VAC" → "KXATPMATCH-26FEB25VACMON" */
+/** Extract match code (ticker minus player suffix), e.g. "KXATPMATCH-26FEB25VACMON-VAC" -> "KXATPMATCH-26FEB25VACMON" */
 function matchCode(ticker: string): string {
   const parts = ticker.split("-");
   return parts.slice(0, -1).join("-");
 }
 
-// ─── Types for intermediate data ─────────────────────────────────────────────
+// --- Types for intermediate data ---------------------------------------------
 
 type KalFill = {
   ticker: string;
@@ -183,7 +183,7 @@ type PmPosition = {
   realizedPnl: number;
 };
 
-// ─── Fetch helpers ───────────────────────────────────────────────────────────
+// --- Fetch helpers -----------------------------------------------------------
 
 async function fetchAllKalshiFills(): Promise<KalFill[]> {
   const all: KalFill[] = [];
@@ -288,7 +288,7 @@ async function fetchPmPositions(): Promise<PmPosition[]> {
   }));
 }
 
-// ─── Main backfill logic ─────────────────────────────────────────────────────
+// --- Main backfill logic -----------------------------------------------------
 
 async function main() {
   console.log("=== Arb Trade Backfill ===\n");
@@ -306,7 +306,7 @@ async function main() {
   }
 
   // 1) Fetch all Kalshi fills
-  console.log("── Step 1: Kalshi Fills ──");
+  console.log("-- Step 1: Kalshi Fills --");
   const allFills = await fetchAllKalshiFills();
   console.log(`  Total fills: ${allFills.length}`);
 
@@ -324,7 +324,7 @@ async function main() {
     return;
   }
 
-  // Group fills by ticker → aggregate shares and cost
+  // Group fills by ticker -> aggregate shares and cost
   type TickerGroup = {
     ticker: string;
     totalShares: number;
@@ -348,7 +348,7 @@ async function main() {
   console.log(`  Unique tickers with BUY fills: ${tickerGroups.size}`);
 
   // 2) Fetch all Kalshi settlements
-  console.log("\n── Step 2: Kalshi Settlements ──");
+  console.log("\n-- Step 2: Kalshi Settlements --");
   const allSettlements = await fetchAllKalshiSettlements();
   console.log(`  Total settlements: ${allSettlements.length}`);
   const settlementMap = new Map<string, KalSettlement>();
@@ -357,7 +357,7 @@ async function main() {
   }
 
   // 3) Fetch market details for each unique ticker (for titles / player names)
-  console.log("\n── Step 3: Kalshi Market Details ──");
+  console.log("\n-- Step 3: Kalshi Market Details --");
   const marketInfoMap = new Map<string, KalMarketInfo>();
   const tickers = [...tickerGroups.keys()];
   for (let i = 0; i < tickers.length; i++) {
@@ -380,7 +380,7 @@ async function main() {
   console.log(`\n  Match groups: ${matchGroups.size}`);
 
   // 5) Fetch PM positions
-  console.log("\n── Step 4: Polymarket Positions ──");
+  console.log("\n-- Step 4: Polymarket Positions --");
   let pmPositions: PmPosition[] = [];
   try {
     pmPositions = await fetchPmPositions();
@@ -402,7 +402,7 @@ async function main() {
   }
 
   // 6) Build ArbTradeRecord entries
-  console.log("\n── Step 5: Building Arb Records ──\n");
+  console.log("\n-- Step 5: Building Arb Records --\n");
   const records: ArbTradeRecord[] = [];
   let matched = 0, unmatched = 0;
 
@@ -411,7 +411,7 @@ async function main() {
     const marketInfos = mcTickers.map(t => marketInfoMap.get(t)).filter(Boolean) as KalMarketInfo[];
 
     // Extract player names from titles
-    const playerNames = new Map<string, string>();  // ticker → player name
+    const playerNames = new Map<string, string>();  // ticker -> player name
     for (const info of marketInfos) {
       if (info.playerName) playerNames.set(info.ticker, info.playerName);
     }
@@ -429,7 +429,7 @@ async function main() {
       // The player we bought YES on (Kalshi side)
       const kalPlayerName = playerNames.get(ticker) ?? "";
 
-      // The OTHER player(s) in this match — that's who we need on the PM side
+      // The OTHER player(s) in this match -- that's who we need on the PM side
       const otherNames = [...playerNames.entries()]
         .filter(([t]) => t !== ticker)
         .map(([, n]) => n);
@@ -501,7 +501,7 @@ async function main() {
         status = "resolved";
         resolvedTs = settlement.settledTime;
         resolutionMethod = "settlement";
-        // Revenue from settlement (cents → dollars)
+        // Revenue from settlement (cents -> dollars)
         const revenueDollars = settlement.revenue / 100;
         // For settled arbs: P&L = settlement revenue - Kalshi cost
         // The PM side payout is separate (either won or lost on PM)
@@ -513,10 +513,10 @@ async function main() {
           if (pmPnl !== 0) {
             realizedPnl += pmPnl;
           } else if (pmMatch.curPrice >= 0.99) {
-            // PM side won → got $1 per share
+            // PM side won -> got $1 per share
             realizedPnl = (shares * 1) - totalCost;
           } else if (pmMatch.curPrice <= 0.01) {
-            // PM side lost → got $0
+            // PM side lost -> got $0
             realizedPnl = revenueDollars - kalCost - pmCost;
           }
         }
@@ -526,10 +526,10 @@ async function main() {
       } else {
         // Check if PM position is resolved
         if (pmMatch && (pmMatch.curPrice >= 0.99 || pmMatch.curPrice <= 0.01)) {
-          // Arb is essentially resolved — one side won
+          // Arb is essentially resolved -- one side won
           realizedPnl = shares * 1 - totalCost;
         } else {
-          // Still open — use projected
+          // Still open -- use projected
           realizedPnl = projectedProfit;
         }
       }
@@ -562,10 +562,10 @@ async function main() {
 
       records.push(record);
 
-      const pmTag = pmMatch ? `PM: ${pmMatch.outcome} ${pmShares}×@${(pmAvgPrice * 100).toFixed(0)}¢` : "PM: (no match)";
+      const pmTag = pmMatch ? `PM: ${pmMatch.outcome} ${pmShares}x@${(pmAvgPrice * 100).toFixed(0)}c` : "PM: (no match)";
       const statusTag = status === "resolved" ? "RESOLVED" : "OPEN";
       const pnlTag = realizedPnl !== undefined ? `pnl=$${realizedPnl.toFixed(2)}` : "";
-      console.log(`  ${statusTag.padEnd(8)} ${matchLabel.padEnd(45).slice(0, 45)}  KAL: ${shares}×@${(kalAvgPrice * 100).toFixed(0)}¢=$${kalCost.toFixed(2)}  ${pmTag}  ${pnlTag}`);
+      console.log(`  ${statusTag.padEnd(8)} ${matchLabel.padEnd(45).slice(0, 45)}  KAL: ${shares}x@${(kalAvgPrice * 100).toFixed(0)}c=$${kalCost.toFixed(2)}  ${pmTag}  ${pnlTag}`);
 
       if (pmMatch) matched++; else unmatched++;
     }
@@ -575,7 +575,7 @@ async function main() {
   records.sort((a, b) => a.ts.localeCompare(b.ts));
 
   // 7) Write to file
-  console.log(`\n── Step 6: Writing ${ARB_LOG_PATH} ──`);
+  console.log(`\n-- Step 6: Writing ${ARB_LOG_PATH} --`);
   const dir = path.dirname(ARB_LOG_PATH);
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 

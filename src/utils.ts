@@ -1,4 +1,4 @@
-// ─── Shared utilities ─────────────────────────────────────────────────────────
+// --- Shared utilities ---------------------------------------------------------
 // Single source of truth for helpers duplicated across 10+ files.
 
 /** Promise-based delay. */
@@ -66,13 +66,13 @@ export function normCents(v: unknown): number | null {
   return n / 100;
 }
 
-/** Normalize a value that could be dollars (0-1 exclusive) or cents (≥1). Returns null for invalid.
+/** Normalize a value that could be dollars (0-1 exclusive) or cents (>=1). Returns null for invalid.
  *  Binary market prices: 1-99 cents or 0.01-0.99 dollars. Exactly 1.0 is ambiguous but treated as
  *  1 cent (0.01) since binary markets can't have $1.00 prices (that would be 100% certainty). */
 export function normDollarsOrCents(v: unknown): number | null {
   const n = Number(v);
   if (!Number.isFinite(n) || n <= 0) return null;
-  if (n >= 1) return n / 100;   // treat as cents (1 → 0.01, 99 → 0.99)
+  if (n >= 1) return n / 100;   // treat as cents (1 -> 0.01, 99 -> 0.99)
   return n;                      // already decimal (0 < n < 1)
 }
 
@@ -114,7 +114,7 @@ export function bestBidFromSide(sideData: unknown): number | null {
   return prices.length ? Math.max(...prices) : null;
 }
 
-// ─── Cross-file arb helpers (single source of truth) ─────────────────────────
+// --- Cross-file arb helpers (single source of truth) -------------------------
 
 /** Map arb direction (A-L) to Kalshi side. Covers tennis (A-D) and soccer (G-L). */
 export function kalSideForDir(dir: string): "yes" | "no" {
@@ -123,7 +123,7 @@ export function kalSideForDir(dir: string): "yes" | "no" {
 }
 
 /** Compute totalCost for an arb trade, including hedgeCost when applicable.
- *  hedgeCost is additive when EITHER leg cost is 0 — covers both:
+ *  hedgeCost is additive when EITHER leg cost is 0 -- covers both:
  *    - KAL-initial, KAL-opposite hedge (pmCost=0, hedgeCost=KAL opp cost)
  *    - PM-initial, PM-opposite hedge  (kalCost=0, hedgeCost=PM opp cost) */
 export function totalCostForTrade(t: { kalCost: number; pmCost: number; hedgeCost?: number }): number {

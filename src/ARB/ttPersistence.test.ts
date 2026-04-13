@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 
-// ─── sweepFullProfitableDepth (pure function, no I/O) ─────────────────────
+// --- sweepFullProfitableDepth (pure function, no I/O) ---------------------
 
 // We need to mock ttConfig to avoid import-time side effects
 vi.mock("./ttConfig.js", () => ({
@@ -44,7 +44,7 @@ describe("sweepFullProfitableDepth", () => {
   });
 
   it("auto-sorts descending input", () => {
-    // Descending order — the sort guard should fix this
+    // Descending order -- the sort guard should fix this
     const asks: [number, number][] = [[30, 2], [20, 3], [10, 5]];
     const result = sweepFullProfitableDepth(asks, 25, true);
     expect(result.totalQty).toBe(8); // should still get 10+20 levels

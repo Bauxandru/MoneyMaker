@@ -1,5 +1,5 @@
 /**
- * debugFillFields.ts — Dump raw Kalshi fill fields to see what's available (fees, etc.)
+ * debugFillFields.ts -- Dump raw Kalshi fill fields to see what's available (fees, etc.)
  * Usage: npx tsx src/debugFillFields.ts
  */
 import dotenv from "dotenv";

@@ -2,9 +2,9 @@
  * Repair script for arb_trades.json using REAL exchange data.
  *
  * Data sources:
- *   - PM costs:  CLOB getTrades() API — exact fill prices for ALL trades (not just current positions)
- *   - KAL costs: fetchAllKalshiFills() — exact per-fill prices including fees
- *   - KAL P&L:  fetchAllKalshiSettlements() — exact revenue/cost/fees for settled markets
+ *   - PM costs:  CLOB getTrades() API -- exact fill prices for ALL trades (not just current positions)
+ *   - KAL costs: fetchAllKalshiFills() -- exact per-fill prices including fees
+ *   - KAL P&L:  fetchAllKalshiSettlements() -- exact revenue/cost/fees for settled markets
  *
  * Creates data/arb_trades.backup.json before modifying.
  *
@@ -27,7 +27,7 @@ const DATA_DIR = join(import.meta.dirname ?? ".", "..", "data");
 const TRADES_PATH = join(DATA_DIR, "arb_trades.json");
 const BACKUP_PATH = join(DATA_DIR, "arb_trades.backup.json");
 
-// ─── Terminal colors ─────────────────────────────────────────────────────────
+// --- Terminal colors ---------------------------------------------------------
 const C = {
   reset: "\x1b[0m",
   bold:  "\x1b[1m",
@@ -47,18 +47,18 @@ const tag = (color: string, label: string) => `${color}${C.bold}[${label}]${C.re
 const val = (v: string | number) => `${C.cyan}${v}${C.reset}`;
 const old = (v: string | number) => `${C.red}${v}${C.reset}`;
 const nw = (v: string | number) => `${C.green}${v}${C.reset}`;
-const arrow = `${C.dim}→${C.reset}`;
+const arrow = `${C.dim}->${C.reset}`;
 const warn = (msg: string) => `${C.yellow}${C.bold}${msg}${C.reset}`;
 
 // Use shared type for all trade operations
 type ArbTrade = ArbTradeRecord;
 
-// ─── Fetch PM CLOB trades ──────────────────────────────────────────────────────
+// --- Fetch PM CLOB trades ------------------------------------------------------
 
 // ClobTrade imported from types.ts
 
 /** Extract our actual fill size from a CLOB trade.
- *  When trader_side === "MAKER", the size field is the TAKER's total — our fill is
+ *  When trader_side === "MAKER", the size field is the TAKER's total -- our fill is
  *  the sum of maker_orders where maker_address matches our wallet/funder. */
 function getOurFillSize(ct: ClobTrade, ourAddresses: Set<string>): { size: number; cost: number } {
   if (ct.trader_side === "MAKER" && ct.maker_orders && ct.maker_orders.length > 0) {
@@ -97,8 +97,8 @@ function buildPmClobFills(clobTrades: ClobTrade[], ourAddresses: Set<string>): M
 /**
  * Match PM CLOB fills to an arb trade by timestamp.
  * Tries multiple candidate timestamps with different windows:
- *   - tradeTs: 60s window (initial entry — both-legs trades)
- *   - resolvedTs: 300s window (hedge fill — hedge-complete trades)
+ *   - tradeTs: 60s window (initial entry -- both-legs trades)
+ *   - resolvedTs: 300s window (hedge fill -- hedge-complete trades)
  * Collects fills greedily by proximity until shares are covered.
  * Returns { price, size, feeBps, totalCost } of matched fills, or null.
  */
@@ -169,7 +169,7 @@ function matchClobFillsToTrade(
   };
 }
 
-// ─── Kalshi fill matching (timestamp-based, same approach as PM CLOB) ──────────
+// --- Kalshi fill matching (timestamp-based, same approach as PM CLOB) ----------
 
 /** Group Kalshi fills by ticker+side key, preserving individual fill details */
 function buildKalFillsByTickerSide(fills: KalFill[]): Map<string, KalFill[]> {
@@ -186,7 +186,7 @@ function buildKalFillsByTickerSide(fills: KalFill[]): Map<string, KalFill[]> {
 
 /**
  * Match Kalshi fills to an arb trade by timestamp proximity.
- * No time window — fills can span hours (initial entry + hedge fills).
+ * No time window -- fills can span hours (initial entry + hedge fills).
  * Sorts ALL unmatched fills by distance to trade timestamp, then greedily
  * collects until share count is reached. For shared tickers, the closest
  * fills are consumed first, so each trade gets its own fills.
@@ -233,11 +233,11 @@ function matchKalFillsToTrade(
   return { costCents: totalCostCents, fees: totalFees, shares: totalShares };
 }
 
-// ─── Main ─────────────────────────────────────────────────────────────────────
+// --- Main ---------------------------------------------------------------------
 
 async function main() {
   if (!existsSync(TRADES_PATH)) {
-    console.log("No arb_trades.json found — nothing to repair.");
+    console.log("No arb_trades.json found -- nothing to repair.");
     return;
   }
 
@@ -247,7 +247,7 @@ async function main() {
   const trades: ArbTrade[] = JSON.parse(readFileSync(TRADES_PATH, "utf8"));
   console.log(`Loaded ${trades.length} trades.`);
 
-  // ── Fetch real exchange data ───────────────────────────────────────────────
+  // -- Fetch real exchange data -----------------------------------------------
   console.log("\nFetching exchange data...");
 
   let kalFills: KalFill[] = [];
@@ -302,7 +302,7 @@ async function main() {
   const usedPmFillIndices = new Map<string, Set<number>>();
   const usedKalFillIndices = new Map<string, Set<number>>();
 
-  // ── Pass 0: Consolidate duplicate trades per ticker ──────────────────────
+  // -- Pass 0: Consolidate duplicate trades per ticker ----------------------
   // When ghost/recovered trades duplicate a normal trade on the same ticker,
   // merge all records into ONE using actual exchange data as the source of truth.
   console.log(`\n${C.bold}${C.white}--- Pass 0: Consolidating duplicate trades per ticker ---${C.reset}\n`);
@@ -381,9 +381,9 @@ async function main() {
       for (const g of group) {
         if (g.trade.resolutionMethod === "hedge-complete" && (g.trade.hedgeCost ?? 0) > 0) {
           // hedgeCost is only "real" if it represents selling back a position
-          // For PM-initial trades: hedgeCost = KAL cost (if KAL hedge filled) → already in kalCost
-          // For KAL-initial trades: hedgeCost = PM cost (if PM hedge filled) → already in pmCost
-          // So hedgeCost should NOT be added separately — it's already captured in leg costs
+          // For PM-initial trades: hedgeCost = KAL cost (if KAL hedge filled) -> already in kalCost
+          // For KAL-initial trades: hedgeCost = PM cost (if PM hedge filled) -> already in pmCost
+          // So hedgeCost should NOT be added separately -- it's already captured in leg costs
         }
       }
 
@@ -458,8 +458,8 @@ async function main() {
 
       console.log(`  ${tag(C.bgYellow, "CONSOLIDATE")} ${C.bold}${t.match}${C.reset} (${ticker})`);
       console.log(`    ${C.dim}Merging ${group.length} records into 1. Removing: ${mergedFrom.join(", ")}${C.reset}`);
-      console.log(`    ${C.dim}KAL: ${actualKalShares} ${kalSide} fills → ${cappedKalShares} arb-matched, cost $${cappedKalCost} (fees $${actualKalFees})${C.reset}`);
-      console.log(`    ${C.dim}PM:  ${actualPmShares.toFixed(1)} total fills → ${cappedPmShares} arb-matched @ ${actualPmFillPrice} = $${cappedPmCost}${C.reset}`);
+      console.log(`    ${C.dim}KAL: ${actualKalShares} ${kalSide} fills -> ${cappedKalShares} arb-matched, cost $${cappedKalCost} (fees $${actualKalFees})${C.reset}`);
+      console.log(`    ${C.dim}PM:  ${actualPmShares.toFixed(1)} total fills -> ${cappedPmShares} arb-matched @ ${actualPmFillPrice} = $${cappedPmCost}${C.reset}`);
       if (totalExcessCost > 0.01) {
         console.log(`    ${C.yellow}Excess: KAL $${excessKalCost} + PM $${excessPmCost} = $${totalExcessCost} (over-hedge, separate from arb P&L)${C.reset}`);
       }
@@ -520,7 +520,7 @@ async function main() {
   let hedgeCostFixed = 0;
   let sharesWarnings = 0;
 
-  // ── Pass 1: Sort trades by timestamp for deterministic fill assignment ────
+  // -- Pass 1: Sort trades by timestamp for deterministic fill assignment ----
   // Process oldest first so greedy fill matchers consume in chronological order.
   const sortedIndices = trades.map((_, i) => i);
   sortedIndices.sort((a, b) => new Date(trades[a].ts).getTime() - new Date(trades[b].ts).getTime());
@@ -540,7 +540,7 @@ async function main() {
     // Skip backfills for cost/pnl corrections
     if (t.id.startsWith("backfill")) continue;
 
-    // ─── 1. Correct KAL cost from real Kalshi fills (timestamp-matched) ──────
+    // --- 1. Correct KAL cost from real Kalshi fills (timestamp-matched) ------
     // Run FIRST so we know actual shares filled, then use that for PM matching.
     // Skip settlement trades (step 5 handles those with higher accuracy).
     if (t.status === "resolved" && t.kalTicker && t.resolutionMethod !== "settlement") {
@@ -580,9 +580,9 @@ async function main() {
       }
     }
 
-    // ─── 2. Correct PM cost from CLOB trade fills (timestamp-matched) ─────
-    // For both-legs: PM filled at trade creation time → use t.ts
-    // For hedge-complete: PM filled during hedge cycle → use t.resolvedTs
+    // --- 2. Correct PM cost from CLOB trade fills (timestamp-matched) -----
+    // For both-legs: PM filled at trade creation time -> use t.ts
+    // For hedge-complete: PM filled during hedge cycle -> use t.resolvedTs
     if (t.status === "resolved" && t.pmTokenId && (t.resolutionMethod === "hedge-complete" || t.resolutionMethod === "both-legs")) {
       const fills = pmClobFills.get(t.pmTokenId);
       if (fills && fills.length > 0) {
@@ -598,9 +598,23 @@ async function main() {
         const matched = matchClobFillsToTrade(fills, candidateTs, t.shares, used);
         if (matched) {
           // pmFillPrice = average fill price (fee-exclusive); pmCost = total cost including fees
-          const realPmFP = r2(matched.avgPrice);
+          let realPmFP = r2(matched.avgPrice);
           const costPerShareWithFees = matched.totalCost / matched.totalSize;
-          const realPmCost = r2(t.shares * costPerShareWithFees);
+          let realPmCost = r2(t.shares * costPerShareWithFees);
+          // Binary market price inversion guard: CLOB may report the complementary price
+          // (e.g., 0.87 instead of 0.13 for a BUY on the underdog token).
+          // Detect: if using CLOB price makes combined cost > $1/share, invert.
+          const combinedWithClob = (t.kalCost + realPmCost) / Math.max(t.shares, 1);
+          if (combinedWithClob > 1.0 && realPmFP > 0.5) {
+            const invertedFP = r2(1 - realPmFP);
+            const invertedCost = r2(t.shares * (1 - costPerShareWithFees));
+            const combinedInverted = (t.kalCost + invertedCost) / Math.max(t.shares, 1);
+            if (combinedInverted < 1.0) {
+              console.log(`  ${tag(C.yellow, "PM-INVERT")} ${C.bold}${t.match}${C.reset}: CLOB price ${realPmFP} -> inverted to ${invertedFP} (combined $${combinedWithClob.toFixed(2)}/sh -> $${combinedInverted.toFixed(2)}/sh)`);
+              realPmFP = invertedFP;
+              realPmCost = invertedCost;
+            }
+          }
           if (Math.abs(realPmCost - t.pmCost) > 0.01 || Math.abs(realPmFP - t.pmFillPrice) > 0.01) {
             console.log(`  ${tag(C.magenta, "PM-CLOB")} ${C.bold}${t.match}${C.reset}: pmFP ${old(t.pmFillPrice)} ${arrow} ${nw(realPmFP)}, pmCost ${old("$" + t.pmCost)} ${arrow} ${nw("$" + realPmCost)} (${val(matched.totalSize)} fills @ ${val(matched.avgPrice.toFixed(4))})`);
             t.pmFillPrice = realPmFP;
@@ -611,7 +625,7 @@ async function main() {
       }
     }
 
-    // ─── 3. Fix totalCost = kalCost + hedgeCost (when applicable) + pmCost ─
+    // --- 3. Fix totalCost = kalCost + hedgeCost (when applicable) + pmCost -
     if (t.status === "resolved" && (t.resolutionMethod === "hedge-complete" || t.resolutionMethod === "both-legs")) {
       const sum = totalCostForTrade(t);
       if (Math.abs(sum - t.totalCost) > 0.02) {
@@ -621,11 +635,11 @@ async function main() {
       }
     }
 
-    // ─── 3b. Fix hedgeCost for hedge-complete trades ─────────────────────
+    // --- 3b. Fix hedgeCost for hedge-complete trades ---------------------
     // hedgeCost = cost of the hedge leg (opposite to initialExchange).
-    // If initialExchange=kal → hedgeCost = pmCost (PM was hedge).
-    // If initialExchange=pm  → hedgeCost = kalCost (KAL was hedge).
-    //   Exception: PM-initial trades where KAL never filled (kalCost=0) — hedge went
+    // If initialExchange=kal -> hedgeCost = pmCost (PM was hedge).
+    // If initialExchange=pm  -> hedgeCost = kalCost (KAL was hedge).
+    //   Exception: PM-initial trades where KAL never filled (kalCost=0) -- hedge went
     //   through PM opposite token. Keep existing hedgeCost (set at trade creation).
     if (t.resolutionMethod === "hedge-complete" && t.status === "resolved") {
       const isPmInitial = t.initialExchange === "pm";
@@ -639,9 +653,9 @@ async function main() {
       }
     }
 
-    // ─── 4. Recalculate P&L for hedge-complete and both-legs trades ─────
-    //     both-legs / hedge-complete with BOTH legs filled: $1/share payout → pnl = shares - totalCost.
-    //     hedge-complete with one leg = 0: round-trip on one exchange → pnl = hedgeCost - cost of filled leg.
+    // --- 4. Recalculate P&L for hedge-complete and both-legs trades -----
+    //     both-legs / hedge-complete with BOTH legs filled: $1/share payout -> pnl = shares - totalCost.
+    //     hedge-complete with one leg = 0: round-trip on one exchange -> pnl = hedgeCost - cost of filled leg.
     if ((t.resolutionMethod === "hedge-complete" || t.resolutionMethod === "both-legs") && t.status === "resolved") {
       const correctPnl = r2(t.shares - t.totalCost);
       if (t.realizedPnl == null || Math.abs(t.realizedPnl - correctPnl) > 0.02) {
@@ -652,8 +666,8 @@ async function main() {
       }
     }
 
-    // ─── 5. Settlement trades: per-trade P&L using market result ─────────
-    //     Don't use aggregate settlement cost/revenue (yesCost+noCost, revenue) —
+    // --- 5. Settlement trades: per-trade P&L using market result ---------
+    //     Don't use aggregate settlement cost/revenue (yesCost+noCost, revenue) --
     //     it sums ALL fills for the ticker, double-counting when trades share a ticker.
     //     Instead, use per-trade kalCost (already set by step 1 from timestamp-matched fills)
     //     and determine payout from market result.
@@ -678,14 +692,14 @@ async function main() {
     }
   }
 
-  // ── Pass: Exchange Reconcile — store actual fill breakdown per ticker ──────
+  // -- Pass: Exchange Reconcile -- store actual fill breakdown per ticker ------
   // Groups ALL Kalshi fills by ticker (regardless of side), then distributes them
   // to arb trades. Any excess beyond what trades account for = over-hedge.
   console.log(`\n${C.bold}${C.white}--- Exchange Reconcile: storing actual fill breakdown ---${C.reset}\n`);
   let overHedgeFixed = 0;
   let fillBreakdownFixed = 0;
 
-  // Group ALL Kalshi BUY fills by ticker → { yesFills, noFills, yesCost, noCost, yesFees, noFees }
+  // Group ALL Kalshi BUY fills by ticker -> { yesFills, noFills, yesCost, noCost, yesFees, noFees }
   const kalTickerSummary = new Map<string, { yesBought: number; noBought: number; yesCost: number; noCost: number; yesFees: number; noFees: number }>();
   for (const f of kalFills) {
     if (f.action !== "buy") continue;
@@ -733,7 +747,7 @@ async function main() {
       let expectedNo = (initialSide === "no") ? expectedInitial : 0;
       // If hedge-complete with Kalshi opposite hedge: only expect opposite fills
       // when the hedge actually went to Kalshi (pmCost === 0 means KAL-hedged).
-      // When pmCost > 0, the hedge went to PM — ALL opposite Kalshi fills are excess (over-hedge).
+      // When pmCost > 0, the hedge went to PM -- ALL opposite Kalshi fills are excess (over-hedge).
       if (t.resolutionMethod === "hedge-complete" && (t.pmCost === 0 || !t.pmCost)) {
         if (initialSide === "yes" && kal.noBought > 0) expectedNo = t.shares;
         if (initialSide === "no" && kal.yesBought > 0) expectedYes = t.shares;
@@ -762,7 +776,7 @@ async function main() {
         delete t.overHedgeSide;
       }
     } else {
-      // Multiple trades on same ticker — store total fills on first, proportional on rest
+      // Multiple trades on same ticker -- store total fills on first, proportional on rest
       // Just store aggregate fill counts on all trades
       for (const t of tickerTrades) {
         if (t.kalYesFills !== kal.yesBought || t.kalNoFills !== kal.noBought) {

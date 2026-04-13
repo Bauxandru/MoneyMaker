@@ -155,7 +155,7 @@ export async function validateLicense(): Promise<void> {
   _consecutiveFailures = 0;
   console.log(`[LICENSE] Validated as "${_userName}" (id=${_userId})`);
 
-  // ── Version check ──
+  // -- Version check --
   const minVersion = result.data.min_version;
   if (minVersion) {
     const localVersion = getLocalVersion();
@@ -208,7 +208,7 @@ export function startPeriodicRevalidation(): void {
           const localVersion = getLocalVersion();
           if (compareVersions(localVersion, minVersion) < 0) {
             console.log(`\n${"=".repeat(60)}`);
-            console.log(`  UPDATE REQUIRED — BOT STOPPING`);
+            console.log(`  UPDATE REQUIRED -- BOT STOPPING`);
             console.log(`  Your version:    ${localVersion}`);
             console.log(`  Required version: ${minVersion}`);
             console.log(`${"=".repeat(60)}\n`);

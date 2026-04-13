@@ -1,9 +1,9 @@
 /**
- * liveMention.ts — Live Powell speech keyword trading bot.
+ * liveMention.ts -- Live Powell speech keyword trading bot.
  *
  * Two modes of operation:
- *   1. AUTO: Deepgram real-time transcription from microphone → keyword detection → trade
- *   2. MANUAL: Web dashboard with keyword buttons → click to trigger trade
+ *   1. AUTO: Deepgram real-time transcription from microphone -> keyword detection -> trade
+ *   2. MANUAL: Web dashboard with keyword buttons -> click to trigger trade
  *
  * Usage:
  *   npx tsx src/liveMention.ts              # dry-run (default)
@@ -16,14 +16,14 @@
 import * as dotenv from "dotenv";
 dotenv.config();
 
-// @ts-ignore — express default export works at runtime with tsx
+// @ts-ignore -- express default export works at runtime with tsx
 import express from "express";
 import { fetchJsonWithRetry, fetchJson } from "./http.js";
 import { placeKalshiOrder, buildKalshiOrder } from "./kalshiTrade.js";
 import { placePolymarketOrder } from "./polymarketTrade.js";
 import { OrderType } from "@polymarket/clob-client";
 
-// ─── Config ──────────────────────────────────────────────────────────────────
+// --- Config ------------------------------------------------------------------
 
 const DRY_RUN = process.env.LIVE !== "1";
 const PORT = Number(process.env.MENTION_PORT ?? 3457);
@@ -38,7 +38,7 @@ const MAX_YES_PRICE = Number(process.env.MENTION_MAX_PRICE ?? 0.95);
 
 const retryOpts = { timeoutMs: 8000, maxRetries: 2, baseDelayMs: 300, maxDelayMs: 4000, jitterMs: 100 };
 
-// ─── Types ───────────────────────────────────────────────────────────────────
+// --- Types -------------------------------------------------------------------
 
 interface KeywordMarket {
   keyword: string;           // display keyword (e.g. "Pandemic")
@@ -57,7 +57,7 @@ interface KeywordMarket {
   error?: string;            // error if trade failed
 }
 
-// ─── Keyword → Market mapping ────────────────────────────────────────────────
+// --- Keyword -> Market mapping ------------------------------------------------
 // All keywords from both Kalshi and PM, sorted alphabetically.
 // requiredClicks: 1 = single mention, N = must click N times before trade fires (for "N+ times" markets)
 
@@ -156,7 +156,7 @@ const KEYWORD_MAP: KwEntry[] = [
 // PM token IDs populated at startup
 const pmTokenMap = new Map<string, string>();
 
-// ─── State ───────────────────────────────────────────────────────────────────
+// --- State -------------------------------------------------------------------
 
 let markets: KeywordMarket[] = [];
 let transcript = "";
@@ -164,7 +164,7 @@ let transcriptLines: string[] = [];
 let isListening = false;
 let deepgramWs: import("ws").WebSocket | null = null;
 
-// ─── Fetch live prices ───────────────────────────────────────────────────────
+// --- Fetch live prices -------------------------------------------------------
 
 async function fetchKalshiPrices(): Promise<Map<string, number>> {
   const prices = new Map<string, number>();
@@ -237,7 +237,7 @@ async function initMarkets(): Promise<void> {
   console.log(`Loaded ${markets.length} keywords (${withKal.length} with Kalshi, ${matched.length} with PM tokens)`);
 }
 
-// ─── Trade execution ─────────────────────────────────────────────────────────
+// --- Trade execution ---------------------------------------------------------
 
 async function executeTrade(market: KeywordMarket): Promise<void> {
   if (market.triggered) {
@@ -305,7 +305,7 @@ async function executeTrade(market: KeywordMarket): Promise<void> {
   await Promise.all(promises);
 }
 
-// ─── Keyword detection ───────────────────────────────────────────────────────
+// --- Keyword detection -------------------------------------------------------
 
 function checkTranscript(text: string): void {
   const lower = text.toLowerCase();
@@ -320,11 +320,11 @@ function checkTranscript(text: string): void {
   }
 }
 
-// ─── Deepgram real-time transcription ────────────────────────────────────────
+// --- Deepgram real-time transcription ----------------------------------------
 
 async function startDeepgramMic(): Promise<void> {
   if (!DEEPGRAM_KEY) {
-    console.log("No DEEPGRAM_API_KEY set — mic transcription disabled. Use dashboard buttons.");
+    console.log("No DEEPGRAM_API_KEY set -- mic transcription disabled. Use dashboard buttons.");
     return;
   }
 
@@ -409,7 +409,7 @@ async function startDeepgramMic(): Promise<void> {
   });
 }
 
-// ─── Web dashboard ───────────────────────────────────────────────────────────
+// --- Web dashboard -----------------------------------------------------------
 
 function startDashboard(): void {
   const app = express();
@@ -480,12 +480,12 @@ function startDashboard(): void {
 
   app.listen(PORT, () => {
     console.log(`\nDashboard: http://localhost:${PORT}`);
-    console.log(`Mode: ${DRY_RUN ? "DRY RUN" : "⚠ LIVE TRADING ⚠"}`);
+    console.log(`Mode: ${DRY_RUN ? "DRY RUN" : "[!] LIVE TRADING [!]"}`);
     console.log(`Trade size: $${TRADE_SIZE_USD} per keyword\n`);
   });
 }
 
-// ─── Dashboard HTML ──────────────────────────────────────────────────────────
+// --- Dashboard HTML ----------------------------------------------------------
 
 function dashboardHtml(): string {
   return `<!DOCTYPE html>
@@ -545,7 +545,7 @@ function dashboardHtml(): string {
   </div>
 </div>
 
-<div class="section-title">Keywords — click to trigger (<span style="border-left:3px solid #58a6ff;padding-left:4px">blue</span> = both KAL+PM)</div>
+<div class="section-title">Keywords -- click to trigger (<span style="border-left:3px solid #58a6ff;padding-left:4px">blue</span> = both KAL+PM)</div>
 <div class="grid" id="grid"></div>
 
 <div class="section-title">Live Transcript</div>
@@ -631,7 +631,7 @@ setInterval(fetchState, 2000);
 </body></html>`;
 }
 
-// ─── Main ────────────────────────────────────────────────────────────────────
+// --- Main --------------------------------------------------------------------
 
 async function main() {
   console.log("Powell Live Mention Bot");
@@ -646,7 +646,7 @@ async function main() {
   if (DEEPGRAM_KEY) {
     await startDeepgramMic();
   } else {
-    console.log("\nNo DEEPGRAM_API_KEY — use dashboard buttons for manual triggers.");
+    console.log("\nNo DEEPGRAM_API_KEY -- use dashboard buttons for manual triggers.");
     console.log("To enable auto transcription: set DEEPGRAM_API_KEY in .env");
   }
 }

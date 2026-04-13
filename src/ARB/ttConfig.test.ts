@@ -1,7 +1,7 @@
 import { describe, it, expect } from "vitest";
 import { fmtPct, estimateFees, parseGammaEvents, parseGammaMarkets, parseKalshiMarkets } from "./ttConfig.js";
 
-// ─── fmtPct ─────────────────────────────────────────────────────────────────
+// --- fmtPct -----------------------------------------------------------------
 
 describe("fmtPct", () => {
   it("formats 0.1234 as 12.3%", () => {
@@ -25,7 +25,7 @@ describe("fmtPct", () => {
   });
 });
 
-// ─── estimateFees ───────────────────────────────────────────────────────────
+// --- estimateFees -----------------------------------------------------------
 
 describe("estimateFees", () => {
   it("returns 0 for both prices at 0", () => {
@@ -44,12 +44,12 @@ describe("estimateFees", () => {
   });
 
   it("fee is symmetric around 0.5 for same exchange", () => {
-    // 0.3 * 0.7 = 0.21, 0.7 * 0.3 = 0.21 — same
+    // 0.3 * 0.7 = 0.21, 0.7 * 0.3 = 0.21 -- same
     expect(estimateFees(0.3, 0)).toBeCloseTo(estimateFees(0.7, 0), 10);
   });
 });
 
-// ─── parseGammaEvents ───────────────────────────────────────────────────────
+// --- parseGammaEvents -------------------------------------------------------
 
 describe("parseGammaEvents", () => {
   it("returns array if raw is already an array", () => {
@@ -83,7 +83,7 @@ describe("parseGammaEvents", () => {
   });
 });
 
-// ─── parseGammaMarkets ──────────────────────────────────────────────────────
+// --- parseGammaMarkets ------------------------------------------------------
 
 describe("parseGammaMarkets", () => {
   it("returns array if raw is array", () => {
@@ -98,7 +98,7 @@ describe("parseGammaMarkets", () => {
   });
 });
 
-// ─── parseKalshiMarkets ─────────────────────────────────────────────────────
+// --- parseKalshiMarkets -----------------------------------------------------
 
 describe("parseKalshiMarkets", () => {
   it("returns markets array from response", () => {

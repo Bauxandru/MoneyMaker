@@ -55,7 +55,7 @@ vi.mock("../http.js", () => ({
 
 const { extractKalshiEventTicker, extractPmSlug, parseStaticPairsCsv } = await import("./ttDiscovery.js");
 
-// ─── extractKalshiEventTicker ───────────────────────────────────────────────
+// --- extractKalshiEventTicker -----------------------------------------------
 
 describe("extractKalshiEventTicker", () => {
   it("extracts last path segment from full URL", () => {
@@ -80,7 +80,7 @@ describe("extractKalshiEventTicker", () => {
   });
 });
 
-// ��── extractPmSlug ──────���───────────────────────────────────────────────────
+// ��-- extractPmSlug ------���---------------------------------------------------
 
 describe("extractPmSlug", () => {
   it("extracts last path segment from PM URL", () => {
@@ -102,7 +102,7 @@ describe("extractPmSlug", () => {
   });
 });
 
-// ─── parseStaticPairsCsv ───────��────────────────────────────────────────────
+// --- parseStaticPairsCsv -------��--------------------------------------------
 
 describe("parseStaticPairsCsv", () => {
   it("returns empty if file doesn't exist", () => {

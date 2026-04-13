@@ -48,7 +48,7 @@ export type ArbOpportunity = {
   edge: number | null;
 };
 
-// Shared arb trade record — used by tradeTennis.ts, dashboard.ts, repairTrades.ts
+// Shared arb trade record -- used by tradeTennis.ts, dashboard.ts, repairTrades.ts
 export type ArbTradeRecord = {
   id: string;
   ts: string;
@@ -68,27 +68,29 @@ export type ArbTradeRecord = {
   projectedEdge: number;
   projectedProfit: number;
   resolvedTs?: string;
-  resolutionMethod?: "both-legs" | "hedge-complete" | "hedge-exit" | "settlement" | "hedge-reconciled-onchain" | "market-settled";
+  resolutionMethod?: "both-legs" | "hedge-complete" | "hedge-exit" | "settlement" | "hedge-reconciled-onchain" | "market-settled" | "recovery-error";
   hedgeCost?: number;
   realizedPnl?: number;
   initialExchange?: "pm" | "kal";
   kalFees?: number;   // actual Kalshi taker+maker fees from order response
-  // Scalar settlement fields — set when Kalshi settles a cancelled/voided match
+  // Scalar settlement fields -- set when Kalshi settles a cancelled/voided match
   scalarSettlement?: boolean;           // true if Kalshi settled as scalar (not binary)
-  kalSettlementValue?: number;          // per-share KAL payout (e.g. 0.14 for NO at 86¢ YES scalar)
+  kalSettlementValue?: number;          // per-share KAL payout (e.g. 0.14 for NO at 86c YES scalar)
   pmSettlementValue?: number;           // per-share PM payout (e.g. 0.50 for 50/50 cancellation)
   resolutionNote?: string;              // human-readable note about non-standard resolution
-  // Over-hedge tracking — set when exchange has more fills than the arb trade's shares
+  // Over-hedge tracking -- set when exchange has more fills than the arb trade's shares
   overHedgeShares?: number;             // excess contracts from over-hedging bug
   overHedgeCost?: number;               // cost of excess contracts
   overHedgeSide?: "yes" | "no";         // which side the excess is on
-  // Actual exchange fill breakdown — set by exchange reconcile for audit accuracy
+  // Actual exchange fill breakdown -- set by exchange reconcile for audit accuracy
   kalYesFills?: number;                 // actual YES contracts bought on Kalshi for this ticker
   kalNoFills?: number;                  // actual NO contracts bought on Kalshi for this ticker
   kalMakerFill?: boolean;               // true if Kalshi leg filled via maker GTC (lower fees)
+  // PM overfill tracking -- when PM fills more fractional shares than ordered
+  pmActualShares?: number;              // actual shares received from PM (e.g., 11.55 when 11 ordered)
 };
 
-// Shared CLOB trade type — used by dashboard.ts and repairTrades.ts
+// Shared CLOB trade type -- used by dashboard.ts and repairTrades.ts
 export interface ClobTrade {
   id?: string;           // unique trade ID for dedup
   order_id?: string;     // taker's order ID (same across partial fills)
@@ -103,7 +105,7 @@ export interface ClobTrade {
   maker_orders?: { maker_address: string; matched_amount: string; price: string; asset_id: string }[];
 }
 
-// Shared execution metric — used by tradeTennis.ts and dashboard.ts
+// Shared execution metric -- used by tradeTennis.ts and dashboard.ts
 // (outcome includes "filled" for post-cancel and race-recovery fills)
 export type ExecMetric = {
   id: string;

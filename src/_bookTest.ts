@@ -9,14 +9,14 @@ async function main() {
   console.log(`Fetching orderbook for: ${ticker}\n`);
   const book = await fetchKalshiOrderbook(ticker);
   console.log(`YES bids (${book.yes.length}):`);
-  for (const [p, s] of book.yes) console.log(`  ${p}¢ × ${s}`);
+  for (const [p, s] of book.yes) console.log(`  ${p}c x ${s}`);
   console.log(`\nNO bids (${book.no.length}):`);
-  for (const [p, s] of book.no) console.log(`  ${p}¢ × ${s}`);
+  for (const [p, s] of book.no) console.log(`  ${p}c x ${s}`);
 
   // Derive YES asks from NO bids
   const yesAsks = book.no.map(([np, s]) => [100 - np, s] as [number, number]).filter(([p]) => p > 0 && p < 100).sort((a, b) => a[0] - b[0]);
   console.log(`\nDerived YES asks (${yesAsks.length}):`);
-  for (const [p, s] of yesAsks.slice(0, 10)) console.log(`  ${p}¢ × ${s}`);
+  for (const [p, s] of yesAsks.slice(0, 10)) console.log(`  ${p}c x ${s}`);
 
   if (book.yes.length === 0 && book.no.length === 0) {
     console.log("\nBoth sides empty! Fetching raw response...");

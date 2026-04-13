@@ -123,6 +123,8 @@ import {
 
 import { pushTradeData, startPeriodicPush } from "../dashboardPush.js";
 
+import { maybeShadowCompare } from "./ttEventLog.js";
+
 // ─── executeArb ──────────────────────────────────────────────────────────────
 
 export async function executeArb(
@@ -366,7 +368,7 @@ export async function executeArb(
   // Positive momentum = price rising = getting more expensive for us
   // Buy the side that is rising faster first. Default to PM-first when equal
   // (PM has thinner books and 3s sports delay means failed fill costs nothing).
-  const pmFirst = pmMom >= kalMom; // PM rising more (or both equal) → PM first
+  const pmFirst = false; // KAL-first always — PM FAK at breakeven after KAL fill
   metric.shares = shares;
   metric.firstLeg = pmFirst ? "pm" : "kal";
 
@@ -380,7 +382,18 @@ export async function executeArb(
   console.log(`  KAL: ${kalLeg.ticker} ${kalSide.toUpperCase()} @${fmtPct(kalAsk)}`);
   console.log(`  PM:  ${entry.pmSlug} outcome=${pmLeg.outcome} @${fmtPct(pmAsk)}`);
 
-  const kalLimitCents = Math.max(1, Math.min(99, Math.floor((1 - pmAsk - MIN_EDGE) * 100)));
+  // KAL IOC limit: account for KAL taker fee + PM taker fee + MIN_EDGE
+  // fee(price) = KALSHI_FEE_RATE * price * (1 - price) + PM_FEE_RATE * pmAsk * (1 - pmAsk)
+  // Iterate: find highest kalPrice where kalPrice + fees + pmAsk + MIN_EDGE <= 1
+  const pmFeeForLimit = PM_FEE_RATE * pmAsk * (1 - pmAsk);
+  let kalLimitCents = Math.max(1, Math.min(99, Math.floor((1 - pmAsk - MIN_EDGE - pmFeeForLimit) * 100)));
+  while (kalLimitCents > 0) {
+    const p = kalLimitCents / 100;
+    const kalFee = KALSHI_FEE_RATE * p * (1 - p);
+    if (p + kalFee + pmAsk + pmFeeForLimit + MIN_EDGE <= 1) break;
+    kalLimitCents--;
+  }
+  kalLimitCents = Math.max(1, kalLimitCents);
   const kalLimitPrice = kalLimitCents / 100;
 
   // ── PRE-FLIGHT DEPTH CHECK + FULL DEPTH OPPORTUNITY LOG ─────────────────────
@@ -702,7 +715,7 @@ export async function executeArb(
         // Order is on-chain but not yet confirmed — poll until it resolves
         console.log(`  [PM LEG] On-chain pending (status=delayed), polling for confirmation...`);
         const _tPoll0 = performance.now();
-        const finalStatus = await waitForPmOrderFill(String(pmMeta.orderId), 20_000, pmLeg.tokenId, pmPreBalance);
+        const finalStatus = await waitForPmOrderFill(String(pmMeta.orderId), 10_000, pmLeg.tokenId, pmPreBalance);
         tPmPoll = performance.now() - _tPoll0;
         if (finalStatus === "matched") {
           console.log(`  [PM LEG] Confirmed filled after delay (${tPmPoll.toFixed(0)}ms).`);
@@ -797,7 +810,7 @@ export async function executeArb(
           return unhedgedShares;
         }
         if (meta.status === "delayed" && meta.orderId) {
-          const finalStatus = await waitForPmOrderFill(String(meta.orderId), 20_000, pmOppLeg.tokenId);
+          const finalStatus = await waitForPmOrderFill(String(meta.orderId), 10_000, pmOppLeg.tokenId);
           if (finalStatus === "matched") {
             console.log(`  [IMMEDIATE PM HEDGE] Filled (delayed) ${unhedgedShares}×${pmOppLeg.outcome} @${fmtPct(oppAsk)} — hedge complete.`);
             return unhedgedShares;
@@ -871,11 +884,12 @@ export async function executeArb(
     // Poll for up to 6 seconds if not immediately filled
     if (!DRY_RUN && kalFilled < pmFilled && kalOrderId) {
       const GTC_POLL_MS = 20000;
-      const GTC_POLL_INTERVAL = 500;
+      let pollInterval = 100;
       const pollStart = Date.now();
       console.log(`  [KAL LEG] GTC not fully filled (${kalFilled}/${pmFilled}). Polling for ${GTC_POLL_MS / 1000}s...`);
       while (Date.now() - pollStart < GTC_POLL_MS && kalFilled < pmFilled) {
-        await sleep(GTC_POLL_INTERVAL);
+        await sleep(pollInterval);
+        pollInterval = Math.min(500, Math.ceil(pollInterval * 1.5));
         try {
           const verify = await getKalshiOrder(kalOrderId);
           const verifiedFilled = Number(verify.fill_count_fp ?? verify.fill_count ?? verify.filled_count ?? 0);
@@ -946,7 +960,7 @@ export async function executeArb(
 
         // ── Compute actual KAL cost for the partial fill ──────────────────────
         const kalRawCostPartial = kalFillCostCents > 0 ? kalFillCostCents / 100 : kalFilled * kalAsk;
-        const kalCostPartial = Math.round((kalRawCostPartial + kalFeesTotal) * 100) / 100;
+        const kalCostPartial = Math.round(kalRawCostPartial * 100) / 100;
         const actualKalPricePartial = kalFillCostCents > 0 && kalFilled > 0
           ? Math.round((kalFillCostCents / 100 / kalFilled) * 10000) / 10000
           : kalAsk;
@@ -957,7 +971,7 @@ export async function executeArb(
           const oppAskNow = pmOppLeg ? await fetchPmAsk(pmOppLeg.tokenId, clobBase).catch(() => null) : null;
           const hedgeCostPm = Math.round(unhedgedCount * (oppAskNow ?? (1 - pmAsk)) * 100) / 100;
           const pmCostFull = Math.round(pmFilled * pmAsk * 100) / 100;
-          const totalCostResolved = Math.round((kalCostPartial + pmCostFull + hedgeCostPm) * 100) / 100;
+          const totalCostResolved = Math.round((kalCostPartial + kalFeesTotal + pmCostFull + hedgeCostPm) * 100) / 100;
           logArbTrade({
             id: `arb-${Date.now()}`, ts: new Date().toISOString(),
             match: `${entry.kal1.surname} vs ${entry.kal2.surname}`,
@@ -992,10 +1006,10 @@ export async function executeArb(
               kalCost: kalCostPartial, kalFees: kalFeesTotal,
               pmOutcome: pmLeg.outcome, pmSlug: entry.pmSlug, pmTokenId: pmLeg.tokenId,
               pmFillPrice: pmAsk, pmCost: pmCostMatched,
-              totalCost: Math.round((kalCostPartial + pmCostMatched) * 100) / 100,
+              totalCost: Math.round((kalCostPartial + kalFeesTotal + pmCostMatched) * 100) / 100,
               projectedEdge: edge, projectedProfit: kalFilled * edge,
               status: "filled",
-              realizedPnl: Math.round((kalFilled - kalCostPartial - pmCostMatched) * 100) / 100,
+              realizedPnl: Math.round((kalFilled - kalCostPartial - kalFeesTotal - pmCostMatched) * 100) / 100,
               initialExchange: "pm",
             });
             console.log(`  [PARTIAL FILL] Logged ${kalFilled} matched shares (KAL+PM). ${remaining} still unhedged.`);
@@ -1031,7 +1045,7 @@ export async function executeArb(
           const pcAvgPrice = pcFillCost > 0 && postCancelFilled > 0
             ? Math.round((pcFillCost / postCancelFilled) * 100) / 100
             : kalAsk;
-          const kalCostActual = Math.round((pcFillCost + pcFees) * 100) / 100;
+          const kalCostActual = Math.round(pcFillCost * 100) / 100;
           // PM cost must match the MATCHED shares, not total PM fills
           const pmCostMatched = Math.round(matchedShares * pmAsk * 100) / 100;
           logArbTrade({
@@ -1042,13 +1056,13 @@ export async function executeArb(
             kalCost: kalCostActual, kalFees: pcFees,
             pmOutcome: pmLeg.outcome, pmSlug: entry.pmSlug, pmTokenId: pmLeg.tokenId,
             pmFillPrice: pmAsk, pmCost: pmCostMatched,
-            totalCost: Math.round((kalCostActual + pmCostMatched) * 100) / 100,
+            totalCost: Math.round((kalCostActual + pcFees + pmCostMatched) * 100) / 100,
             projectedEdge: edge, projectedProfit: matchedShares * edge,
             status: unhedgedPm > 0 ? "filled" : "resolved",
             resolutionMethod: unhedgedPm > 0 ? undefined : "both-legs",
             resolvedTs: unhedgedPm > 0 ? undefined : new Date().toISOString(),
             initialExchange: "pm",
-            realizedPnl: Math.round((matchedShares - kalCostActual - pmCostMatched) * 100) / 100,
+            realizedPnl: Math.round((matchedShares - kalCostActual - pcFees - pmCostMatched) * 100) / 100,
           });
           printTimings();
           metric.firstLegFilled = pmFilled;
@@ -1097,7 +1111,7 @@ export async function executeArb(
             const lateKalFillCost = (Number(finalKalOrder.taker_fill_cost ?? 0) + Number(finalKalOrder.maker_fill_cost ?? 0)) / 100;
             const lateKalAvg = lateKalFillCost > 0 && kalLateFilledCount > 0
               ? Math.round((lateKalFillCost / kalLateFilledCount) * 100) / 100 : kalAsk;
-            const kalCostLate = Math.round((lateKalFillCost + lateKalFees) * 100) / 100;
+            const kalCostLate = Math.round(lateKalFillCost * 100) / 100;
             const pmCostLate = Math.round(pmFilled * pmAsk * 100) / 100;
             logArbTrade({
               id: `arb-${Date.now()}`, ts: new Date().toISOString(),
@@ -1107,12 +1121,12 @@ export async function executeArb(
               kalCost: kalCostLate, kalFees: lateKalFees,
               pmOutcome: pmLeg.outcome, pmSlug: entry.pmSlug, pmTokenId: pmLeg.tokenId,
               pmFillPrice: pmAsk, pmCost: pmCostLate,
-              totalCost: Math.round((kalCostLate + pmCostLate) * 100) / 100,
+              totalCost: Math.round((kalCostLate + lateKalFees + pmCostLate) * 100) / 100,
               projectedEdge: edge, projectedProfit: pmFilled * edge,
               status: "filled", initialExchange: "pm",
-              realizedPnl: Math.round((Math.min(kalLateFilledCount, pmFilled) - kalCostLate - pmCostLate) * 100) / 100,
+              realizedPnl: Math.round((Math.min(kalLateFilledCount, pmFilled) - kalCostLate - lateKalFees - pmCostLate) * 100) / 100,
             });
-            console.log(`  [RACE RECOVERY] Trade logged as KAL-filled (not hedged). P&L=$${(Math.min(kalLateFilledCount, pmFilled) - kalCostLate - pmCostLate).toFixed(2)}`);
+            console.log(`  [RACE RECOVERY] Trade logged as KAL-filled (not hedged). P&L=$${(Math.min(kalLateFilledCount, pmFilled) - kalCostLate - lateKalFees - pmCostLate).toFixed(2)}`);
             printTimings();
             metric.firstLegFilled = pmFilled;
             metric.secondLegFilled = kalLateFilledCount;
@@ -1396,27 +1410,28 @@ export async function executeArb(
 
     // Cap PM price at breakeven based on ACTUAL KAL fill cost (not scan-time estimate).
     // Without this, slippage or fees on KAL side can push total cost > $1/share → guaranteed loss.
-    pmOrderPrice = pmAsk;
     let pmPriceWasCapped = false;
     if (!DRY_RUN && kalFillCostCents > 0 && kalFilled > 0) {
       const actualKalPerShare = (kalFillCostCents / 100 + kalFeesTotal) / kalFilled;
-      const maxPmForBreakeven = 1 - actualKalPerShare;
-      if (pmAsk > maxPmForBreakeven) {
-        const pmTick = pmLeg.tickSize || 0.01;
-        pmOrderPrice = Math.floor(maxPmForBreakeven / pmTick) * pmTick;
-        pmPriceWasCapped = true;
-        console.log(
-          `  [PM LEG] Capping PM price: scan=${fmtPct(pmAsk)} → breakeven=${fmtPct(maxPmForBreakeven)} → order=${fmtPct(pmOrderPrice)}` +
-          ` (KAL actual=${fmtPct(actualKalPerShare)}/share incl fees)`
-        );
-        if (pmOrderPrice <= 0) {
-          console.warn(`  [PM LEG] Breakeven price ≤0 — KAL cost too high. Entering hedge mode.`);
-          printTimings();
-          metric.firstLegFilled = kalFilled;
-          saveExecMetric("hedge-entry", "pm-breakeven-negative");
-          return { sessionSkip: true, unhedged: makeUnhedged("kal", kalFilled) };
-        }
+      const rawBudget = 1 - actualKalPerShare;
+      const pmFeeAtBudget = PM_FEE_RATE * rawBudget * (1 - rawBudget);
+      const pmBudget = rawBudget - pmFeeAtBudget;
+      const pmTick = pmLeg.tickSize || 0.01;
+      pmOrderPrice = Math.floor(pmBudget / pmTick) * pmTick;
+      pmPriceWasCapped = true;
+      console.log(
+        `  [PM LEG] Breakeven PM price: rawBudget=${fmtPct(rawBudget)} pmFee=${fmtPct(pmFeeAtBudget)} → order=${fmtPct(pmOrderPrice)}` +
+        ` (KAL actual=${fmtPct(actualKalPerShare)}/share incl fees)`
+      );
+      if (pmOrderPrice <= 0) {
+        console.warn(`  [PM LEG] Breakeven price ≤0 — KAL cost too high. Entering hedge mode.`);
+        printTimings();
+        metric.firstLegFilled = kalFilled;
+        saveExecMetric("hedge-entry", "pm-breakeven-negative");
+        return { sessionSkip: true, unhedged: makeUnhedged("kal", kalFilled) };
       }
+    } else {
+      pmOrderPrice = pmAsk;
     }
 
     // ── PM FOK execution: single aggressive FOK at the ask ──────────────────
@@ -1475,7 +1490,7 @@ export async function executeArb(
         // FOK matched but on-chain confirmation pending — poll for it
         console.log(`  [PM LEG] FOK delayed (on-chain pending), polling for confirmation...`);
         const _tPoll0 = performance.now();
-        const finalStatus = await waitForPmOrderFill(String(fokMeta.orderId), 20_000, pmLeg.tokenId, pmPreBalance);
+        const finalStatus = await waitForPmOrderFill(String(fokMeta.orderId), 10_000, pmLeg.tokenId, pmPreBalance);
         tPmPoll = performance.now() - _tPoll0;
         if (finalStatus === "matched") {
           console.log(`  [PM LEG] Confirmed filled after delay (${tPmPoll.toFixed(0)}ms).`);
@@ -1663,13 +1678,15 @@ export async function executeArb(
   const kalRawCost = kalFillCostCents > 0
     ? kalFillCostCents / 100
     : shares * kalAsk;
-  const kalCostWithFees = Math.round((kalRawCost + kalFeesTotal) * 100) / 100;
+  const kalCostRaw = Math.round(kalRawCost * 100) / 100;
   const actualKalFillPrice = kalFillCostCents > 0 && kalFilled > 0
     ? Math.round((kalFillCostCents / 100 / kalFilled) * 10000) / 10000
     : kalAsk;
   // Use the ACTUAL order price (which may have been capped at breakeven), not the scan-time ask.
   const actualPmFillPrice = pmOrderPrice;
   const pmCostBothLegs = Math.round(shares * actualPmFillPrice * 100) / 100;
+  const pmTakerFee = Math.round(PM_FEE_RATE * actualPmFillPrice * (1 - actualPmFillPrice) * shares * 100) / 100;
+  const totalCostBothLegs = Math.round((kalCostRaw + kalFeesTotal + pmCostBothLegs + pmTakerFee) * 100) / 100;
   if (kalFillCostCents > 0) {
     console.log(`  [COST] KAL actual fill: ${kalFilled}×${(actualKalFillPrice * 100).toFixed(1)}¢ = $${kalRawCost.toFixed(2)} + $${kalFeesTotal.toFixed(2)} fee (snapshot was ${(kalAsk * 100).toFixed(0)}¢)`);
   }
@@ -1681,21 +1698,23 @@ export async function executeArb(
     ts: new Date().toISOString(),
     match: `${entry.kal1.surname} vs ${entry.kal2.surname}`,
     dir,
-    status: "filled",
+    status: "resolved",
+    resolutionMethod: "both-legs",
+    resolvedTs: new Date().toISOString(),
     shares,
     kalTicker: kalLeg.ticker,
     kalFillPrice: actualKalFillPrice,
-    kalCost: kalCostWithFees,
+    kalCost: kalCostRaw,
     kalFees: kalFeesTotal,
     pmOutcome: pmLeg.outcome,
     pmSlug: entry.pmSlug,
     pmTokenId: pmLeg.tokenId,
     pmFillPrice: actualPmFillPrice,
     pmCost: pmCostBothLegs,
-    totalCost: Math.round((kalCostWithFees + pmCostBothLegs) * 100) / 100,
+    totalCost: totalCostBothLegs,
     projectedEdge: edge,
     projectedProfit,
-    realizedPnl: Math.round((shares - kalCostWithFees - pmCostBothLegs) * 100) / 100,
+    realizedPnl: Math.round((shares - totalCostBothLegs) * 100) / 100,
     initialExchange: pmFirst ? "pm" : "kal",
     ...(kalFilledViaMaker ? { kalMakerFill: true } : {}),
   });
@@ -1856,7 +1875,7 @@ export async function executeArb3Leg(
           continue;
         }
         if (meta.status === "delayed" && meta.orderId) {
-          const finalStatus = await waitForPmOrderFill(String(meta.orderId), 20_000, leg.pmLeg.tokenId);
+          const finalStatus = await waitForPmOrderFill(String(meta.orderId), 10_000, leg.pmLeg.tokenId);
           if (finalStatus === "matched") {
             console.log(`  [${legLabel}] PM filled (delayed)`);
             filled.push({ leg, fillPrice: leg.price, fillCost: shares * leg.price });
@@ -2082,6 +2101,8 @@ export async function executeArb3Leg(
 // by both executeArb (cancelled ticker checks) and monitorLoop (seeding at startup).
 const _cancelledTickers = new Set<string>();
 const _cancelledEventKeys = new Set<string>();
+let _lastKalRestRefreshMs = 0;
+const KAL_REST_REFRESH_INTERVAL_MS = 300_000; // 5 min
 
 // ─── monitorLoop ─────────────────────────────────────────────────────────────
 
@@ -2522,7 +2543,7 @@ export async function monitorLoop(watchlist: WatchEntry[]): Promise<void> {
     // ── MID-SESSION RECOVERY: pick up auto-recovered trades from reconciliation ──
     // reconcilePositions may create "hedging" trades mid-session. Without this,
     // they'd sit in arb_trades.json doing nothing until the next restart.
-    if (_reconcileRecoveredTrades) {
+    if (_reconcileRecoveredTrades || cycle % 500 === 1) {
       setReconcileRecoveredTrades(false);
       const hsTickers = new Set(hedgeStates.map(hs => hs.position.kalLeg.ticker));
       const freshTrades = loadArbTrades();
@@ -2616,8 +2637,15 @@ export async function monitorLoop(watchlist: WatchEntry[]): Promise<void> {
       const hedgeCheckInterval = allOrdersPlaced ? 25 : 1; // 25 cycles ≈ 10s once orders are placed
 
       if (cycle % hedgeCheckInterval === 0) {
+        // Run all hedge cycles in parallel, non-blocking. Each has 90s timeout.
         for (const hs of hedgeStates) {
-          await runHedgeCycle(hs, clobBase);
+          Promise.race([
+            runHedgeCycle(hs, clobBase),
+            new Promise<void>(resolve => setTimeout(() => {
+              console.warn(`[HEDGE] runHedgeCycle timeout (90s) for ${hs.position.kalLeg.ticker}`);
+              resolve();
+            }, 90_000)),
+          ]);
         }
 
         // Remove resolved positions
@@ -2684,6 +2712,14 @@ export async function monitorLoop(watchlist: WatchEntry[]): Promise<void> {
             if (resolvedEntry) {
               sessionSkipSet.add(resolvedEntry.matchCode);
             }
+            // Orphan cleanup: cancel any remaining orders for this resolved position
+            for (const [oid, ho] of hs.activeOrders) {
+              try {
+                if (ho.exchange === "pm") cancelPmOrder(oid, DRY_RUN).catch(() => {});
+                else cancelKalshiOrder(oid, DRY_RUN).catch(() => {});
+              } catch { /* best effort */ }
+            }
+            hs.activeOrders.clear();
             return false;
           }
           return true;
@@ -2707,6 +2743,11 @@ export async function monitorLoop(watchlist: WatchEntry[]): Promise<void> {
       console.warn(`[CANC-MON] Monitor error: ${(err as Error).message}`);
     }
 
+    // ── SHADOW COMPARE: periodic cost-basis audit ──
+    if (cycle % 100 === 0) {
+      try { maybeShadowCompare(loadArbTrades(), "2026-04-05"); } catch { /* best effort */ }
+    }
+
     _step = "kal-prices";
     // ── 1. Refresh Kalshi prices: WS primary, REST every 30 cycles (~12s) ──
     // WS gives real-time best ask; REST is only needed for markets without WS data
@@ -2724,7 +2765,9 @@ export async function monitorLoop(watchlist: WatchEntry[]): Promise<void> {
     }
     // Only call REST if WS is missing data for >50% of prices, or every 30 cycles
     const kalWsCoverage = wsKalHits / (watchlist.length * 4);
-    if (kalWsCoverage < 0.5 || cycle % 30 === 0) {
+    const kalRefreshDue = Date.now() - _lastKalRestRefreshMs > KAL_REST_REFRESH_INTERVAL_MS;
+    if (kalWsCoverage < 0.5 || kalRefreshDue) {
+      _lastKalRestRefreshMs = Date.now();
       await refreshKalshiPrices(watchlist);
       // Re-overlay WS on top of REST (WS is more current)
       for (const e of watchlist) {
@@ -2781,16 +2824,23 @@ export async function monitorLoop(watchlist: WatchEntry[]): Promise<void> {
         }
       }
     }
-    // REST fallback for tokens without WS data
+    // REST fallback for tokens without WS data (with 3s timeout to prevent blocking)
     if (restNeeded.length > 0) {
       const PM_BATCH_SIZE = 20;
+      const PM_PRICE_TIMEOUT_MS = 3_000;
       for (let i = 0; i < restNeeded.length; i += PM_BATCH_SIZE) {
         const batch = restNeeded.slice(i, i + PM_BATCH_SIZE);
-        const results = await Promise.all(
-          batch.map(({ tid }) => fetchPmAskDirect(tid, clobBase).then(p => ({ tid, p })))
-        );
-        for (const { tid, p } of results) {
-          if (p !== null) pmPriceMap.set(tid, p);
+        try {
+          const results = await Promise.race([
+            Promise.all(batch.map(({ tid }) => fetchPmAskDirect(tid, clobBase).then(p => ({ tid, p })).catch(() => ({ tid, p: null as number | null })))),
+            new Promise<never>((_, rej) => setTimeout(() => rej(new Error("pm-prices-timeout")), PM_PRICE_TIMEOUT_MS)),
+          ]);
+          for (const { tid, p } of results) {
+            if (p !== null) pmPriceMap.set(tid, p);
+          }
+        } catch {
+          console.warn(`[POLL] PM price batch timed out (${PM_PRICE_TIMEOUT_MS / 1000}s) — using WS/cached data`);
+          break; // skip remaining batches
         }
       }
     }
@@ -2840,9 +2890,15 @@ export async function monitorLoop(watchlist: WatchEntry[]): Promise<void> {
         if (isCoinFlipAsk(pm1Ask) && isCoinFlipAsk(pm2Ask)) {
           let bid1 = getWsPmBestBid(entry.pm1.tokenId);
           let bid2 = getWsPmBestBid(entry.pm2.tokenId);
-          // REST fallback for bids when WS has no data
-          if (bid1 === null) bid1 = await fetchPmBidDirect(entry.pm1.tokenId, clobBase);
-          if (bid2 === null) bid2 = await fetchPmBidDirect(entry.pm2.tokenId, clobBase);
+          // REST fallback for bids when WS has no data (parallel fetch)
+          if (bid1 === null || bid2 === null) {
+            const [newBid1, newBid2] = await Promise.all([
+              bid1 === null ? fetchPmBidDirect(entry.pm1.tokenId, clobBase).catch(() => null) : Promise.resolve(bid1),
+              bid2 === null ? fetchPmBidDirect(entry.pm2.tokenId, clobBase).catch(() => null) : Promise.resolve(bid2),
+            ]);
+            if (bid1 === null) bid1 = newBid1;
+            if (bid2 === null) bid2 = newBid2;
+          }
           if (!coinFlipWarned.has(entry.matchCode)) {
             coinFlipWarned.add(entry.matchCode);
             console.warn(
@@ -3163,7 +3219,10 @@ export async function monitorLoop(watchlist: WatchEntry[]): Promise<void> {
         const is3LegDir = bestEntry.is3Way && ["A", "B", "C", "D", "E", "F"].includes(bestDir);
         const { sessionSkip, unhedged, abortReason } = is3LegDir
           ? await executeArb3Leg(bestEntry, bestDir, bestEdge)
-          : await executeArb(bestEntry, bestDir, bestKalAsk, bestPmAsk, bestEdge);
+          : await Promise.race([
+              executeArb(bestEntry, bestDir, bestKalAsk, bestPmAsk, bestEdge),
+              new Promise<never>((_, rej) => setTimeout(() => rej(new Error("executeArb-timeout-30s")), 30_000)),
+            ]);
         consecutiveErrors = 0; // reset on successful execution
 
         // Track consecutive aborts per match for cooldown
@@ -3204,7 +3263,10 @@ export async function monitorLoop(watchlist: WatchEntry[]): Promise<void> {
           );
         }
         if (unhedged) {
-          const newHs: HedgeState = { position: unhedged, activeOrders: new Map(), kalNextRetryAt: 0, pmOnlyCycles: 0 };
+          // Delay PM orders by 10s: the "failed" PM FAK may still be settling on-chain.
+          // PM delayed orders confirm in ~7s. 10s gives margin. After that, it's dead.
+          const pmDelay = unhedged.heldExchange === "kal" ? Date.now() + 10_000 : 0;
+          const newHs: HedgeState = { position: unhedged, activeOrders: new Map(), kalNextRetryAt: 0, pmNextRetryAt: pmDelay, pmOnlyCycles: 0 };
           hedgeStates.push(newHs);
           setAllHedgeStates(hedgeStates);
           saveHedgeStates(hedgeStates);

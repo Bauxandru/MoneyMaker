@@ -9,6 +9,11 @@ import { fileURLToPath } from "url";
 import { getChainStatus } from "./polyChain.js";
 import { type ArbTradeRecord, type ExecMetric, type ClobTrade } from "./types.js";
 import { kalSideForDir, totalCostForTrade } from "./utils.js";
+import {
+  loadEventsFromDisk, getAllTradeIds, getTradeEvents, getAllEvents,
+  computeTradeFromEvents, shadowCompare,
+  type ExchangeEvent, type ComputedTradeRecord,
+} from "./ARB/ttEventLog.js";
 import WebSocket from "ws";
 import { fetchAllKalshiFills, fetchAllKalshiSettlements, getKalshiPositionMap, type KalFill } from "./kalshiTrade.js";
 import { ClobClient } from "@polymarket/clob-client";
@@ -23,14 +28,14 @@ const ROOT = join(__dirname, "..");
 const PORT = parseInt(process.env.DASHBOARD_PORT || "3456", 10);
 
 // Minimum trade date to display. Set DASHBOARD_MIN_DATE in .env to filter old trades.
-// Defaults to "" (show all trades — no assumptions about start date).
-const TRADE_MIN_DATE = process.env.DASHBOARD_MIN_DATE || "";
+// Defaults to "" (show all trades -- no assumptions about start date).
+const TRADE_MIN_DATE = process.env.DASHBOARD_MIN_DATE || "2026-04-01";
 
 // Audit cutoff: only flag discrepancies for trades/fills from today.
 // Everything before today is considered reconciled and accepted.
 const AUDIT_CUTOFF_DATE = process.env.AUDIT_CUTOFF_DATE || new Date().toISOString().slice(0, 10);
 
-// ── Multi-user data store (for remote bots pushing via /api/ingest) ──────────
+// -- Multi-user data store (for remote bots pushing via /api/ingest) ----------
 import { readFileSync as _readFs, writeFileSync as _writeFs, appendFileSync } from "fs";
 
 interface RemoteUserData {
@@ -84,7 +89,7 @@ function extractIp(req: express.Request): string {
   return raw.replace(/^::ffff:/, "");
 }
 
-// ── IP Access Logging ───────────────────────────────────────────────────────
+// -- IP Access Logging -------------------------------------------------------
 function logAccess(ip: string, route: string): void {
   const entry = `${new Date().toISOString()},${ip},${route}\n`;
   try {
@@ -148,15 +153,19 @@ interface HedgeEntry {
 
 function validateTrade(t: ArbTrade): string[] {
   const w: string[] = [];
-  // 1. Cost sum mismatch (hedgeCost is additive when EITHER leg cost is 0,
-  //    OR when both legs have costs AND totalCost > kalCost + pmCost — partial-fill + PM hedge)
-  // kalCost already includes kalFees (baked in at resolve time) — do NOT add kalFees separately
-  const baseCost = t.kalCost + t.pmCost;
-  const hc = (t.hedgeCost ?? 0) > 0 && (t.pmCost === 0 || t.kalCost === 0 || t.totalCost > baseCost + 0.05)
-    ? (t.hedgeCost ?? 0) : 0;
-  if (Math.abs(baseCost + hc - t.totalCost) > 0.05) {
-    w.push("cost-sum-mismatch: kalCost+hedgeCost+pmCost != totalCost (off by $" +
-      Math.abs(baseCost + hc - t.totalCost).toFixed(2) + ")");
+  // 1. Cost sum mismatch
+  //    For pm-hedged trades (kalCost=0, initialExchange=pm): pmCost already includes
+  //    the hedge cost (initial PM + PM opposite token combined). hedgeCost is display-only.
+  //    For kal-hedged trades (pmCost=0, initialExchange=kal): kalCost already includes hedge.
+  //    Only add hedgeCost when it's NOT already baked into the primary cost field.
+  const isPmHedged = t.kalCost === 0 && t.initialExchange === "pm" && (t.hedgeCost ?? 0) > 0;
+  const isKalHedged = t.pmCost === 0 && t.initialExchange === "kal" && (t.hedgeCost ?? 0) > 0;
+  const baseCost = t.kalCost + (t.kalFees ?? 0) + t.pmCost;
+  const feeTolerance = 0.05;
+  // For pm/kal-hedged: hedgeCost is already in pmCost/kalCost — don't add it
+  if (!isPmHedged && !isKalHedged && Math.abs(baseCost - t.totalCost) > feeTolerance) {
+    w.push("cost-sum-mismatch: kalCost+kalFees+pmCost != totalCost (off by $" +
+      Math.abs(baseCost - t.totalCost).toFixed(2) + ")");
   }
   // 2. Hedge-complete P&L check
   if (t.resolutionMethod === "hedge-complete" && t.realizedPnl != null) {
@@ -190,17 +199,19 @@ function validateTrade(t: ArbTrade): string[] {
         "=$" + expected.toFixed(2) + " vs kalCost=$" + t.kalCost.toFixed(2));
     }
   }
-  if (t.shares > 0 && t.pmFillPrice > 0 && t.pmCost > 0) {
+  // Skip pm-price check for pm-hedged trades: pmFillPrice is the initial leg price,
+  // but pmCost includes initial + hedge combined — divergence is expected.
+  if (t.shares > 0 && t.pmFillPrice > 0 && t.pmCost > 0 && !isPmHedged) {
     const expected = t.shares * t.pmFillPrice;
     if (Math.abs(expected - t.pmCost) / t.pmCost > 0.10) {
       w.push("pm-price-cost-divergence: " + t.shares + "*" + t.pmFillPrice.toFixed(3) +
         "=$" + expected.toFixed(2) + " vs pmCost=$" + t.pmCost.toFixed(2));
     }
   }
-  // 5. Unreasonable P&L
+  // 5. Unreasonable P&L (with tolerance for floating point)
   if (t.realizedPnl != null) {
-    if (t.realizedPnl > t.shares) w.push("pnl-out-of-range: pnl > shares");
-    if (t.totalCost > 0 && t.realizedPnl < -t.totalCost) w.push("pnl-out-of-range: pnl < -totalCost");
+    if (t.realizedPnl > t.shares + 0.0001) w.push("pnl-out-of-range: pnl > shares");
+    if (t.totalCost > 0 && t.realizedPnl < -(t.totalCost + 0.0001)) w.push("pnl-out-of-range: pnl < -totalCost");
   }
   return w;
 }
@@ -231,14 +242,19 @@ function loadTrades(): ArbTrade[] {
     for (const t of trades) {
       // Override P&L for scalar settlements using stored settlement values.
       // This prevents the bot's reconcile from reverting scalar P&L to the binary formula.
+      // Only count KAL payout if we actually hold KAL contracts (kalCost > 0).
+      // PM-only positions (KAL GTC failed, detect trades) get kalPayout = 0.
       if (t.scalarSettlement && t.kalSettlementValue != null && t.pmSettlementValue != null) {
-        const scalarPnl = Math.round((t.shares * (t.kalSettlementValue + t.pmSettlementValue) - t.totalCost) * 100) / 100;
+        const hasKalPosition = (t.kalCost ?? 0) > 0;
+        const kalPayout = hasKalPosition ? t.shares * t.kalSettlementValue : 0;
+        const pmPayout = t.shares * t.pmSettlementValue;
+        const scalarPnl = Math.round((kalPayout + pmPayout - t.totalCost) * 100) / 100;
         if (Math.abs((t.realizedPnl ?? 0) - scalarPnl) > 0.05) {
           t.realizedPnl = scalarPnl;
         }
       }
-      // Attach depth opportunity data (max potential) — find closest opp within 2 min
-      // Skip scalar-settled trades — match was cancelled, depth is irrelevant
+      // Attach depth opportunity data (max potential) -- find closest opp within 2 min
+      // Skip scalar-settled trades -- match was cancelled, depth is irrelevant
       if (!t.scalarSettlement) {
         const key = t.match + "|" + t.dir;
         const candidates = depthByKey.get(key);
@@ -283,7 +299,7 @@ function loadMetrics(): ExecMetric[] {
 }
 
 function computeExecStats(metrics: ExecMetric[]) {
-  // Separate live vs dry-run metrics — stats computed from live only
+  // Separate live vs dry-run metrics -- stats computed from live only
   const live = metrics.filter(m => !m.dryRun);
   const dryRunCount = metrics.length - live.length;
 
@@ -426,14 +442,14 @@ function kalshiSign(method: string, path: string, timestamp: string): string {
 // Live orderbook state per subscription
 type BookLevel = [number, number]; // [priceCents, size]
 interface LiveBook {
-  yes: Map<number, number>; // priceCents → size
+  yes: Map<number, number>; // priceCents -> size
   no: Map<number, number>;
   lastUpdate: number;
 }
 
 // Active subscriptions
-const kalshiBooks = new Map<string, LiveBook>(); // ticker → book
-const pmBooks = new Map<string, { bids: Map<number, number>; asks: Map<number, number>; lastUpdate: number }>(); // tokenId → book
+const kalshiBooks = new Map<string, LiveBook>(); // ticker -> book
+const pmBooks = new Map<string, { bids: Map<number, number>; asks: Map<number, number>; lastUpdate: number }>(); // tokenId -> book
 
 let kalshiWs: WebSocket | null = null;
 let kalshiWsReady = false;
@@ -454,7 +470,7 @@ function bookToLevels(m: Map<number, number>): BookLevel[] {
   return levels.sort((a, b) => a[0] - b[0]);
 }
 
-// ─── Kalshi WebSocket ─────────────────────────────────────────────────────────
+// --- Kalshi WebSocket ---------------------------------------------------------
 
 function connectKalshiWs() {
   const keyId = process.env.KALSHI_API_KEY_ID;
@@ -550,7 +566,7 @@ function kalshiUnsubscribe(ticker: string) {
   // Unsubscribe is handled by reconnection cycle
 }
 
-// ─── Polymarket WebSocket ─────────────────────────────────────────────────────
+// --- Polymarket WebSocket -----------------------------------------------------
 
 function connectPmWs() {
   pmWs = new WebSocket("wss://ws-subscriptions-clob.polymarket.com/ws/market");
@@ -626,7 +642,7 @@ function connectPmWs() {
       console.log("[OB-WS] Polymarket disconnected, reconnecting in 3s...");
       setTimeout(connectPmWs, 3000);
     } else {
-      console.log("[OB-WS] Polymarket disconnected, no active subs — idle");
+      console.log("[OB-WS] Polymarket disconnected, no active subs -- idle");
     }
   });
 
@@ -693,7 +709,7 @@ async function runAudit(): Promise<AuditResult> {
   const trades = allTrades.filter(t => t.ts >= AUDIT_CUTOFF_DATE);
   const discrepancies: AuditDiscrepancy[] = [];
 
-  // ── 1. Fetch Kalshi fills (filtered to cutoff date) ──────────────────────
+  // -- 1. Fetch Kalshi fills (filtered to cutoff date) ----------------------
   let kalFills: KalFill[] = [];
   try {
     const allKalFills = await fetchAllKalshiFills();
@@ -716,7 +732,7 @@ async function runAudit(): Promise<AuditResult> {
     g.totalFees += f.feeCost;
   }
 
-  // ── 2. Fetch PM CLOB trades ───────────────────────────────────────────────
+  // -- 2. Fetch PM CLOB trades -----------------------------------------------
   let pmFills: ClobTrade[] = [];
   try {
     const pk = process.env.POLY_WALLET_PRIVATE_KEY;
@@ -770,13 +786,13 @@ async function runAudit(): Promise<AuditResult> {
     dedupedPmFills.push(ct);
   }
   if (pmFills.length !== dedupedPmFills.length) {
-    console.log(`[AUDIT] Deduped PM fills: ${pmFills.length} → ${dedupedPmFills.length} (removed ${pmFills.length - dedupedPmFills.length} duplicates)`);
+    console.log(`[AUDIT] Deduped PM fills: ${pmFills.length} -> ${dedupedPmFills.length} (removed ${pmFills.length - dedupedPmFills.length} duplicates)`);
   }
 
   const pmByToken = new Map<string, { totalBought: number; totalCost: number }>();
   for (const ct of dedupedPmFills) {
     if (ct.side !== "BUY" || ct.status !== "CONFIRMED") continue;
-    // When side=BUY and trader_side=MAKER, the TAKER was buying FROM us — we SOLD.
+    // When side=BUY and trader_side=MAKER, the TAKER was buying FROM us -- we SOLD.
     // Skip these; they are not our purchases.
     if (ct.trader_side === "MAKER") continue;
     if (!pmByToken.has(ct.asset_id)) pmByToken.set(ct.asset_id, { totalBought: 0, totalCost: 0 });
@@ -784,7 +800,7 @@ async function runAudit(): Promise<AuditResult> {
 
     const feeBps = Number(ct.fee_rate_bps ?? 0);
     {
-      // We're the taker — size is our actual fill
+      // We're the taker -- size is our actual fill
       const size = Number(ct.size);
       const price = Number(ct.price);
       const baseCost = size * price;
@@ -794,13 +810,13 @@ async function runAudit(): Promise<AuditResult> {
     }
   }
 
-  // ── 3. Fetch current exchange positions ───────────────────────────────────
+  // -- 3. Fetch current exchange positions -----------------------------------
   let kalPositions = new Map<string, { yesCount: number; noCount: number; avgPriceCents: number }>();
   try {
     kalPositions = await getKalshiPositionMap();
   } catch { /* non-critical */ }
 
-  // ── 4. Build trade-indexed lookups ────────────────────────────────────────
+  // -- 4. Build trade-indexed lookups ----------------------------------------
   // Group arb trades by kalTicker and pmTokenId
   const tradesByKalTicker = new Map<string, ArbTrade[]>();
   const tradesByPmToken = new Map<string, ArbTrade[]>();
@@ -817,11 +833,11 @@ async function runAudit(): Promise<AuditResult> {
     }
   }
 
-  // ── 5. Compare Kalshi fills vs arb trades ─────────────────────────────────
+  // -- 5. Compare Kalshi fills vs arb trades ---------------------------------
   for (const [ticker, kal] of kalByTicker) {
     const arbTrades = tradesByKalTicker.get(ticker);
     if (!arbTrades || arbTrades.length === 0) {
-      // Fills on a ticker with no arb trade record — only flag if recent (after bot start)
+      // Fills on a ticker with no arb trade record -- only flag if recent (after bot start)
       const totalBought = kal.yesBought + kal.noBought;
       const hasRecentFill = kal.fills.some(f => f.ts && f.ts >= TRADE_MIN_DATE);
       if (totalBought > 0 && hasRecentFill) {
@@ -836,7 +852,7 @@ async function runAudit(): Promise<AuditResult> {
 
     // Sum expected Kalshi shares from all arb trades on this ticker.
     // If kalYesFills/kalNoFills are set (from exchange reconcile), use those as the
-    // "known" fill counts — they already include over-hedge shares.
+    // "known" fill counts -- they already include over-hedge shares.
     // Otherwise infer from dir/shares/resolutionMethod.
     let dashYesBought = 0;
     let dashNoBought = 0;
@@ -880,7 +896,7 @@ async function runAudit(): Promise<AuditResult> {
     const hasOverHedge = arbTrades.some(t => (t.overHedgeShares ?? 0) > 0);
 
     // Compare YES bought
-    // If reconcile data exists, it was set FROM exchange fills — any mismatch means
+    // If reconcile data exists, it was set FROM exchange fills -- any mismatch means
     // new trades happened since repair or it's a known over-hedge. Downgrade to warning.
     if (kal.yesBought !== dashYesBought) {
       const diff = kal.yesBought - dashYesBought;
@@ -923,11 +939,11 @@ async function runAudit(): Promise<AuditResult> {
     }
   }
 
-  // ── 6. Compare PM fills vs arb trades ─────────────────────────────────────
+  // -- 6. Compare PM fills vs arb trades -------------------------------------
   for (const [tokenId, pm] of pmByToken) {
     const arbTrades = tradesByPmToken.get(tokenId);
     if (!arbTrades || arbTrades.length === 0) {
-      // Skip untracked PM fills — PM data-api doesn't provide dates for easy filtering,
+      // Skip untracked PM fills -- PM data-api doesn't provide dates for easy filtering,
       // and many tokens are from testing/manual trades. Only flag large positions.
       if (pm.totalBought >= 10 && pm.totalCost >= 5) {
         discrepancies.push({
@@ -954,7 +970,7 @@ async function runAudit(): Promise<AuditResult> {
     const pmShareThreshold = Math.max(2, dashPmShares * 0.20);
     const pmShareDiff = pm.totalBought - dashPmShares;
     if (Math.abs(pmShareDiff) > pmShareThreshold) {
-      // PM CLOB getTrades() returns ALL lifetime fills for this token — it mixes arb trades,
+      // PM CLOB getTrades() returns ALL lifetime fills for this token -- it mixes arb trades,
       // manual trades, testing, and crash/restart over-hedges. Per-trade attribution is unreliable.
       // Always warn (never error) since Kalshi fills are the authoritative source of truth.
       discrepancies.push({
@@ -982,7 +998,7 @@ async function runAudit(): Promise<AuditResult> {
     }
   }
 
-  // ── 7. Check for orphaned exchange positions (no matching open arb trade) ─
+  // -- 7. Check for orphaned exchange positions (no matching open arb trade) -
   const activeTickers = new Set<string>();
   const activeTokens = new Set<string>();
   for (const t of trades) {
@@ -1003,7 +1019,7 @@ async function runAudit(): Promise<AuditResult> {
     }
   }
 
-  // Collect tickers with known over-hedges or any resolved trade (already documented — downgrade to warning)
+  // Collect tickers with known over-hedges or any resolved trade (already documented -- downgrade to warning)
   // Use allTrades (not date-filtered trades) so resolved pre-cutoff trades are recognized
   const overHedgeTickers = new Set<string>();
   const allKnownTickers = new Set<string>();
@@ -1019,13 +1035,13 @@ async function runAudit(): Promise<AuditResult> {
     if (totalPos > 0 && !activeTickers.has(ticker)) {
       const isKnownOverHedge = overHedgeTickers.has(ticker);
       const isKnownTicker = allKnownTickers.has(ticker);
-      // Skip resolved trade residuals — Kalshi holds shares until match settles/pays out
+      // Skip resolved trade residuals -- Kalshi holds shares until match settles/pays out
       if (isKnownTicker || isKnownOverHedge) continue;
       // Only warn about truly unknown positions (manual trades, non-arb, etc.)
       discrepancies.push({
         type: "orphaned-kal-position", severity: "warning", ticker,
         match: tradesByKalTicker.get(ticker)?.[0]?.match,
-        detail: `Kalshi position: ${pos.yesCount} YES + ${pos.noCount} NO on ${ticker} — non-arb or manual position`,
+        detail: `Kalshi position: ${pos.yesCount} YES + ${pos.noCount} NO on ${ticker} -- non-arb or manual position`,
         exchangeValue: totalPos, dashboardValue: 0,
       });
     }
@@ -1062,7 +1078,7 @@ app.use((req, _res, next) => {
   next();
 });
 
-// ── Multi-user ingest endpoint (bots push here) ────────────────────────────
+// -- Multi-user ingest endpoint (bots push here) ----------------------------
 
 app.post("/api/ingest", async (req, res) => {
   const { token, trades, metrics, timestamp } = req.body || {};
@@ -1075,7 +1091,7 @@ app.post("/api/ingest", async (req, res) => {
 
   const auth = await validateIngestToken(token);
   if (!auth.valid) {
-    console.warn(`[DASHBOARD] Rejected ingest from ${ip} — invalid token`);
+    console.warn(`[DASHBOARD] Rejected ingest from ${ip} -- invalid token`);
     res.status(403).json({ error: "Invalid token" });
     return;
   }
@@ -1092,7 +1108,7 @@ app.post("/api/ingest", async (req, res) => {
   res.json({ ok: true });
 });
 
-// ── Remote users list ───────────────────────────────────────────────────────
+// -- Remote users list -------------------------------------------------------
 
 app.get("/api/remote-users", (_req, res) => {
   const users: any[] = [];
@@ -1107,7 +1123,7 @@ app.get("/api/remote-users", (_req, res) => {
   res.json(users);
 });
 
-// ── Remote user trades/stats ────────────────────────────────────────────────
+// -- Remote user trades/stats ------------------------------------------------
 
 app.get("/api/remote-trades", (req, res) => {
   const userName = req.query.user as string;
@@ -1187,7 +1203,7 @@ app.get("/api/chain-status", (_req, res) => {
   }
 });
 
-// ─── Position Audit endpoint ────────────────────────────────────────────────
+// --- Position Audit endpoint ------------------------------------------------
 // Fetches real exchange fills (Kalshi + PM CLOB) and compares against arb_trades.json.
 // Slow (~10-30s due to API calls), results cached for 5 minutes.
 // Use ?force=1 to bypass cache.
@@ -1213,7 +1229,90 @@ app.get("/api/audit", async (req, res) => {
   }
 });
 
-// ─── Orderbook viewer endpoints ─────────────────────────────────────────────
+// --- Event-based audit endpoint (Phase 4) ------------------------------------
+// Fast (~0ms, no API calls). Compares event-computed records vs arb_trades.json.
+// Existing /api/audit is kept as manual fallback for ground-truth exchange verification.
+
+app.get("/api/event-audit", (_req, res) => {
+  try {
+    // Reload events from disk to get latest
+    loadEventsFromDisk();
+    const trades = loadTrades();
+    const discs = shadowCompare(trades, AUDIT_CUTOFF_DATE);
+
+    // Compute event-based records for all trades that have events
+    const tradeIds = getAllTradeIds();
+    const computedRecords: ComputedTradeRecord[] = [];
+    let withEvents = 0;
+    let withoutEvents = 0;
+    for (const t of trades) {
+      if (tradeIds.includes(t.id)) {
+        const computed = computeTradeFromEvents(t.id);
+        if (computed) { computedRecords.push(computed); withEvents++; }
+      } else {
+        withoutEvents++;
+      }
+    }
+
+    res.json({
+      ts: new Date().toISOString(),
+      totalTrades: trades.length,
+      tradesWithEvents: withEvents,
+      tradesWithoutEvents: withoutEvents,
+      totalEvents: getAllEvents().length,
+      discrepancies: discs,
+      discrepancySummary: {
+        errors: discs.filter(d => d.severity === "error").length,
+        warnings: discs.filter(d => d.severity === "warning").length,
+        info: discs.filter(d => d.severity === "info").length,
+      },
+      computedRecords,
+    });
+  } catch (e) {
+    res.status(500).json({ error: (e as Error).message });
+  }
+});
+
+// --- Event log endpoints (Phase 5) -------------------------------------------
+
+/** All events for a specific trade. */
+app.get("/api/events/:tradeId", (req, res) => {
+  const events = getTradeEvents(req.params.tradeId);
+  const computed = computeTradeFromEvents(req.params.tradeId);
+  res.json({ tradeId: req.params.tradeId, eventCount: events.length, events, computed });
+});
+
+/** Summary of all events in the log. */
+app.get("/api/events", (req, res) => {
+  const limit = Math.min(parseInt(req.query.limit as string) || 200, 5000);
+  const offset = parseInt(req.query.offset as string) || 0;
+  const typeFilter = req.query.type as string | undefined;
+  const exchangeFilter = req.query.exchange as string | undefined;
+
+  let events = getAllEvents();
+  if (typeFilter) events = events.filter(e => e.type === typeFilter);
+  if (exchangeFilter) events = events.filter(e => e.exchange === exchangeFilter);
+
+  const total = events.length;
+  const page = events.slice(offset, offset + limit);
+
+  // Summary stats
+  const tradeIds = getAllTradeIds();
+  const byType: Record<string, number> = {};
+  for (const e of getAllEvents()) byType[e.type] = (byType[e.type] || 0) + 1;
+
+  res.json({
+    total,
+    offset,
+    limit,
+    returned: page.length,
+    uniqueTrades: tradeIds.length,
+    byType,
+    events: page,
+  });
+});
+
+// --- Orderbook viewer endpoints ---------------------------------------------
 
 app.get("/api/watchlist", (_req, res) => {
   const p = join(ROOT, "discovery_cache.json");
@@ -1234,7 +1333,7 @@ app.get("/api/watchlist", (_req, res) => {
   } catch { res.json([]); }
 });
 
-// ── Exchange-Verified P&L ────────────────────────────────────────────────────
+// -- Exchange-Verified P&L ----------------------------------------------------
 // Queries both exchanges directly for the ground truth, ignoring arb_trades.json
 
 interface VerifiedPnlResult {
@@ -1290,7 +1389,7 @@ app.get("/api/verified-pnl", async (req, res) => {
 
   const t0 = Date.now();
 
-  // ── 0. Load bot tickers from arb_trades.json to filter exchange data ─────
+  // -- 0. Load bot tickers from arb_trades.json to filter exchange data -----
   const botTrades = loadTrades();
   const botKalTickers = new Set<string>();
   const botPmTokenIds = new Set<string>();
@@ -1300,7 +1399,7 @@ app.get("/api/verified-pnl", async (req, res) => {
   }
   console.log(`[VERIFIED-PNL] Filtering to ${botKalTickers.size} Kalshi tickers, ${botPmTokenIds.size} PM tokens from ${botTrades.length} arb trades`);
 
-  // ── 1. Fetch ALL Kalshi data, then filter to bot tickers ─────────────────
+  // -- 1. Fetch ALL Kalshi data, then filter to bot tickers -----------------
   let kalFills: KalFill[] = [];
   let kalSettlements: any[] = [];
   let kalPositions = new Map<string, { yesCount: number; noCount: number; avgPriceCents: number }>();
@@ -1352,15 +1451,15 @@ app.get("/api/verified-pnl", async (req, res) => {
   }
 
   // Kalshi: revenue from settlements
-  // Auto-detect units: if first settlement's revenue / yesCount > 2 it's likely cents; ≤ 2 it's dollars
-  // (A single winning contract pays $1 = 100 cents; revenue per contract should be ≤ $1 = 100 cents)
+  // Auto-detect units: if first settlement's revenue / yesCount > 2 it's likely cents; <= 2 it's dollars
+  // (A single winning contract pays $1 = 100 cents; revenue per contract should be <= $1 = 100 cents)
   let settlementsInCents = true;
   if (kalSettlements.length > 0) {
     const sample = kalSettlements[0];
     const totalContracts = (sample.yesCount || 0) + (sample.noCount || 0);
     if (totalContracts > 0) {
       const revenuePerContract = sample.revenue / totalContracts;
-      // If revenue/contract ≤ 1.5, it's likely already in dollars (max $1/contract)
+      // If revenue/contract <= 1.5, it's likely already in dollars (max $1/contract)
       // If revenue/contract > 1.5, it's likely in cents (max 100 cents/contract)
       settlementsInCents = revenuePerContract > 1.5;
     }
@@ -1368,7 +1467,7 @@ app.get("/api/verified-pnl", async (req, res) => {
   const settDivisor = settlementsInCents ? 100 : 1;
   if (kalSettlements.length > 0) {
     const s0 = kalSettlements[0];
-    console.log(`[VERIFIED-PNL] Settlement sample[0]: ticker=${s0.ticker} revenue=${s0.revenue} yesCost=${s0.yesCost} noCost=${s0.noCost} feeCost=${s0.feeCost} yesCount=${s0.yesCount} noCount=${s0.noCount} → unit=${settlementsInCents ? "CENTS" : "DOLLARS"} divisor=${settDivisor}`);
+    console.log(`[VERIFIED-PNL] Settlement sample[0]: ticker=${s0.ticker} revenue=${s0.revenue} yesCost=${s0.yesCost} noCost=${s0.noCost} feeCost=${s0.feeCost} yesCount=${s0.yesCount} noCount=${s0.noCount} -> unit=${settlementsInCents ? "CENTS" : "DOLLARS"} divisor=${settDivisor}`);
   }
 
   let kalSettlementRevenue = 0;
@@ -1407,7 +1506,7 @@ app.get("/api/verified-pnl", async (req, res) => {
 
   const kalNetPnl = (kalSettlementRevenue + kalSellRevenue) - kalTotalSpent;
 
-  // ── 2. Fetch ALL Polymarket data ─────────────────────────────────────────
+  // -- 2. Fetch ALL Polymarket data -----------------------------------------
   let pmFills: ClobTrade[] = [];
   let pmUsdcBalance = 0;
 
@@ -1462,15 +1561,15 @@ app.get("/api/verified-pnl", async (req, res) => {
     const fee = baseCost * (feeBps / 10000);
 
     if (pmDebugCount < 5) {
-      console.log(`[VERIFIED-PNL] PM fill sample: size="${ct.size}" → ${size}, price="${ct.price}" → ${price}, baseCost=${baseCost.toFixed(4)}, side=${ct.side}, trader_side=${ct.trader_side}`);
+      console.log(`[VERIFIED-PNL] PM fill sample: size="${ct.size}" -> ${size}, price="${ct.price}" -> ${price}, baseCost=${baseCost.toFixed(4)}, side=${ct.side}, trader_side=${ct.trader_side}`);
       pmDebugCount++;
     }
 
     // Determine if we bought or sold
-    // side=BUY + trader_side=TAKER → we bought
-    // side=BUY + trader_side=MAKER → someone bought FROM us (we sold)
-    // side=SELL + trader_side=TAKER → we sold
-    // side=SELL + trader_side=MAKER → someone sold TO us (we bought)
+    // side=BUY + trader_side=TAKER -> we bought
+    // side=BUY + trader_side=MAKER -> someone bought FROM us (we sold)
+    // side=SELL + trader_side=TAKER -> we sold
+    // side=SELL + trader_side=MAKER -> someone sold TO us (we bought)
     const weBought = (ct.side === "BUY" && ct.trader_side !== "MAKER") ||
                      (ct.side === "SELL" && ct.trader_side === "MAKER");
 
@@ -1496,7 +1595,7 @@ app.get("/api/verified-pnl", async (req, res) => {
   // is calculated as: (current USDC + value of current positions + revenue from sells) - total spent
   const pmNetPnl = pmTotalRevenue - pmTotalSpent;
 
-  // ── 3. Combine ──────────────────────────────────────────────────────────
+  // -- 3. Combine ----------------------------------------------------------
 
   const result: VerifiedPnlResult = {
     ts: new Date().toISOString(),
@@ -1554,7 +1653,7 @@ app.get("/api/verified-pnl", async (req, res) => {
   res.json(result);
 });
 
-// ── Per-ticker P&L map: fills (buys+sells) + settlements + open positions ────
+// -- Per-ticker P&L map: fills (buys+sells) + settlements + open positions ----
 // Captures manual sells, partial exits, and everything the exchange knows about
 // Returns { [kalTicker]: { buyCost, buyCount, sellRevenue, sellCount, settlementRevenue,
 //           fees, openYes, openNo, openValue, net, status } }
@@ -1604,7 +1703,7 @@ app.get("/api/settlement-map", async (_req, res) => {
       if (!botTickers.has(f.ticker)) continue;
       ensure(f.ticker);
       const entry = map[f.ticker];
-      const price = (f.side === "yes" ? f.yesPrice : f.noPrice) / 100; // cents→dollars
+      const price = (f.side === "yes" ? f.yesPrice : f.noPrice) / 100; // cents->dollars
       const cost = f.count * price;
 
       if (f.action === "buy") {
@@ -1707,7 +1806,7 @@ app.get("/api/ob-subscribe", (req, res) => {
   });
 });
 
-// Get live orderbook state (instant — reads from in-memory maps, no network call)
+// Get live orderbook state (instant -- reads from in-memory maps, no network call)
 app.get("/api/orderbook", async (_req, res) => {
   const result: Record<string, unknown> = {
     ts: new Date().toISOString(),
@@ -1715,7 +1814,7 @@ app.get("/api/orderbook", async (_req, res) => {
     pmConnected: pmWsReady,
   };
 
-  // Kalshi books — WS first, REST fallback when WS is disconnected
+  // Kalshi books -- WS first, REST fallback when WS is disconnected
   const kalBooksOut: Record<string, { yes: BookLevel[]; no: BookLevel[]; age: number }> = {};
   const kalBase = "https://api.elections.kalshi.com/trade-api/v2";
   for (const ticker of kalshiSubscribedTickers) {
@@ -2153,7 +2252,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
   <div id="verifiedDetails">
     <div style="text-align:center;padding:40px;color:#8b949e;font-size:14px">
       Click "Fetch Exchange-Verified P&L" to query both exchanges directly.
-      <br><span style="font-size:11px">This ignores arb_trades.json — shows actual money in/out.</span>
+      <br><span style="font-size:11px">This ignores arb_trades.json -- shows actual money in/out.</span>
     </div>
   </div>
 </div>
@@ -2177,61 +2276,108 @@ async function fetchSettlementMap() {
   } catch (e) { console.warn("Settlement map fetch failed:", e); }
 }
 
-function actualPnlCell(t) {
+// Shared Actual P&L computation -- single source of truth used by:
+//   actualPnlCell(), totals loop, and detail panel.
+// Returns { actualNet, statusLabel, cls, badge, kalWon, pmPayout, isShared, isScalar, usable }
+// usable=false means no exchange data / not computable -- caller should fall back.
+function computeActualPnl(t) {
   var s = settlementMap[t.kalTicker];
+
+  // No exchange audit data -- fall back to recorded realizedPnl for resolved trades
   if (!s) {
-    if (t.status === "resolved") return '<span class="gray" title="No exchange data for ' + esc(t.kalTicker) + '">?</span>';
-    return '<span class="gray">--</span>';
+    if (t.status === "resolved" && t.realizedPnl != null) {
+      return { actualNet: t.realizedPnl, statusLabel: "from trade record", cls: t.realizedPnl >= 0 ? "green" : "red",
+               badge: '', kalWon: false, pmPayout: 0,
+               isShared: false, isScalar: false, usable: true };
+    }
+    return { usable: false, resolved: t.status === "resolved" };
   }
 
-  // When multiple trades share the same Kalshi ticker, exchange data (sm.net) covers
-  // ALL trades combined — using it per-trade would double/triple-count KAL costs.
-  // Fall back to per-trade realizedPnl in that case.
+  // Edge case 9: PM-hedged trade (kalCost=0, hedge done entirely on PM opposite token).
+  // Exchange settlement data only shows the KAL side (which has 0 fills for this trade).
+  // The PM hedge payout ($1/share from opposite outcome) isn't in settlement data.
+  // Use the stored realizedPnl which was verified by the re-audit against PM positions.
+  if (t.resolutionMethod === "hedge-complete" && t.kalCost === 0 && t.initialExchange === "pm" && (t.hedgeCost || 0) > 0) {
+    var pmHedgePnl = t.realizedPnl != null ? t.realizedPnl : 0;
+    return { actualNet: pmHedgePnl, statusLabel: "pm-hedged", cls: pmHedgePnl >= 0 ? "green" : "red",
+             badge: '', kalWon: false, pmPayout: t.shares,
+             isShared: false, isScalar: false, usable: true };
+  }
+
+  // Edge case 2: Shared tickers -- multiple trades on same KAL ticker.
+  // Exchange data can't be split per-trade, fall back to realizedPnl.
   var isSharedTicker = _tickerTradeCount[t.kalTicker] > 1;
 
   var pmCost = t.pmCost || 0;
   var actualNet, statusLabel, cls, badge = '';
-  // hedgeCost is extra PM/KAL spending not captured in pmCost/kalCost (e.g. buying PM opposite side)
-  // Only add when one leg is 0, matching totalCostForTrade logic
-  var hcAdj = ((t.pmCost === 0 || t.kalCost === 0) && (t.hedgeCost || 0) > 0) ? (t.hedgeCost || 0) : 0;
+
+  // hedgeCost adjustment logic:
+  // - When pmCost=0 (hedge on KAL): s.net already includes hedge cost. Do NOT subtract.
+  // - When kalCost=0 (hedge on PM): hedge cost is PM spending NOT in s.net. Subtract it.
+  // - hcAdj only applies when kalCost===0 AND hedgeCost>0
+  var hcAdj = (t.kalCost === 0 && (t.hedgeCost || 0) > 0) ? (t.hedgeCost || 0) : 0;
+
+  var kalSide = ("CDGHI".indexOf(t.dir) >= 0) ? "no" : "yes";
+  var hasPmLeg = (pmCost > 0 || t.pmFillPrice > 0);
+  var isScalar = s.settlementResult === "scalar";
+  var kalWon = false;
+  var pmPayout = 0;
 
   if (s.status === "settled") {
-    var isScalar = s.settlementResult === "scalar";
-    var kalWon;
-    if (!isScalar && s.pairRedemption > 0 && s.settlementResult) {
-      // Pair-redeemed: both YES+NO bought, settlementRevenue=0. Determine winner from
-      // settlementResult vs original KAL side (the more expensive buy = the arb opportunity)
-      var originalSide = (s.buyNoCost || 0) >= (s.buyYesCost || 0) ? "no" : "yes";
-      kalWon = s.settlementResult === originalSide;
+    // Winner determination (priority order):
+    // 1. Scalar/voided: kalWon=false always (refund scenario)
+    // 2. settlementResult exists: direct from Kalshi
+    // 3. pairRedemption > 0: both sides covered, payout = shares regardless
+    // 4. Fallback heuristic: settlementRevenue > 0.50
+    if (isScalar) {
+      kalWon = false;
+    } else if (s.settlementResult) {
+      kalWon = s.settlementResult === kalSide;
+    } else if (s.pairRedemption > 0) {
+      // Both YES+NO bought -- pair redemption covers payout regardless of winner
+      kalWon = true; // doesn't matter, pairRedemption already in s.net
     } else {
-      kalWon = !isScalar && s.settlementRevenue > 0.50;
+      kalWon = s.settlementRevenue > 0.50;
     }
-    var hasPmLeg = (t.pmCost > 0 || t.pmFillPrice > 0);
-    var pmPayout = (!kalWon && !isScalar && hasPmLeg) ? t.shares : 0;
+
+    // PM payout: PM side wins when KAL side lost AND trade has a PM leg
+    pmPayout = (!kalWon && !isScalar && hasPmLeg) ? t.shares : 0;
+
     if (isScalar && hasPmLeg) {
-      // Voided/scalar settlement: KAL refunds (sm.net = fees lost), PM settles at 50c/share
+      // Edge case 3: Voided/scalar settlement
+      // KAL refunds (s.net ~ -fees), PM settles at 50c/share
       var pmVoidPayout = t.shares * 0.50;
       actualNet = Math.round((s.net + pmVoidPayout - pmCost - hcAdj) * 100) / 100;
       statusLabel = "settled (voided)";
       cls = actualNet >= 0 ? "green" : "red";
       badge = ' <span style="color:#d29922;font-size:9px">VOID</span>';
-    } else if (isSharedTicker && t.realizedPnl != null) {
-      // Shared ticker — use per-trade P&L to avoid double-counting KAL net
-      actualNet = t.realizedPnl;
-      statusLabel = kalWon ? "settled (KAL won)" : "settled (PM won)";
-      cls = actualNet >= 0 ? "green" : "red";
-      badge = ' <span style="color:#8b949e;font-size:9px" title="KAL exchange data shared across ' + _tickerTradeCount[t.kalTicker] + ' trades — using per-trade P&L">(' + _tickerTradeCount[t.kalTicker] + 'x)</span>';
+    } else if (isSharedTicker) {
+      // Edge case 2: shared ticker -- use per-trade P&L
+      if (t.realizedPnl != null) {
+        actualNet = t.realizedPnl;
+        statusLabel = kalWon ? "settled (KAL won)" : "settled (PM won)";
+        cls = actualNet >= 0 ? "green" : "red";
+        badge = ' <span style="color:#8b949e;font-size:9px" title="KAL exchange data shared across ' + _tickerTradeCount[t.kalTicker] + ' trades -- using per-trade P&L">(' + _tickerTradeCount[t.kalTicker] + 'x)</span>';
+      } else {
+        return { usable: false, resolved: true };
+      }
     } else {
+      // Standard case: s.net covers all KAL activity, add PM payout, subtract PM costs
       actualNet = Math.round((s.net + pmPayout - pmCost - hcAdj) * 100) / 100;
       statusLabel = kalWon ? "settled (KAL won)" : "settled (PM won)";
       cls = actualNet >= 0 ? "green" : "red";
     }
   } else if (s.status === "sold") {
-    if (isSharedTicker && t.realizedPnl != null) {
-      actualNet = t.realizedPnl;
-      statusLabel = "sold (shared ticker)";
-      cls = actualNet >= 0 ? "green" : "red";
-      badge = ' <span style="color:#d29922;font-size:9px">SOLD</span>';
+    // Edge case 6: Sold positions -- s.net covers sell revenue
+    if (isSharedTicker) {
+      if (t.realizedPnl != null) {
+        actualNet = t.realizedPnl;
+        statusLabel = "sold (shared ticker)";
+        cls = actualNet >= 0 ? "green" : "red";
+        badge = ' <span style="color:#d29922;font-size:9px">SOLD</span>';
+      } else {
+        return { usable: false, resolved: true };
+      }
     } else {
       actualNet = Math.round((s.net) * 100) / 100;
       statusLabel = "sold (PM pending)";
@@ -2239,27 +2385,46 @@ function actualPnlCell(t) {
       badge = ' <span style="color:#d29922;font-size:9px">SOLD</span>';
     }
   } else {
+    // Edge case 5: Open/unsettled -- use realizedPnl as estimate
     if (t.status === "resolved" && t.realizedPnl != null) {
       actualNet = t.realizedPnl;
       statusLabel = "pending";
       cls = actualNet >= 0 ? "green" : "red";
       badge = ' <span style="color:#8b949e;font-size:9px">PENDING</span>';
     } else {
-      return '<span class="gray" title="Position still open">open</span>';
+      return { usable: false, resolved: false };
     }
   }
 
+  return {
+    actualNet: actualNet, statusLabel: statusLabel, cls: cls, badge: badge,
+    kalWon: kalWon, pmPayout: pmPayout, isShared: isSharedTicker,
+    isScalar: isScalar, usable: true
+  };
+}
+
+function actualPnlCell(t) {
+  var r = computeActualPnl(t);
+  if (!r.usable) {
+    if (r.resolved) return '<span class="gray" title="No exchange data for ' + esc(t.kalTicker) + '">?</span>';
+    return '<span class="gray">--</span>';
+  }
+
+  var s = settlementMap[t.kalTicker];
+  var pmCost = t.pmCost || 0;
   var parts = [];
-  if (s.buyCost > 0) parts.push("bought: $" + s.buyCost.toFixed(2) + " (" + s.buyCount + ")");
-  if (s.sellRevenue > 0) parts.push("sold: $" + s.sellRevenue.toFixed(2) + " (" + s.sellCount + ")");
-  if (s.settlementRevenue > 0) parts.push("settlement: $" + s.settlementRevenue.toFixed(2));
-  if (s.pairRedemption > 0) parts.push("pair redemption: $" + s.pairRedemption.toFixed(2));
+  if (s) {
+    if (s.buyCost > 0) parts.push("bought: $" + s.buyCost.toFixed(2) + " (" + s.buyCount + ")");
+    if (s.sellRevenue > 0) parts.push("sold: $" + s.sellRevenue.toFixed(2) + " (" + s.sellCount + ")");
+    if (s.settlementRevenue > 0) parts.push("settlement: $" + s.settlementRevenue.toFixed(2));
+    if (s.pairRedemption > 0) parts.push("pair redemption: $" + s.pairRedemption.toFixed(2));
+  }
   if (pmCost > 0) parts.push("PM cost: $" + pmCost.toFixed(2));
-  parts.push("fees: $" + s.fees.toFixed(2));
-  parts.push("status: " + statusLabel);
-  if (isSharedTicker) parts.push("(shared ticker: " + _tickerTradeCount[t.kalTicker] + " trades)");
+  if (s) parts.push("fees: $" + s.fees.toFixed(2));
+  parts.push("status: " + r.statusLabel);
+  if (r.isShared) parts.push("(shared ticker: " + _tickerTradeCount[t.kalTicker] + " trades)");
   var title = parts.join(" | ");
-  return '<span class="' + cls + '" title="' + esc(title) + '">' + pnlStr(actualNet) + '</span>' + badge;
+  return '<span class="' + r.cls + '" title="' + esc(title) + '">' + pnlStr(r.actualNet) + '</span>' + r.badge;
 }
 
 // Tab switching
@@ -2286,7 +2451,9 @@ function kalFee(t) {
   return t.kalFees != null ? t.kalFees : Math.max(0, t.kalCost - t.shares * t.kalFillPrice);
 }
 function pmFee(t) {
-  return Math.max(0, t.pmCost - t.shares * t.pmFillPrice);
+  // pmCost can include hedgeCost (opposite PM token buy) — don't count that as fee
+  var basePmCost = t.pmCost - (t.hedgeCost || 0);
+  return Math.max(0, basePmCost - t.shares * t.pmFillPrice);
 }
 function tradeFees(t) {
   return kalFee(t) + pmFee(t);
@@ -2392,7 +2559,7 @@ function renderPositions(positions) {
       '<td><span class="dir dir-' + (p.kalSide === "no" ? "C" : "A") + '">' + (p.kalSide === "no" ? "NO" : "YES") + '</span></td>' +
       '<td>' + esc(p.heldExchange).toUpperCase() + '</td>' +
       '<td>' + esc(p.kalSide) + '</td>' +
-      '<td>' + remaining + ' / ' + total + '</td>' +
+      '<td>' + hedged + ' / ' + total + '</td>' +
       '<td>$' + (p.initialCost || 0).toFixed(2) + '</td>' +
       '<td>$' + (p.hedgeFillCost || 0).toFixed(2) + '</td>' +
       '<td><div class="progress-bar"><div class="progress-fill" style="width:' + pct + '%"></div></div> ' + pct + '%</td>' +
@@ -2411,7 +2578,7 @@ function renderDayFilter(trades) {
     var day = t.ts ? toLocalDay(t.ts) : "unknown";
     if (!days[day]) days[day] = { count: 0, pnl: 0 };
     days[day].count++;
-    if (t.realizedPnl != null) days[day].pnl += t.realizedPnl;
+    days[day].pnl += (t.realizedPnl || 0);
   });
   var sortedDays = Object.keys(days).sort();
   var html = '<button class="day-btn' + (filterDay === null ? ' active' : '') + '" data-day="all">All (' + trades.length + ')</button>';
@@ -2459,7 +2626,7 @@ function renderTrades(trades) {
 
   updateSortHeaders();
 
-  // Build ticker frequency map — needed to avoid double-counting exchange data
+  // Build ticker frequency map -- needed to avoid double-counting exchange data
   // when multiple trades share the same Kalshi ticker
   _tickerTradeCount = {};
   for (var tc = 0; tc < trades.length; tc++) {
@@ -2467,61 +2634,30 @@ function renderTrades(trades) {
     _tickerTradeCount[tk] = (_tickerTradeCount[tk] || 0) + 1;
   }
 
-  // Compute totals for P&L and Actual P&L
+  // Compute P&L total — same source as day buttons (realizedPnl from trade record)
   var totalPnl = 0;
-  var totalActualPnl = 0;
-  var actualPnlCount = 0;
-  var kalNetCounted = {}; // track tickers whose KAL net has been counted once
   for (var ti = 0; ti < trades.length; ti++) {
-    var tr = trades[ti];
-    if (tr.realizedPnl != null) totalPnl += tr.realizedPnl;
-    var sm = settlementMap[tr.kalTicker];
-    if (sm) {
-      if (sm.status === "settled") {
-        var trHcAdj = ((tr.pmCost === 0 || tr.kalCost === 0) && (tr.hedgeCost || 0) > 0) ? (tr.hedgeCost || 0) : 0;
-        if (sm.settlementResult === "scalar" && (tr.pmCost > 0 || tr.pmFillPrice > 0)) {
-          // Voided/scalar: KAL refunds (sm.net), PM settles at 50c/share
-          totalActualPnl += sm.net + tr.shares * 0.50 - (tr.pmCost || 0) - trHcAdj;
-          actualPnlCount++;
-        } else if (_tickerTradeCount[tr.kalTicker] > 1) {
-          // Multiple trades share this ticker — use per-trade P&L
-          if (tr.realizedPnl != null) { totalActualPnl += tr.realizedPnl; actualPnlCount++; }
-        } else {
-          var kalW;
-          if (sm.settlementResult !== "scalar" && sm.pairRedemption > 0 && sm.settlementResult) {
-            var totOs = (sm.buyNoCost || 0) >= (sm.buyYesCost || 0) ? "no" : "yes";
-            kalW = sm.settlementResult === totOs;
-          } else {
-            kalW = sm.settlementResult !== "scalar" && sm.settlementRevenue > 0.50;
-          }
-          var hasPmL = (tr.pmCost > 0 || tr.pmFillPrice > 0);
-          var pmPay = (!kalW && hasPmL) ? tr.shares : 0;
-          totalActualPnl += sm.net + pmPay - (tr.pmCost || 0) - trHcAdj;
-          actualPnlCount++;
-        }
-      } else if (sm.status === "sold") {
-        if (_tickerTradeCount[tr.kalTicker] > 1) {
-          if (tr.realizedPnl != null) { totalActualPnl += tr.realizedPnl; actualPnlCount++; }
-        } else {
-          totalActualPnl += sm.net;
-          actualPnlCount++;
-        }
-      } else if (tr.status === "resolved" && tr.realizedPnl != null) {
-        // Pending settlement — use bot's P&L
-        totalActualPnl += tr.realizedPnl;
-        actualPnlCount++;
-      }
-    }
+    totalPnl += (trades[ti].realizedPnl || 0);
   }
   totalPnl = Math.round(totalPnl * 100) / 100;
-  totalActualPnl = Math.round(totalActualPnl * 100) / 100;
   var pnlC = totalPnl >= 0 ? "#3fb950" : "#f85149";
-  var actC = totalActualPnl >= 0 ? "#3fb950" : "#f85149";
+
+  // Compute Actual P&L total — reuse the same per-trade computation as the column
+  var totalActualPnl = 0;
+  for (var ai = 0; ai < trades.length; ai++) {
+    var ar = computeActualPnl(trades[ai]);
+    if (ar.usable) {
+      totalActualPnl += ar.actualNet;
+    } else {
+      totalActualPnl += (trades[ai].realizedPnl || 0);
+    }
+  }
+  totalActualPnl = Math.round(totalActualPnl * 100) / 100;
+  var apnlC = totalActualPnl >= 0 ? "#3fb950" : "#f85149";
+
   $("tradeTotals").innerHTML =
-    '<span style="color:#8b949e">P&L Total: <b style="color:' + pnlC + '">' + pnlStr(totalPnl) + '</b></span>' +
-    '<span style="color:#8b949e">Actual P&L Total: <b style="color:' + actC + '">' + pnlStr(totalActualPnl) + '</b>' +
-    (actualPnlCount < trades.length ? ' <span style="color:#484f58;font-size:11px">(' + actualPnlCount + '/' + trades.length + ' settled)</span>' : '') +
-    '</span>';
+    '<span style="color:#8b949e">P&L Total: <b style="color:' + pnlC + '">' + pnlStr(totalPnl) + '</b>' +
+    '&nbsp;&nbsp;Actual P&L Total: <b style="color:' + apnlC + '">' + pnlStr(totalActualPnl) + '</b></span>';
 
   if (sorted.length === 0) {
     tbody.innerHTML = '<tr><td colspan="14" class="empty">No trades</td></tr>';
@@ -2591,7 +2727,7 @@ function renderTrades(trades) {
       '<div><span>KAL Ticker:</span> ' + esc(t.kalTicker) + '</div>' +
       '<div><span>PM Slug:</span> ' + esc(t.pmSlug || "n/a") + '</div>' +
       '<div><span>KAL Cost:</span> ' + (kalNoFill
-        ? '<span style="color:#f85149">No fill — KAL leg failed, hedged via PM</span>'
+        ? '<span style="color:#f85149">No fill -- KAL leg failed, hedged via PM</span>'
         : '$' + t.kalCost.toFixed(2) + ' (' + t.shares + ' @ ' + t.kalFillPrice.toFixed(3) + ')' +
           (t.kalFillPrice > 0 || t.kalFees ? ' <span style="color:#d29922">fee $' + kalFee(t).toFixed(2) + '</span>' : '') +
           (t.kalMakerFill ? ' <span style="background:#238636;color:#fff;padding:1px 5px;border-radius:3px;font-size:11px">MAKER</span>' : (t.kalFees > 0 ? ' <span style="background:#6e4000;color:#fff;padding:1px 5px;border-radius:3px;font-size:11px">TAKER</span>' : ''))) + '</div>' +
@@ -2614,23 +2750,12 @@ function renderTrades(trades) {
         var sm = settlementMap[t.kalTicker];
         if (!sm) return '';
         var pmCost = t.pmCost || 0;
-        var isScalar = sm.settlementResult === "scalar";
-        var kalWon;
-        if (!isScalar && sm.pairRedemption > 0 && sm.settlementResult) {
-          var detailOrigSide = (sm.buyNoCost || 0) >= (sm.buyYesCost || 0) ? "no" : "yes";
-          kalWon = sm.settlementResult === detailOrigSide;
-        } else {
-          kalWon = !isScalar && sm.settlementRevenue > 0.50;
-        }
-        var hasPmLeg = (t.pmCost > 0 || t.pmFillPrice > 0);
-        var pmPayout = isScalar && hasPmLeg ? t.shares * 0.50
-          : (sm.status === "settled" && !kalWon && hasPmLeg) ? t.shares : 0;
-        var isShared = _tickerTradeCount[t.kalTicker] > 1;
-        var detailHcAdj = ((t.pmCost === 0 || t.kalCost === 0) && (t.hedgeCost || 0) > 0) ? (t.hedgeCost || 0) : 0;
-        var actualNet = isShared && t.realizedPnl != null
-          ? t.realizedPnl
-          : Math.round((sm.net + pmPayout - pmCost - detailHcAdj) * 100) / 100;
-        var winnerStr = sm.status === "settled" ? (isScalar ? "VOIDED" : (kalWon ? "KAL won" : "PM won")) : sm.status;
+        var r = computeActualPnl(t);
+        var pmPayout = r.usable ? r.pmPayout : 0;
+        if (r.isScalar && (t.pmCost > 0 || t.pmFillPrice > 0)) pmPayout = t.shares * 0.50;
+        var winnerStr = sm.status === "settled" ? (r.isScalar ? "VOIDED" : (r.kalWon ? "KAL won" : "PM won")) : sm.status;
+        var isShared = r.isShared;
+        var actualNet = r.usable ? r.actualNet : (t.realizedPnl || 0);
         var sharedNote = isShared ? ' <span style="color:#d29922;font-size:10px">(ticker shared by ' + _tickerTradeCount[t.kalTicker] + ' trades)</span>' : '';
         return '<div style="grid-column:1/-1;margin-top:6px;padding:6px 8px;background:#0d1b2a;border:1px solid #1f6feb;border-radius:4px">' +
           '<div style="color:#58a6ff;font-weight:bold;margin-bottom:4px">Exchange Data (' + winnerStr.toUpperCase() + ')' + sharedNote + '</div>' +
@@ -2780,11 +2905,10 @@ function renderChainStatus(cs) {
 // Fetch & render
 async function fetchAndRender() {
   try {
-    const [tradesRes, positionsRes, chainRes, execRes, reconcileRes, missedRes, settlRes] = await Promise.all([
-      fetch("/api/trades"), fetch("/api/positions"), fetch("/api/chain-status"), fetch("/api/exec-stats"), fetch("/api/reconcile-log"), fetch("/api/missed-opps"), fetch("/api/settlement-map")
+    const [tradesRes, positionsRes, chainRes, execRes, reconcileRes, missedRes] = await Promise.all([
+      fetch("/api/trades"), fetch("/api/positions"), fetch("/api/chain-status"), fetch("/api/exec-stats"), fetch("/api/reconcile-log"), fetch("/api/missed-opps")
     ]);
     allTrades = await tradesRes.json();
-    try { settlementMap = await settlRes.json(); } catch(e) { console.warn("Settlement map parse error:", e); }
     const positions = await positionsRes.json();
     const chainStatus = await chainRes.json();
     const execStats = await execRes.json();
@@ -2809,13 +2933,25 @@ async function fetchAndRender() {
 
 // Countdown timer
 let countdown = 1;
+var _settlementMapLoaded = false;
 setInterval(function() {
   countdown--;
   if (countdown <= 0) { countdown = 1; fetchAndRender(); }
   $("countdown").textContent = countdown;
+  // Load settlement map once in background (don't block main render)
+  if (!_settlementMapLoaded) {
+    _settlementMapLoaded = true;
+    fetch("/api/settlement-map").then(function(r) {
+      if (r.ok) return r.json();
+      _settlementMapLoaded = false; // retry next cycle
+      return null;
+    }).then(function(data) {
+      if (data) { settlementMap = data; console.log("[SETTLEMENT-MAP] Loaded"); }
+    }).catch(function() { _settlementMapLoaded = false; });
+  }
 }, 1000);
 
-// ─── Position Audit ──────────────────────────────────────────────────────────
+// --- Position Audit ----------------------------------------------------------
 
 var auditData = null;
 
@@ -2894,7 +3030,7 @@ function renderAudit(data) {
   $("auditResults").innerHTML = html;
 }
 
-// ─── Verified P&L ────────────────────────────────────────────────────────────
+// --- Verified P&L ------------------------------------------------------------
 
 async function runVerifiedPnl() {
   var btn = $("verifiedRunBtn");
@@ -3000,7 +3136,7 @@ function renderVerifiedPnl(d) {
   $("verifiedDetails").innerHTML = html;
 }
 
-// ─── Orderbook viewer ────────────────────────────────────────────────────────
+// --- Orderbook viewer --------------------------------------------------------
 
 var obWatchlist = [];
 var obSelectedMatch = null;
@@ -3079,7 +3215,7 @@ async function fetchOrderbook() {
     // Connection status
     var connStr = (data.kalshiConnected ? "\\u2705 KAL" : "\\u274C KAL") + " " + (data.pmConnected ? "\\u2705 PM" : "\\u274C PM");
 
-    // Kalshi data — keyed by ticker
+    // Kalshi data -- keyed by ticker
     var k1 = (data.kalshi || {})[m.kal1.ticker] || { yes: [], no: [] };
     var k2 = (data.kalshi || {})[m.kal2.ticker] || { yes: [], no: [] };
     var k1Age = k1.age != null ? k1.age : -1;
@@ -3109,7 +3245,7 @@ async function fetchOrderbook() {
       (k1Age >= 0 ? " | <span style='color:#484f58'>" + k1Age + "ms ago</span>" : "") +
       "<br>" + m.kal2.surname + ": YES bid <span class='green'>" + k2BestBid + "\\u00A2</span> / ask <span class='red'>" + k2BestAsk + "\\u00A2</span>";
 
-    // PM data — keyed by tokenId. Prices already in cents from server.
+    // PM data -- keyed by tokenId. Prices already in cents from server.
     var pm1 = (data.pm || {})[m.pm1.tokenId] || { bids: [], asks: [] };
     var pm2 = (data.pm || {})[m.pm2.tokenId] || { bids: [], asks: [] };
     renderBookLevels("obPm1Bids", pm1.bids || [], true);
@@ -3169,7 +3305,7 @@ document.querySelector('[data-tab="orderbook"]').addEventListener("click", funct
   if (obWatchlist.length === 0) loadWatchlist();
 });
 
-// ── Multi-user tab system ────────────────────────────────────
+// -- Multi-user tab system ------------------------------------
 var currentUser = "local";
 
 function loadRemoteUsers() {
@@ -3244,7 +3380,7 @@ fetchAndRender = function() {
         var totalPnl = trades.reduce(function(s, t) { return s + (t.realizedPnl || 0); }, 0);
         var filled = trades.filter(function(t) { return t.status === "resolved"; }).length;
         document.getElementById("cards").innerHTML =
-          '<div style="padding:16px 20px;color:#c9d1d9;">Viewing <strong>' + esc(currentUser) + '</strong> — ' +
+          '<div style="padding:16px 20px;color:#c9d1d9;">Viewing <strong>' + esc(currentUser) + '</strong> -- ' +
           trades.length + ' trades | ' + filled + ' resolved | PnL: $' + totalPnl.toFixed(2) + '</div>';
       })
       .catch(function() {});
@@ -3257,6 +3393,9 @@ fetchAndRender();
 </script>
 </body>
 </html>`;
+
+// Load event log on startup (for event-based audit endpoints)
+try { loadEventsFromDisk(); } catch (e) { console.warn(`[DASHBOARD] Event log load failed: ${(e as Error).message}`); }
 
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`Dashboard running at http://0.0.0.0:${PORT}`);

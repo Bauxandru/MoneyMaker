@@ -1,5 +1,5 @@
 /**
- * Quick P&L checker — queries Kalshi fills + PM positions to estimate profit.
+ * Quick P&L checker -- queries Kalshi fills + PM positions to estimate profit.
  * Run: npx tsx src/checkPnL.ts
  */
 import crypto from "crypto";
@@ -9,7 +9,7 @@ import { fetchJson } from "./http.js";
 import dotenv from "dotenv";
 dotenv.config();
 
-// ─── Kalshi auth (exact copy from kalshiTrade.ts) ─────────────────────────────
+// --- Kalshi auth (exact copy from kalshiTrade.ts) -----------------------------
 
 function loadPrivateKey(): string {
   if (process.env.KALSHI_PRIVATE_KEY) {
@@ -51,13 +51,13 @@ async function kalshiGet(path: string): Promise<Record<string, unknown>> {
   }) as Promise<Record<string, unknown>>;
 }
 
-// ─── Main ─────────────────────────────────────────────────────────────────────
+// --- Main ---------------------------------------------------------------------
 
 async function main() {
   console.log("=== P&L Check ===\n");
 
   // 1) Kalshi balance
-  console.log("── Kalshi Account ──");
+  console.log("-- Kalshi Account --");
   try {
     const bal = await kalshiGet("/portfolio/balance");
     console.log(`  Raw: ${JSON.stringify(bal).slice(0, 300)}`);
@@ -68,7 +68,7 @@ async function main() {
   }
 
   // 2) Kalshi fills
-  console.log("\n── Kalshi Fills ──");
+  console.log("\n-- Kalshi Fills --");
   try {
     const fills = await kalshiGet("/portfolio/fills?limit=200");
     const items = (Array.isArray(fills.fills) ? fills.fills :
@@ -93,7 +93,7 @@ async function main() {
       if (isBuy) totalSpent += cost;
       else totalRevenue += cost;
 
-      console.log(`  ${ts}  ${action.toUpperCase().padEnd(4)} ${count}×${side}@${price}¢  $${(cost/100).toFixed(2).padStart(5)}  ${ticker}`);
+      console.log(`  ${ts}  ${action.toUpperCase().padEnd(4)} ${count}x${side}@${price}c  $${(cost/100).toFixed(2).padStart(5)}  ${ticker}`);
     }
 
     console.log(`\n  Kalshi totals: spent=$${(totalSpent / 100).toFixed(2)}  revenue=$${(totalRevenue / 100).toFixed(2)}`);
@@ -102,7 +102,7 @@ async function main() {
   }
 
   // 3) Kalshi open positions
-  console.log("\n── Kalshi Open Positions ──");
+  console.log("\n-- Kalshi Open Positions --");
   try {
     const pos = await kalshiGet("/portfolio/positions?count_filter=position&limit=200");
     const items = Array.isArray(pos.market_positions)
@@ -115,7 +115,7 @@ async function main() {
       const side = position > 0 ? "YES" : "NO";
       const qty = Math.abs(position);
       const totalTraded = Number(p.total_traded ?? 0);
-      console.log(`  ${qty}×${side}  ${ticker}  totalTraded=$${(totalTraded/100).toFixed(2)}`);
+      console.log(`  ${qty}x${side}  ${ticker}  totalTraded=$${(totalTraded/100).toFixed(2)}`);
     }
     if (items.filter(p => Number(p.position ?? 0) !== 0).length === 0) {
       console.log("  (no open positions)");
@@ -125,7 +125,7 @@ async function main() {
   }
 
   // 4) Kalshi settlements
-  console.log("\n── Kalshi Settlements ──");
+  console.log("\n-- Kalshi Settlements --");
   try {
     const sett = await kalshiGet("/portfolio/settlements?limit=200");
     const items = (Array.isArray(sett.settlements) ? sett.settlements :
@@ -139,10 +139,10 @@ async function main() {
       const noCount = Number(s.no_count ?? 0);
       const ts = String(s.settled_time ?? s.created_time ?? "").slice(0, 19);
       totalSettlementRevenue += revenue;
-      console.log(`  ${ts}  ${ticker}  ${count > 0 ? count + "×YES" : ""}${noCount > 0 ? noCount + "×NO" : ""}  revenue=$${(revenue / 100).toFixed(2)}`);
+      console.log(`  ${ts}  ${ticker}  ${count > 0 ? count + "xYES" : ""}${noCount > 0 ? noCount + "xNO" : ""}  revenue=$${(revenue / 100).toFixed(2)}`);
     }
     if (items.length === 0) {
-      console.log("  (none — markets haven't settled yet)");
+      console.log("  (none -- markets haven't settled yet)");
       console.log("  Raw: " + JSON.stringify(sett).slice(0, 300));
     } else {
       console.log(`\n  Total settlement revenue: $${(totalSettlementRevenue / 100).toFixed(2)}`);
@@ -152,7 +152,7 @@ async function main() {
   }
 
   // 5) Polymarket positions
-  console.log("\n── Polymarket Positions ──");
+  console.log("\n-- Polymarket Positions --");
   try {
     const w = new Wallet(process.env.POLY_WALLET_PRIVATE_KEY ?? "");
     const funder = process.env.POLY_FUNDER || w.address;
@@ -202,16 +202,16 @@ async function main() {
       }
 
       const tag = isBot ? "[BOT]" : "[MAN]";
-      console.log(`  ${tag} ${Math.round(size).toString().padStart(5)}× ${outcome.padEnd(20).slice(0, 20)}  avg=${(avgPrice * 100).toFixed(0).padStart(3)}¢  cur=${(curPrice * 100).toFixed(0).padStart(3)}¢  paid=$${cashPaid.toFixed(2).padStart(7)}  val=$${curVal.toFixed(2).padStart(7)}  pnl=$${unrealizedPnl.toFixed(2).padStart(7)}${status}  cashPnl=$${cashPnl.toFixed(2)}  ${title}`);
+      console.log(`  ${tag} ${Math.round(size).toString().padStart(5)}x ${outcome.padEnd(20).slice(0, 20)}  avg=${(avgPrice * 100).toFixed(0).padStart(3)}c  cur=${(curPrice * 100).toFixed(0).padStart(3)}c  paid=$${cashPaid.toFixed(2).padStart(7)}  val=$${curVal.toFixed(2).padStart(7)}  pnl=$${unrealizedPnl.toFixed(2).padStart(7)}${status}  cashPnl=$${cashPnl.toFixed(2)}  ${title}`);
     }
 
-    console.log(`\n  ── Bot Arb Trades (PM side only) ──`);
+    console.log(`\n  -- Bot Arb Trades (PM side only) --`);
     console.log(`  Total paid:     $${botPaid.toFixed(2)}`);
     console.log(`  Current value:  $${botVal.toFixed(2)}`);
     console.log(`  PM-side P&L:    $${(botVal - botPaid).toFixed(2)}`);
     console.log(`  (Note: full arb P&L = PM-side + Kalshi-side. Need Kalshi fills above.)`);
 
-    console.log(`\n  ── Manual Trades ──`);
+    console.log(`\n  -- Manual Trades --`);
     console.log(`  Total paid:     $${manualPaid.toFixed(2)}`);
     console.log(`  Current value:  $${manualVal.toFixed(2)}`);
     console.log(`  PM-side P&L:    $${(manualVal - manualPaid).toFixed(2)}`);

@@ -1,6 +1,6 @@
 /**
  * Hedge-only mode: sync positions + place hedge orders until filled.
- * No new arbs — only completes existing unhedged positions.
+ * No new arbs -- only completes existing unhedged positions.
  *
  * Usage:  npx tsx src/_hedge.ts
  *         npm run hedge

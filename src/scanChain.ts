@@ -1,5 +1,5 @@
 /**
- * scanChain.ts — Scan Polygon for PM conditional token transfers to/from our wallet.
+ * scanChain.ts -- Scan Polygon for PM conditional token transfers to/from our wallet.
  * Uses free RPC with 10k block pagination.
  * Usage: npx tsx src/scanChain.ts [daysBack]
  */
@@ -81,7 +81,7 @@ async function main() {
   const latestHex = (await rpcCall("eth_blockNumber", [])) as string;
   const latest = parseInt(latestHex, 16);
   const startBlock = latest - BLOCKS_PER_DAY * DAYS_BACK;
-  console.log(`Block range: ${startBlock} → ${latest} (${latest - startBlock} blocks)\n`);
+  console.log(`Block range: ${startBlock} -> ${latest} (${latest - startBlock} blocks)\n`);
 
   const allTransfers: Transfer[] = [];
 
@@ -168,7 +168,7 @@ async function main() {
       const slug = String(trade.pmSlug ?? "");
       const outcome = String(trade.pmOutcome ?? "");
       if (slug && matchLabel.toLowerCase().includes(slug.split("-").slice(0, 3).join("-"))) {
-        console.log(`  → MATCHED TRADE: ${trade.match} dir=${trade.dir} shares=${trade.shares} pmCost=$${trade.pmCost}`);
+        console.log(`  -> MATCHED TRADE: ${trade.match} dir=${trade.dir} shares=${trade.shares} pmCost=$${trade.pmCost}`);
       }
     }
     console.log("");

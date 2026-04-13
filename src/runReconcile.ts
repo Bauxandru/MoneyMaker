@@ -1,5 +1,5 @@
 /**
- * runReconcile.ts — Standalone reconciliation runner.
+ * runReconcile.ts -- Standalone reconciliation runner.
  * Usage: npx tsx src/runReconcile.ts
  */
 import dotenv from "dotenv";

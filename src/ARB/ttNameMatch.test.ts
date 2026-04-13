@@ -8,7 +8,7 @@ import {
   CBB_SERIES, SOCCER_SERIES, NON_MONEYLINE_BINARY_SERIES, SET_WINNER_SERIES,
 } from "./ttNameMatch.js";
 
-// ─── extractEntityName ──────────────────────────────────────────────────────
+// --- extractEntityName ------------------------------------------------------
 
 describe("extractEntityName", () => {
   it("extracts 'Will X win' pattern", () => {
@@ -40,7 +40,7 @@ describe("extractEntityName", () => {
   });
 });
 
-// ─── pmSlugToken ────────────────────────────────────────────────────────────
+// --- pmSlugToken ------------------------------------------------------------
 
 describe("pmSlugToken", () => {
   it("returns last word, lowercase, max 7 chars", () => {
@@ -60,7 +60,7 @@ describe("pmSlugToken", () => {
   });
 });
 
-// ─── parseDateFromTicker ────────────────────────────────────────────────────
+// --- parseDateFromTicker ----------------------------------------------------
 
 describe("parseDateFromTicker", () => {
   it("parses standard ticker format", () => {
@@ -80,7 +80,7 @@ describe("parseDateFromTicker", () => {
   });
 });
 
-// ─── parseDateFromEventTitle ────────────────────────────────────────────────
+// --- parseDateFromEventTitle ------------------------------------------------
 
 describe("parseDateFromEventTitle", () => {
   it("parses (Mon DD, YYYY) format", () => {
@@ -101,7 +101,7 @@ describe("parseDateFromEventTitle", () => {
   });
 });
 
-// ─── matchCodePrefix ────────────────────────────────────────────────────────
+// --- matchCodePrefix --------------------------------------------------------
 
 describe("matchCodePrefix", () => {
   it("strips last segment after dash", () => {
@@ -113,7 +113,7 @@ describe("matchCodePrefix", () => {
   });
 });
 
-// ─── normalizeName ──────────────────────────────────────────────────────────
+// --- normalizeName ----------------------------------------------------------
 
 describe("normalizeName", () => {
   it("lowercases", () => {
@@ -137,7 +137,7 @@ describe("normalizeName", () => {
   });
 });
 
-// ─── namesMatch ─────────────────────────────────────────────────────────────
+// --- namesMatch -------------------------------------------------------------
 
 describe("namesMatch", () => {
   it("matches exact (case insensitive)", () => {
@@ -161,7 +161,7 @@ describe("namesMatch", () => {
   });
 
   it("matches short words via substring containment", () => {
-    // "li" is contained in "li na" — namesMatch uses substring check
+    // "li" is contained in "li na" -- namesMatch uses substring check
     expect(namesMatch("Li", "Li Na")).toBe(true);
   });
 
@@ -188,7 +188,7 @@ describe("namesMatch", () => {
   });
 });
 
-// ─── fuzzyIntlNamesMatch ────────────────────────────────────────────────────
+// --- fuzzyIntlNamesMatch ----------------------------------------------------
 
 describe("fuzzyIntlNamesMatch", () => {
   it("falls back to namesMatch first", () => {
@@ -212,7 +212,7 @@ describe("fuzzyIntlNamesMatch", () => {
   });
 });
 
-// ─── cbbExpandName / cbbNamesMatch ──────────────────────────────────────────
+// --- cbbExpandName / cbbNamesMatch ------------------------------------------
 
 describe("cbbExpandName", () => {
   it("expands UConn to connecticut", () => {
@@ -246,7 +246,7 @@ describe("cbbNamesMatch", () => {
   });
 });
 
-// ─── Sport abbreviation lookups ─────────────────────────────────────────────
+// --- Sport abbreviation lookups ---------------------------------------------
 
 describe("nbaNameToAbbr", () => {
   it("full name match", () => {
@@ -331,7 +331,7 @@ describe("soccerNameToAbbr", () => {
   });
 });
 
-// ─── Series classification Sets ─────────────────────────────────────────────
+// --- Series classification Sets ---------------------------------------------
 
 describe("Series classification", () => {
   it("TENNIS_SERIES contains ATP/WTA", () => {
@@ -357,7 +357,7 @@ describe("Series classification", () => {
   });
 });
 
-// ─── SERIES_TO_PM_PREFIX mapping ────────────────────────────────────────────
+// --- SERIES_TO_PM_PREFIX mapping --------------------------------------------
 
 describe("SERIES_TO_PM_PREFIX", () => {
   it("maps ATP match to atp", () => {

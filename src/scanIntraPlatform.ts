@@ -2,7 +2,7 @@
  * scanIntraPlatform.ts
  *
  * Scans ALL active Kalshi and Polymarket markets for intra-platform arb:
- *   YES ask + NO ask < $1.00  →  buy both, guaranteed $1.00 payout, cost < $1.
+ *   YES ask + NO ask < $1.00  ->  buy both, guaranteed $1.00 payout, cost < $1.
  *
  * Usage:
  *   npx tsx src/scanIntraPlatform.ts
@@ -18,13 +18,13 @@ dotenv.config();
 
 type AnyRecord = Record<string, unknown>;
 
-// ─── Rate-limited fetch helpers ───────────────────────────────────────────────
+// --- Rate-limited fetch helpers -----------------------------------------------
 
 const retryOpts = { timeoutMs: 15000, maxRetries: 4, baseDelayMs: 700, maxDelayMs: 10000, jitterMs: 300 };
 const kalFetch = createRateLimitedFetcher(Number(process.env.KALSHI_REQUEST_INTERVAL_MS ?? 120), retryOpts);
 const polyFetch = createRateLimitedFetcher(Number(process.env.POLY_REQUEST_INTERVAL_MS ?? 150), retryOpts);
 
-// ─── Result types ─────────────────────────────────────────────────────────────
+// --- Result types -------------------------------------------------------------
 
 type IntraArb = {
   exchange: "kalshi" | "polymarket";
@@ -35,12 +35,12 @@ type IntraArb = {
   edge: number;
 };
 
-// ─── Kalshi scan ─────────────────────────────────────────────────────────────
+// --- Kalshi scan -------------------------------------------------------------
 //
 // Kalshi's events endpoint with with_nested_markets=true returns market objects
 // that already contain yes_ask / no_ask prices (integer cents, 1–99).
 // No extra API calls needed per market.
-// ──────────────────────────────────────────────────────────────────────────────
+// ------------------------------------------------------------------------------
 
 async function scanKalshi(): Promise<IntraArb[]> {
   const base =
@@ -134,14 +134,14 @@ async function scanKalshi(): Promise<IntraArb[]> {
   return arbs;
 }
 
-// ─── Polymarket scan ──────────────────────────────────────────────────────────
+// --- Polymarket scan ----------------------------------------------------------
 //
 // Two-phase approach:
 //  Phase 1: Paginate the Gamma /events endpoint to collect all binary YES/NO
 //           markets and their two CLOB token IDs. (fast)
 //  Phase 2: For each market, fetch both YES and NO CLOB order books.
 //           Check if bestYesAsk + bestNoAsk < 1.00. (slower, ~2 req/market)
-// ──────────────────────────────────────────────────────────────────────────────
+// ------------------------------------------------------------------------------
 
 type RawPolyMarket = {
   slug: string;
@@ -278,7 +278,7 @@ async function scanPolymarket(): Promise<IntraArb[]> {
   let completed = 0;
   const total = marketList.length;
 
-  // Concurrently dispatch CLOB checks — all requests still flow through the
+  // Concurrently dispatch CLOB checks -- all requests still flow through the
   // single polyQueue so rate limiting is honoured automatically.
   const concurrency = 12;
   const pending = [...marketList];
@@ -305,7 +305,7 @@ async function scanPolymarket(): Promise<IntraArb[]> {
   return arbs;
 }
 
-// ─── Main ─────────────────────────────────────────────────────────────────────
+// --- Main ---------------------------------------------------------------------
 
 function fmtPct(v: number, decimals = 2): string {
   return (v * 100).toFixed(decimals) + "%";
@@ -316,7 +316,7 @@ function padRight(s: string, n: number): string {
 }
 
 async function main() {
-  console.log("[SCAN] Intra-platform arb scan — scanning Kalshi and Polymarket simultaneously\n");
+  console.log("[SCAN] Intra-platform arb scan -- scanning Kalshi and Polymarket simultaneously\n");
 
   const [kalArbs, pmArbs] = await Promise.all([scanKalshi(), scanPolymarket()]);
 
@@ -327,14 +327,14 @@ async function main() {
   if (!all.length) {
     console.log("[SCAN] No intra-platform arb opportunities found across either exchange.");
     console.log(
-      "[SCAN] This is expected — both markets are usually well-arbitraged."
+      "[SCAN] This is expected -- both markets are usually well-arbitraged."
     );
     return;
   }
 
   const kalCount = all.filter((a) => a.exchange === "kalshi").length;
   const pmCount = all.filter((a) => a.exchange === "polymarket").length;
-  console.log(`[SCAN] Found ${all.length} opportunities — Kalshi: ${kalCount}  Polymarket: ${pmCount}\n`);
+  console.log(`[SCAN] Found ${all.length} opportunities -- Kalshi: ${kalCount}  Polymarket: ${pmCount}\n`);
 
   const TITLE_W = 60;
   const header = [
@@ -348,7 +348,7 @@ async function main() {
   ].join("  ");
 
   console.log(header);
-  console.log("─".repeat(header.length + 10));
+  console.log("-".repeat(header.length + 10));
 
   for (let i = 0; i < all.length; i++) {
     const a = all[i];

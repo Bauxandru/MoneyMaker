@@ -1,12 +1,12 @@
 /**
- * ttDiscovery.ts — Discovery module for cross-platform arbitrage pair detection.
+ * ttDiscovery.ts -- Discovery module for cross-platform arbitrage pair detection.
  *
  * Scans Kalshi events for head-to-head sports/esports markets and matches them
  * to corresponding Polymarket markets. Handles moneyline, spread, total,
  * game-total, set-winner, and map-level market types across tennis, NBA, NHL,
  * MLB, college basketball, soccer, and esports (CS2, LoL, Dota 2, Valorant, CoD).
  *
- * Extracted from tradeTennis.ts — discovery section (lines 1358-2892).
+ * Extracted from tradeTennis.ts -- discovery section (lines 1358-2892).
  */
 
 import fs from "fs";
@@ -20,6 +20,7 @@ import {
 } from "./ttConfig.js";
 import {
   extractEntityName, namesMatch, parseDateFromTicker, parseDateFromEventTitle,
+  parseDateFromPmSlug, datesMatch, datesMatchTennis,
   matchCodePrefix, normalizeName, pmSlugToken,
   nbaNameToAbbr, nhlNameToAbbr, mlbNameToAbbr, soccerNameToAbbr,
   cbbNamesMatch, cbbExpandName, fuzzyIntlNamesMatch,
@@ -29,7 +30,7 @@ import {
 import { fetchPmAsk } from "./ttPmOrders.js";
 import type { GammaMarket, KalshiEvent, KalshiMarket, WatchEntry, KalshiLeg, PmLeg } from "./ttTypes.js";
 
-// ─── Discovery helpers ────────────────────────────────────────────────────────
+// --- Discovery helpers --------------------------------------------------------
 
 export async function searchPolymarketByNames(
   name1: string, name2: string, gammaBase: string
@@ -84,13 +85,13 @@ export async function searchPolymarketByNames(
   return null;
 }
 
-// ─── Discovery caching ────────────────────────────────────────────────────────
+// --- Discovery caching --------------------------------------------------------
 
 const DISCOVERY_CACHE_PATH = "discovery_cache.json";
 
 type DiscoveryCache = {
-  date: string;              // "YYYY-MM-DD" — legacy date check (used when DISCOVERY_CACHE_TTL_MS=0)
-  savedAt?: number;          // epoch ms — used for TTL-based invalidation
+  date: string;              // "YYYY-MM-DD" -- legacy date check (used when DISCOVERY_CACHE_TTL_MS=0)
+  savedAt?: number;          // epoch ms -- used for TTL-based invalidation
   watchlist: WatchEntry[];
   noMatchPairs: string[];    // sorted normalized name pairs that had no PM match
 };
@@ -118,13 +119,13 @@ export function loadDiscoveryCache(): DiscoveryCache | null {
     if (DISCOVERY_CACHE_TTL_MS > 0 && raw.savedAt) {
       const ageMs = Date.now() - raw.savedAt;
       if (ageMs > DISCOVERY_CACHE_TTL_MS) {
-        console.log(`[DISCOVER] Cache expired (age ${Math.round(ageMs / 60000)}min > TTL ${Math.round(DISCOVERY_CACHE_TTL_MS / 60000)}min) — will re-discover`);
+        console.log(`[DISCOVER] Cache expired (age ${Math.round(ageMs / 60000)}min > TTL ${Math.round(DISCOVERY_CACHE_TTL_MS / 60000)}min) -- will re-discover`);
         return null;
       }
     } else {
       const today = new Date().toISOString().slice(0, 10);
       if (raw.date !== today) {
-        console.log(`[DISCOVER] Cache is stale (${raw.date} vs today ${today}) — will re-discover`);
+        console.log(`[DISCOVER] Cache is stale (${raw.date} vs today ${today}) -- will re-discover`);
         return null;
       }
     }
@@ -136,7 +137,7 @@ export function loadDiscoveryCache(): DiscoveryCache | null {
   }
 }
 
-// ─── Static pairs loader ──────────────────────────────────────────────────────
+// --- Static pairs loader ------------------------------------------------------
 // Reads data/static_pairs.csv with columns: kalshi, pm
 // Each row has a Kalshi URL and a Polymarket URL.
 // Fetches both APIs on startup to build WatchEntry objects.
@@ -202,13 +203,13 @@ export async function loadStaticPairs(): Promise<WatchEntry[]> {
     const eventTicker = extractKalshiEventTicker(pair.kalshiUrl);
     const pmSlug = extractPmSlug(pair.pmUrl);
     if (!eventTicker || !pmSlug) {
-      console.warn(`[STATIC] SKIP — missing ticker or slug: kal=${pair.kalshiUrl} pm=${pair.pmUrl}`);
+      console.warn(`[STATIC] SKIP -- missing ticker or slug: kal=${pair.kalshiUrl} pm=${pair.pmUrl}`);
       continue;
     }
 
     console.log(`[STATIC] Loading: ${eventTicker} ↔ ${pmSlug}`);
 
-    // ── Fetch Kalshi event with nested markets ──
+    // -- Fetch Kalshi event with nested markets --
     let kalNames: string[] = [], kalAsks: number[] = [], kalNoAsks: number[] = [], kalTickers: string[] = [];
     let kalYesAskSizes: number[] = [], kalNoAskSizes: number[] = [];
     try {
@@ -216,7 +217,7 @@ export async function loadStaticPairs(): Promise<WatchEntry[]> {
       const ev = evRes.event ?? evRes as unknown as KalshiEvent;
       const mlist = ev.markets ?? [];
       if (mlist.length !== 2) {
-        console.warn(`[STATIC] SKIP — Kalshi event ${eventTicker} has ${mlist.length} markets (need 2)`);
+        console.warn(`[STATIC] SKIP -- Kalshi event ${eventTicker} has ${mlist.length} markets (need 2)`);
         continue;
       }
       for (const m of mlist) {
@@ -233,15 +234,15 @@ export async function loadStaticPairs(): Promise<WatchEntry[]> {
         kalNoAskSizes.push(Number(m.no_ask_size_fp ?? m.no_ask_size ?? 0) || 0);
       }
       if (kalNames.length !== 2 || !kalTickers[0] || !kalTickers[1]) {
-        console.warn(`[STATIC] SKIP — could not parse Kalshi markets for ${eventTicker}`);
+        console.warn(`[STATIC] SKIP -- could not parse Kalshi markets for ${eventTicker}`);
         continue;
       }
     } catch (err) {
-      console.warn(`[STATIC] SKIP — Kalshi fetch failed for ${eventTicker}: ${(err as Error).message}`);
+      console.warn(`[STATIC] SKIP -- Kalshi fetch failed for ${eventTicker}: ${(err as Error).message}`);
       continue;
     }
 
-    // ── Fetch PM market from slug ──
+    // -- Fetch PM market from slug --
     let pmMarket: GammaMarket | null = null;
     try {
       const raw = await polyFetch<unknown>(`${gammaBase}/markets?slug=${encodeURIComponent(pmSlug)}`);
@@ -265,14 +266,14 @@ export async function loadStaticPairs(): Promise<WatchEntry[]> {
     }
 
     if (!pmMarket) {
-      console.warn(`[STATIC] SKIP — PM market not found for slug: ${pmSlug}`);
+      console.warn(`[STATIC] SKIP -- PM market not found for slug: ${pmSlug}`);
       continue;
     }
 
     const outcomes = parseJsonArray(pmMarket.outcomes ?? "");
     const tokenIds = parseJsonArray(pmMarket.clobTokenIds ?? "");
     if (outcomes.length !== 2 || tokenIds.length < 2) {
-      console.warn(`[STATIC] SKIP — PM ${pmSlug} has ${outcomes.length} outcomes (need 2)`);
+      console.warn(`[STATIC] SKIP -- PM ${pmSlug} has ${outcomes.length} outcomes (need 2)`);
       continue;
     }
 
@@ -280,7 +281,7 @@ export async function loadStaticPairs(): Promise<WatchEntry[]> {
     const minSize = Number(pmMarket.orderMinSize ?? 1);
     const negRisk = Boolean(pmMarket.negRisk);
 
-    // ── Map Kalshi names to PM outcomes ──
+    // -- Map Kalshi names to PM outcomes --
     function findPmToken(kalName: string): { outcome: string; tokenId: string } | null {
       for (let i = 0; i < outcomes.length; i++) {
         if (namesMatch(kalName, outcomes[i])) return { outcome: outcomes[i], tokenId: tokenIds[i] };
@@ -292,12 +293,12 @@ export async function loadStaticPairs(): Promise<WatchEntry[]> {
     let pm2Info = findPmToken(kalNames[1]);
 
     if (!pm1Info || !pm2Info || pm1Info.tokenId === pm2Info.tokenId) {
-      console.warn(`[STATIC] SKIP — outcome mismatch: KAL=[${kalNames[0]}, ${kalNames[1]}] PM=${JSON.stringify(outcomes)}`);
+      console.warn(`[STATIC] SKIP -- outcome mismatch: KAL=[${kalNames[0]}, ${kalNames[1]}] PM=${JSON.stringify(outcomes)}`);
       continue;
     }
 
-    // ── Cross-validate token mapping via CLOB prices ──
-    // Only swap when name matches were ambiguous — price divergence is expected for arb opportunities.
+    // -- Cross-validate token mapping via CLOB prices --
+    // Only swap when name matches were ambiguous -- price divergence is expected for arb opportunities.
     const staticPm1Confident = namesMatch(kalNames[0], pm1Info.outcome);
     const staticPm2Confident = namesMatch(kalNames[1], pm2Info.outcome);
     const staticBothConfident = staticPm1Confident && staticPm2Confident;
@@ -311,9 +312,9 @@ export async function loadStaticPairs(): Promise<WatchEntry[]> {
         const diff_swapped = Math.abs(kalAsks[0] - ask2) + Math.abs(kalAsks[1] - ask1);
         if (diff_swapped < diff_correct - 0.10) {
           if (staticBothConfident) {
-            console.log(`[STATIC] Price divergence for ${pmSlug} — names confident, NOT swapping`);
+            console.log(`[STATIC] Price divergence for ${pmSlug} -- names confident, NOT swapping`);
           } else {
-            console.warn(`[STATIC] TOKEN SWAP DETECTED for ${pmSlug} — swapping pm1↔pm2`);
+            console.warn(`[STATIC] TOKEN SWAP DETECTED for ${pmSlug} -- swapping pm1↔pm2`);
             [pm1Info, pm2Info] = [pm2Info, pm1Info];
           }
         }
@@ -322,6 +323,13 @@ export async function loadStaticPairs(): Promise<WatchEntry[]> {
 
     const date = parseDateFromTicker(kalTickers[0]) || "";
     const matchCode = kalTickers[0].includes("-") ? matchCodePrefix(kalTickers[0]) : eventTicker;
+    const pmDateStatic = parseDateFromPmSlug(pmSlug);
+    const staticSeries = (kalTickers[0].split("-")[0] ?? "").toUpperCase();
+    const dateCheckStatic = TENNIS_SERIES.has(staticSeries) ? datesMatchTennis : datesMatch;
+    if (date && pmDateStatic && !dateCheckStatic(date, pmDateStatic)) {
+      console.warn(`[STATIC] DATE MISMATCH: KAL=${date} PM=${pmDateStatic} slug=${pmSlug} -- SKIPPING`);
+      continue;
+    }
 
     entries.push({
       matchCode, pmSlug, date,
@@ -330,13 +338,13 @@ export async function loadStaticPairs(): Promise<WatchEntry[]> {
       pm1: { outcome: pm1Info.outcome, tokenId: pm1Info.tokenId, tickSize, minSize, negRisk },
       pm2: { outcome: pm2Info.outcome, tokenId: pm2Info.tokenId, tickSize, minSize, negRisk },
     });
-    console.log(`[STATIC] LOADED: ${kalNames[0]} vs ${kalNames[1]} → ${pmSlug}`);
+    console.log(`[STATIC] LOADED: ${kalNames[0]} vs ${kalNames[1]} -> ${pmSlug}`);
   }
 
   return entries;
 }
 
-// ─── Discovery ────────────────────────────────────────────────────────────────
+// --- Discovery ----------------------------------------------------------------
 
 type KalEntity = { ticker: string; name: string; yesAsk: number; noAsk: number; yesAskSize?: number; noAskSize?: number };
 type KalCandidate = {
@@ -417,7 +425,7 @@ export function buildBinarySlugSuffix(
 
   // Spreads: NBA, CBB, NHL, and all soccer leagues (KXEPL, KXMLS, KXUCL, etc.)
   if (series === "KXNBASPREAD" || series === "KXNCAAMBSPREAD" || series === "KXNHLSPREAD" || series.endsWith("SPREAD")) {
-    // Ticker suffix: {TEAM_ABBR}{NUMBER} e.g., "LAL8" → "LAL wins by >8.5"
+    // Ticker suffix: {TEAM_ABBR}{NUMBER} e.g., "LAL8" -> "LAL wins by >8.5"
     const m = lastPart.match(/^([A-Z]+)(\d+)$/i);
     if (!m) return null;
     const lineNum = m[2]; // integer part; actual line = lineNum.5
@@ -436,7 +444,7 @@ export function buildBinarySlugSuffix(
 
   // Totals: NBA, NHL, and all soccer leagues
   if (series === "KXNBATOTAL" || series === "KXNHLTOTAL" || series.endsWith("TOTAL")) {
-    // Ticker suffix: {NUMBER} e.g., "233" → PM "total-233pt5"
+    // Ticker suffix: {NUMBER} e.g., "233" -> PM "total-233pt5"
     if (!/^\d+$/.test(lastPart)) return null;
     return {
       suffix: `total-${lastPart}pt5`,
@@ -446,7 +454,7 @@ export function buildBinarySlugSuffix(
   }
 
   if (series === "KXATPGAMETOTAL") {
-    // Ticker suffix: {NUMBER} e.g., "27" → PM "match-total-27pt5"
+    // Ticker suffix: {NUMBER} e.g., "27" -> PM "match-total-27pt5"
     // ATP games are integers: KAL "over 27" = PM ">27.5"
     if (!/^\d+$/.test(lastPart)) return null;
     return {
@@ -457,11 +465,11 @@ export function buildBinarySlugSuffix(
   }
 
   if (series === "KXCS2TOTALMAPS" || series === "KXLOLTOTALMAPS") {
-    // Ticker suffix: {N} e.g., "3" → "over 2.5 maps" → PM "total-games-2pt5"
+    // Ticker suffix: {N} e.g., "3" -> "over 2.5 maps" -> PM "total-games-2pt5"
     // Suffix N = minimum count for YES, line = N - 0.5, PM integer part = N - 1
     const count = parseInt(lastPart, 10);
     if (isNaN(count) || count < 2) return null;
-    const pmLine = count - 1; // suffix 3 → 2.5 → "2pt5"
+    const pmLine = count - 1; // suffix 3 -> 2.5 -> "2pt5"
     return {
       suffix: `total-games-${pmLine}pt5`,
       type: "game_total",
@@ -496,10 +504,10 @@ export async function fetchKalshiCandidates(kalBase: string): Promise<KalCandida
       const category = pickString(ev.category ?? ev.event_category ?? ev.series_category ?? "").toLowerCase();
       if (category && !SPORTS_KEYWORDS.some(k => category.includes(k))) continue;
 
-      // ── Extract series prefix for non-moneyline branching ───────────────
+      // -- Extract series prefix for non-moneyline branching ---------------
       const evSeriesPrefix = eventTicker.split("-")[0]?.toUpperCase() ?? "";
 
-      // ── Non-moneyline binary series (spreads, totals, game totals) ──────
+      // -- Non-moneyline binary series (spreads, totals, game totals) ------
       // These events have MANY markets per event (one per line value).
       // Extract each market as an independent binary candidate.
       if (NON_MONEYLINE_BINARY_SERIES.has(evSeriesPrefix)) {
@@ -527,7 +535,7 @@ export async function fetchKalshiCandidates(kalBase: string): Promise<KalCandida
 
           // For spreads: determine if this ticker's team is home or away so we
           // match the CORRECT PM market (same team, same line).  Kalshi has
-          // separate tickers per team (DET1 = "Det >1.5", LAL1 = "LAL >1.5") —
+          // separate tickers per team (DET1 = "Det >1.5", LAL1 = "LAL >1.5") --
           // matching DET1 to PM "Lakers -1.5" would NOT be an arb because a
           // close game makes both positions lose.
           let finalSuffix = slugInfo.suffix;
@@ -542,11 +550,11 @@ export async function fetchKalshiCandidates(kalBase: string): Promise<KalCandida
             const spreadIdx = mTitle.indexOf("spread");
             const afterSpread = spreadIdx >= 0 ? mTitle.slice(spreadIdx) : mTitle;
             if (afterSpread.includes(homeLower)) {
-              // This ticker is about the HOME team → use spread-home only
+              // This ticker is about the HOME team -> use spread-home only
               finalSuffix = `spread-home-${slugInfo.lineNum}pt5`;
               finalSuffixAlt = undefined;
             } else if (afterSpread.includes(awayLower)) {
-              // This ticker is about the AWAY team → use spread-away only
+              // This ticker is about the AWAY team -> use spread-away only
               finalSuffix = `spread-away-${slugInfo.lineNum}pt5`;
               finalSuffixAlt = undefined;
             }
@@ -571,10 +579,10 @@ export async function fetchKalshiCandidates(kalBase: string): Promise<KalCandida
         continue;
       }
 
-      // ── Set winner series (KXATPSETWINNER): 2-market events, Set 1 only ─
+      // -- Set winner series (KXATPSETWINNER): 2-market events, Set 1 only -
       const isSetWinner = SET_WINNER_SERIES.has(evSeriesPrefix);
       if (isSetWinner) {
-        // PM only has "first-set-winner" — skip Set 2, 3, etc.
+        // PM only has "first-set-winner" -- skip Set 2, 3, etc.
         const titleLower = eventTitle.toLowerCase();
         if (!titleLower.includes("set 1") && !eventTicker.endsWith("-1")) continue;
         // Fall through to normal 2-market processing (but skip SKIP_MARKET_KEYWORDS)
@@ -610,7 +618,7 @@ export async function fetchKalshiCandidates(kalBase: string): Promise<KalCandida
       if (POLITICS_BLOCKLIST.some(kw => nameLower.includes(kw))) continue;
 
       const allTitles = [eventTitle, ...mlist.map(m => pickString(m.title ?? m.subtitle ?? ""))].join(" ").toLowerCase();
-      // Skip non-moneyline keywords — but NOT for set-winner events (their titles contain "set 1")
+      // Skip non-moneyline keywords -- but NOT for set-winner events (their titles contain "set 1")
       if (!isSetWinner && SKIP_MARKET_KEYWORDS.some(kw => allTitles.includes(kw))) continue;
 
       const detectedMap = detectMapType(allTitles);
@@ -678,8 +686,8 @@ export async function fetchKalshiCandidates(kalBase: string): Promise<KalCandida
 /** Phase 2a: Pre-fetch all active PM sports events by tag (bulk fetch, scan locally). */
 export async function prefetchPmSportsMarkets(gammaBase: string): Promise<GammaMarket[]> {
   const markets: GammaMarket[] = [];
-  // Fetch multiple sport tags — Gamma API tag_slug works on /events endpoint
-  // Soccer is excluded — handled by separate soccer scanner command.
+  // Fetch multiple sport tags -- Gamma API tag_slug works on /events endpoint
+  // Soccer is excluded -- handled by separate soccer scanner command.
   const sportTags = [
     "esports", "nba", "basketball", "baseball", "mlb",
     "dota-2", "valorant", "call-of-duty",        // esports sub-tags (PM splits them)
@@ -730,7 +738,7 @@ export async function discoverWatchlist(): Promise<{ watchlist: WatchEntry[]; no
   const kalBase = process.env.KALSHI_BASE_URL ?? "https://api.elections.kalshi.com/trade-api/v2";
   const gammaBase = process.env.POLY_GAMMA_URL ?? "https://gamma-api.polymarket.com";
 
-  // ── Phase 1 + 2a: Run in PARALLEL (independent data sources) ─────────────
+  // -- Phase 1 + 2a: Run in PARALLEL (independent data sources) -------------
   const t0 = performance.now();
   const [candidates, pmEsportsMarkets] = await Promise.all([
     fetchKalshiCandidates(kalBase),
@@ -738,7 +746,7 @@ export async function discoverWatchlist(): Promise<{ watchlist: WatchEntry[]; no
   ]);
   console.log(`[DISCOVER] Kalshi: ${candidates.length} head-to-head pairs | PM prefetch: ${pmEsportsMarkets.length} markets (${((performance.now() - t0) / 1000).toFixed(1)}s parallel)`);
 
-  // Build event slug index for fast soccer 3-way lookups (Step E) — avoids re-fetching events from API
+  // Build event slug index for fast soccer 3-way lookups (Step E) -- avoids re-fetching events from API
   const pmEventIndex = new Map<string, GammaMarket[]>();
   for (const m of pmEsportsMarkets) {
     const evSlug = pickString(m._eventSlug ?? "");
@@ -750,11 +758,11 @@ export async function discoverWatchlist(): Promise<{ watchlist: WatchEntry[]; no
   }
   console.log(`[DISCOVER] PM event index: ${pmEventIndex.size} events cached`);
 
-  // ── Load slug cache from previous discovery (speeds up re-discovery) ───────
+  // -- Load slug cache from previous discovery (speeds up re-discovery) -------
   // Even with FORCE_DISCOVER, we can reuse known PM slug mappings from last run
   // to skip expensive slug-guessing API calls. The slug is validated against
   // the prefetch anyway, so stale entries are harmless (just won't match).
-  const slugCache = new Map<string, string>(); // namePairKey → pmSlug
+  const slugCache = new Map<string, string>(); // namePairKey -> pmSlug
   const noMatchCache = new Set<string>(); // namePairKey known to have no PM match
   try {
     const prevCache = loadDiscoveryCache();
@@ -772,25 +780,25 @@ export async function discoverWatchlist(): Promise<{ watchlist: WatchEntry[]; no
     }
   } catch { /* ignore */ }
 
-  // ── Phase 2: For each Kalshi pair, find matching Polymarket market ─────────
+  // -- Phase 2: For each Kalshi pair, find matching Polymarket market ---------
   const watchlist: WatchEntry[] = [];
-  // seenPairs: player pairs already processed (matched or not-found) — skip duplicates.
+  // seenPairs: player pairs already processed (matched or not-found) -- skip duplicates.
   // Key: sorted normalized names joined by "|" + ":" + marketType.
   const seenPairs = new Set<string>();
   const noMatchPairs: string[] = [];
-  // matchedSlugs: PM slugs already in the watchlist — prevents same PM token appearing
+  // matchedSlugs: PM slugs already in the watchlist -- prevents same PM token appearing
   // multiple times when several Kalshi market types (KXLOLMAP, KXLOLGAME) all point
   // to the same PM market, which would create fake arbs.
   const matchedSlugs = new Set<string>();
   // Cache moneyline PM base slugs by player pair, so map_N candidates can derive
   // their PM slug as {baseSlug}-gameN without re-doing the full matching.
-  const moneylineBaseSlugs = new Map<string, string>(); // pairKey → PM base slug
+  const moneylineBaseSlugs = new Map<string, string>(); // pairKey -> PM base slug
 
   function esportsSlugToken(name: string): string {
     return name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
   }
 
-  // These series have PM slugs that can't be guessed from team names — rely on
+  // These series have PM slugs that can't be guessed from team names -- rely on
   // prefetch name-matching (Step C) instead of slug guessing (Step A).
   const OPAQUE_SLUG_SERIES = new Set([
     "KXUCLGAME", "KXUELGAME",                         // UCL/UEL use codes like cfc1, psg1
@@ -799,11 +807,11 @@ export async function discoverWatchlist(): Promise<{ watchlist: WatchEntry[]; no
     "KXINTLFRIENDLYGAME", "KXFIFAGAME",                // international matches
     "KXFACUPGAME", "KXEFLCUPGAME",                     // domestic cups
     "KXEWSLGAME",                                       // women's
-    // International basketball — PM slug patterns unknown, rely on name matching
+    // International basketball -- PM slug patterns unknown, rely on name matching
     "KXNBLGAME", "KXCBAGAME", "KXKBLGAME", "KXACBGAME",
     "KXBBLGAME", "KXBSLGAME", "KXVTBGAME", "KXABAGAME",
     "KXEUROLEAGUEGAME", "KXARGLNBGAME", "KXBBSERIEAGAME",
-    // College basketball — PM slug abbreviations are custom, rely on name matching
+    // College basketball -- PM slug abbreviations are custom, rely on name matching
     "KXNCAAMBGAME", "KXNCAAWBGAME",
   ]);
 
@@ -819,12 +827,12 @@ export async function discoverWatchlist(): Promise<{ watchlist: WatchEntry[]; no
       "KXWTACHALLENGERMATCH",     // WTA Challenger / WTA 125
       // Esports
       "KXCS2GAME", "KXCS2MAP", "KXLOLGAME", "KXLOLMAP",
-      "KXDOTA2GAME", "KXDOTA2MAP",  // Dota 2 (BO3/BO5 = binary, BO2 = 3-way with TIE → auto-skipped)
+      "KXDOTA2GAME", "KXDOTA2MAP",  // Dota 2 (BO3/BO5 = binary, BO2 = 3-way with TIE -> auto-skipped)
       "KXVALORANTGAME", "KXVALORANTMAP",
       "KXCODGAME", "KXCODMAP",
-      // Hockey — NHL
+      // Hockey -- NHL
       "KXNHLGAME",
-      // Basketball — NBA + international leagues
+      // Basketball -- NBA + international leagues
       "KXNBAGAME",
       "KXNBLGAME",          // NBL (Australia)
       "KXCBAGAME",          // CBA (China)
@@ -853,7 +861,7 @@ export async function discoverWatchlist(): Promise<{ watchlist: WatchEntry[]; no
       "KXATPGAMETOTAL",     // ATP Match Totals (single-ticker binary)
       "KXCS2TOTALMAPS",     // CS2 Total Maps (single-ticker binary)
       "KXLOLTOTALMAPS",     // LoL Total Maps (single-ticker binary)
-      // Soccer spreads & totals (no moneyline — user only wants non-ML)
+      // Soccer spreads & totals (no moneyline -- user only wants non-ML)
       "KXEPLSPREAD", "KXEPLTOTAL",
       "KXMLSSPREAD", "KXMLSTOTAL",
       "KXUCLSPREAD", "KXUCLTOTAL",
@@ -876,7 +884,7 @@ export async function discoverWatchlist(): Promise<{ watchlist: WatchEntry[]; no
 
     let pmMarket: GammaMarket | null = null, pmSlug = "";
 
-    // Step C (FIRST — free, no API calls): scan pre-fetched sports markets by name matching
+    // Step C (FIRST -- free, no API calls): scan pre-fetched sports markets by name matching
     if (pmEsportsMarkets.length > 0) {
       for (const m of pmEsportsMarkets) {
         const mSlug = pickString(m.slug ?? m._eventSlug ?? "");
@@ -896,10 +904,18 @@ export async function discoverWatchlist(): Promise<{ watchlist: WatchEntry[]; no
         const matchByOutcomes = e1Matches.length > 0 && e2Matches.length > 0 &&
             !(e1Matches.length === 1 && e2Matches.length === 1 && e1Matches[0] === e2Matches[0]);
         const matchByTitle = mTitle.includes(normalizeName(e1.name)) && mTitle.includes(normalizeName(e2.name));
-        // CBB alias expansion for title matching (e.g., "UConn" → "connecticut" ⊂ title)
+        // CBB alias expansion for title matching (e.g., "UConn" -> "connecticut" ⊂ title)
         const matchByTitleCBB = isCBB && !matchByTitle &&
             mTitle.includes(cbbExpandName(e1.name)) && mTitle.includes(cbbExpandName(e2.name));
         if (matchByOutcomes || matchByTitle || matchByTitleCBB) {
+          // Date validation: PM slug must contain the same date as the Kalshi event.
+          // Without this, the bot can pair different games of the same teams on different dates.
+          const pmDate = parseDateFromPmSlug(mSlug);
+          const dateCheckFn = TENNIS_SERIES.has(seriesPrefix) ? datesMatchTennis : datesMatch;
+          if (cand.date && pmDate && !dateCheckFn(cand.date, pmDate)) {
+            console.log(`  [DISC] Date mismatch: KAL=${cand.date} PM=${pmDate} slug=${mSlug} -- skipping`);
+            continue;
+          }
           pmMarket = m;
           pmSlug = mSlug;
           break;
@@ -958,10 +974,10 @@ export async function discoverWatchlist(): Promise<{ watchlist: WatchEntry[]; no
       continue;
     }
 
-    // ── Outcome verification helper ───────────────────────────────────────────
+    // -- Outcome verification helper -------------------------------------------
     // After slug/event lookup (Steps A/B/D), verify that at least one PM outcome
     // matches at least one Kalshi entity name.  Without this, a slug guess that
-    // happens to return a valid but WRONG market is silently accepted — causing
+    // happens to return a valid but WRONG market is silently accepted -- causing
     // cross-match trades (e.g. CS2 pair matched to a LoL market with NaVi).
     function outcomesSanityCheck(market: GammaMarket | null): boolean {
       if (!market) return false;
@@ -972,7 +988,7 @@ export async function discoverWatchlist(): Promise<{ watchlist: WatchEntry[]; no
       return any1 && any2;  // BOTH players must match an outcome (prevents cross-match trades)
     }
 
-    // Step A: slug guessing (API calls — only if prefetch + cache didn't match)
+    // Step A: slug guessing (API calls -- only if prefetch + cache didn't match)
     if (!pmMarket && pmPrefix && cand.date && !OPAQUE_SLUG_SERIES.has(seriesPrefix)) {
       const isTennis = TENNIS_SERIES.has(seriesPrefix);
       let slugVariants: string[];
@@ -1048,7 +1064,7 @@ export async function discoverWatchlist(): Promise<{ watchlist: WatchEntry[]; no
             }
           }
         } catch { /* skip */ }
-        // Also try as event slug — esports often have event-level slugs
+        // Also try as event slug -- esports often have event-level slugs
         if (!pmMarket) {
           try {
             const raw = await polyFetch<unknown>(`${gammaBase}/events?slug=${encodeURIComponent(slug)}`);
@@ -1077,7 +1093,7 @@ export async function discoverWatchlist(): Promise<{ watchlist: WatchEntry[]; no
     // Step B: generic slug guessing for unknown series (esports, UFC, darts, etc.)
     // Polymarket esports slugs typically follow "{team1}-vs-{team2}" at the EVENT level.
     // We try both /markets?slug= and /events?slug= since Polymarket has both hierarchies.
-    // IMPORTANT: Skip Step B when pmPrefix is known — Step A already tried sport-prefixed
+    // IMPORTANT: Skip Step B when pmPrefix is known -- Step A already tried sport-prefixed
     // slug variants.  Generic (unprefixed) slugs risk cross-sport false matches because
     // the same org can compete in multiple games (e.g. TNC in CS2 and MLBB).
     if (!pmMarket && !pmPrefix) {
@@ -1124,30 +1140,32 @@ export async function discoverWatchlist(): Promise<{ watchlist: WatchEntry[]; no
       }
     }
 
-    // Step D: search API fallback (last resort — mostly broken)
+    // Step D: search API fallback (last resort -- mostly broken)
     // Skip for known series (they should be caught by prefetch or slug guess).
     // Only use for completely unknown series as a last-ditch effort.
     if (!pmMarket && !pmPrefix && !OPAQUE_SLUG_SERIES.has(seriesPrefix)) {
       const candidate = await searchPolymarketByNames(e1.name, e2.name, gammaBase);
       if (candidate) {
         const cSlug = pickString(candidate.slug ?? candidate.marketSlug ?? "");
-        if (!isNonMoneyline(cSlug, candidate)) {
+        const pmDateD = parseDateFromPmSlug(cSlug);
+        const dateCheckD = TENNIS_SERIES.has(seriesPrefix) ? datesMatchTennis : datesMatch;
+        if (!isNonMoneyline(cSlug, candidate) && (!cand.date || !pmDateD || dateCheckD(cand.date, pmDateD))) {
           pmMarket = candidate;
           pmSlug = cSlug;
         }
       }
     }
 
-    // ── Type-aware PM resolution ──────────────────────────────────────────────
+    // -- Type-aware PM resolution ----------------------------------------------
     // Steps A-D above find the MONEYLINE PM market (they filter isNonMoneyline).
     // For non-moneyline Kalshi candidates, we derive the PM slug from the cached
     // moneyline base slug or the just-found market's event slug.
 
     if (cand.isBinary) {
-      // ── Binary (spreads, totals, game totals): derive PM slug from base slug + suffix ──
+      // -- Binary (spreads, totals, game totals): derive PM slug from base slug + suffix --
       let baseSlug = moneylineBaseSlugs.get(namePairKey) ?? "";
       // NHL spread/total names ("Toronto") differ from moneyline names ("TOR Maple Leafs")
-      // — try abbreviation-based alias key
+      // -- try abbreviation-based alias key
       if (!baseSlug && seriesPrefix.includes("NHL")) {
         const a1 = nhlNameToAbbr(e1.name), a2 = nhlNameToAbbr(e2.name);
         if (a1 && a2) {
@@ -1159,7 +1177,7 @@ export async function discoverWatchlist(): Promise<{ watchlist: WatchEntry[]; no
         baseSlug = pickString(pmMarket._eventSlug ?? pmSlug);
       }
       if (!baseSlug) {
-        // Binary needs moneyline base slug — skip if not available
+        // Binary needs moneyline base slug -- skip if not available
         console.log(`[DISCOVER] SKIP (no base slug for binary ${marketType}): ${e1.name} vs ${e2.name}`);
         seenPairs.add(pairKey); noMatchPairs.push(pairKey); continue;
       }
@@ -1173,7 +1191,7 @@ export async function discoverWatchlist(): Promise<{ watchlist: WatchEntry[]; no
           const ml = parseGammaMarkets(raw);
           if (ml.length && !ml[0].closed && ml[0].clobTokenIds) {
             pmMarket = ml[0]; pmSlug = slug; found = true;
-            console.log(`[DISCOVER] Resolved binary ${marketType} → PM slug: ${slug}`);
+            console.log(`[DISCOVER] Resolved binary ${marketType} -> PM slug: ${slug}`);
             break;
           }
         } catch { /* skip */ }
@@ -1184,7 +1202,7 @@ export async function discoverWatchlist(): Promise<{ watchlist: WatchEntry[]; no
       }
 
     } else if (marketType === "set_winner") {
-      // ── Set winner: derive PM slug from base slug + first-set-winner-{P1}-vs-{P2} ──
+      // -- Set winner: derive PM slug from base slug + first-set-winner-{P1}-vs-{P2} --
       let baseSlug = moneylineBaseSlugs.get(namePairKey) ?? "";
       if (!baseSlug && pmMarket) {
         baseSlug = pickString(pmMarket._eventSlug ?? pmSlug);
@@ -1214,7 +1232,7 @@ export async function discoverWatchlist(): Promise<{ watchlist: WatchEntry[]; no
           const ml = parseGammaMarkets(raw);
           if (ml.length && !ml[0].closed && ml[0].clobTokenIds) {
             pmMarket = ml[0]; pmSlug = slug; found = true;
-            console.log(`[DISCOVER] Resolved set_winner → PM slug: ${slug}`);
+            console.log(`[DISCOVER] Resolved set_winner -> PM slug: ${slug}`);
             break;
           }
         } catch { /* skip */ }
@@ -1225,7 +1243,7 @@ export async function discoverWatchlist(): Promise<{ watchlist: WatchEntry[]; no
       }
 
     } else if (marketType !== "moneyline") {
-      // ── Map N: derive PM slug from moneyline base slug ──
+      // -- Map N: derive PM slug from moneyline base slug --
       const mapNum = marketType.replace("map_", ""); // "1", "2", etc.
       let baseSlug = moneylineBaseSlugs.get(namePairKey) ?? "";
 
@@ -1244,7 +1262,7 @@ export async function discoverWatchlist(): Promise<{ watchlist: WatchEntry[]; no
         const ml = parseGammaMarkets(raw);
         if (ml.length && !ml[0].closed && ml[0].clobTokenIds) {
           pmMarket = ml[0]; pmSlug = mapSlug;
-          console.log(`[DISCOVER] Resolved ${marketType} → PM slug: ${mapSlug}`);
+          console.log(`[DISCOVER] Resolved ${marketType} -> PM slug: ${mapSlug}`);
         } else {
           console.log(`[DISCOVER] NOT FOUND (PM ${mapSlug} doesn't exist): ${e1.name} vs ${e2.name}`);
           seenPairs.add(pairKey); noMatchPairs.push(pairKey); continue;
@@ -1254,7 +1272,7 @@ export async function discoverWatchlist(): Promise<{ watchlist: WatchEntry[]; no
         seenPairs.add(pairKey); noMatchPairs.push(pairKey); continue;
       }
     } else {
-      // ── Moneyline: validate PM market is actually moneyline ──
+      // -- Moneyline: validate PM market is actually moneyline --
       if (!pmMarket || !pmSlug) {
         console.log(`[DISCOVER] NOT FOUND on PM: ${e1.name} vs ${e2.name}`);
         seenPairs.add(pairKey); noMatchPairs.push(pairKey); continue;
@@ -1283,8 +1301,8 @@ export async function discoverWatchlist(): Promise<{ watchlist: WatchEntry[]; no
     }
 
     // Bug 3 fix: if this PM slug is already in the watchlist (another Kalshi market type
-    // matched to the same PM market), skip — prevents same PM token from being traded
-    // from multiple Kalshi angles (e.g. KXLOLMAP + KXLOLGAME both → same handicap slug).
+    // matched to the same PM market), skip -- prevents same PM token from being traded
+    // from multiple Kalshi angles (e.g. KXLOLMAP + KXLOLGAME both -> same handicap slug).
     if (matchedSlugs.has(pmSlug)) {
       console.log(`[DISCOVER] SKIP (dup PM slug ${pmSlug}): ${e1.name} vs ${e2.name}`);
       seenPairs.add(pairKey);
@@ -1292,7 +1310,7 @@ export async function discoverWatchlist(): Promise<{ watchlist: WatchEntry[]; no
       continue;
     }
 
-    // ── Binary (non-moneyline) WatchEntry creation ─────────────────────────
+    // -- Binary (non-moneyline) WatchEntry creation -------------------------
     // For binary candidates (spreads, totals, game totals): kal1=kal2=same ticker,
     // pm1=first outcome token, pm2=second outcome token.
     // Only dirs A (KAL YES + PM2) and C (KAL NO + PM1) produce valid arbs.
@@ -1330,10 +1348,16 @@ export async function discoverWatchlist(): Promise<{ watchlist: WatchEntry[]; no
         }
       }
       const kalEntity = cand.e1; // same ticker as e2 (cloned)
-      // e1.name/e2.name were overridden to teamNames — use them for display surnames
+      // e1.name/e2.name were overridden to teamNames -- use them for display surnames
       // so match shows "Detroit vs Los Angeles L" instead of duplicate team names
       const surname1 = cand.e1.name;
       const surname2 = cand.e2.name;
+      const pmDateBin = parseDateFromPmSlug(pmSlug);
+      const dateCheckBin = TENNIS_SERIES.has(seriesPrefix) ? datesMatchTennis : datesMatch;
+      if (cand.date && pmDateBin && !dateCheckBin(cand.date, pmDateBin)) {
+        console.warn(`[DISCOVER] DATE MISMATCH (binary): KAL=${cand.date} PM=${pmDateBin} slug=${pmSlug} -- REJECTING`);
+        seenPairs.add(pairKey); noMatchPairs.push(pairKey); continue;
+      }
       seenPairs.add(pairKey);
       matchedSlugs.add(pmSlug);
       watchlist.push({
@@ -1343,15 +1367,15 @@ export async function discoverWatchlist(): Promise<{ watchlist: WatchEntry[]; no
         pm1: { outcome: outcomes[0], tokenId: tokenIds[0], tickSize, minSize, negRisk },
         pm2: { outcome: outcomes[1], tokenId: tokenIds[1], tickSize, minSize, negRisk },
       });
-      console.log(`[DISCOVER] MATCHED BINARY [${seriesPrefix}] ${marketType}: ${surname1} vs ${surname2} → ${pmSlug} (${outcomes[0]}/${outcomes[1]})`);
+      console.log(`[DISCOVER] MATCHED BINARY [${seriesPrefix}] ${marketType}: ${surname1} vs ${surname2} -> ${pmSlug} (${outcomes[0]}/${outcomes[1]})`);
       continue;
     }
 
-    // ── Step E: Soccer 3-way discovery ──────────────────────────────────────
+    // -- Step E: Soccer 3-way discovery --------------------------------------
     // For 3-way candidates, we need to find 3 separate PM binary markets
     // inside the PM event (home-win, draw, away-win).
     if (cand.is3Way && cand.e3) {
-      // Get PM event sub-markets — try prefetch cache first (free), then API fallback
+      // Get PM event sub-markets -- try prefetch cache first (free), then API fallback
       const eventSlug = (pmMarket as any)?._eventSlug ?? pmSlug;
       let pmEventMarkets: GammaMarket[] = pmEventIndex.get(eventSlug) ?? [];
       // Prefetch only stores 2-outcome markets; for 3-way we need all sub-markets from the event
@@ -1370,7 +1394,7 @@ export async function discoverWatchlist(): Promise<{ watchlist: WatchEntry[]; no
       }
 
       // Match each PM sub-market to: Home team, Away team, Draw
-      // Use slug SUFFIX (last segment after date) to avoid false matches — the event base
+      // Use slug SUFFIX (last segment after date) to avoid false matches -- the event base
       // slug contains both team abbreviations (e.g. epl-tot-not-2026-03-22), so .includes()
       // would match both teams on every sub-market.
       let pmHome: GammaMarket | null = null, pmAway: GammaMarket | null = null, pmDraw: GammaMarket | null = null;
@@ -1421,6 +1445,11 @@ export async function discoverWatchlist(): Promise<{ watchlist: WatchEntry[]; no
         seenPairs.add(pairKey); noMatchPairs.push(pairKey); continue;
       }
 
+      const pmDate3w = parseDateFromPmSlug(pmSlug);
+      if (cand.date && pmDate3w && !datesMatch(cand.date, pmDate3w)) {
+        console.warn(`[DISCOVER] DATE MISMATCH (3-way): KAL=${cand.date} PM=${pmDate3w} slug=${pmSlug} -- REJECTING`);
+        seenPairs.add(pairKey); noMatchPairs.push(pairKey); continue;
+      }
       seenPairs.add(pairKey);
       matchedSlugs.add(pmSlug);
       watchlist.push({
@@ -1432,7 +1461,7 @@ export async function discoverWatchlist(): Promise<{ watchlist: WatchEntry[]; no
         pm2: { outcome: pm2Token.outcome, tokenId: pm2Token.tokenId, noTokenId: pm2Token.noTokenId, tickSize: pm2Token.tickSize, minSize: pm2Token.minSize, negRisk: pm2Token.negRisk },
         pm3: { outcome: pm3Token.outcome, tokenId: pm3Token.tokenId, noTokenId: pm3Token.noTokenId, tickSize: pm3Token.tickSize, minSize: pm3Token.minSize, negRisk: pm3Token.negRisk },
       });
-      console.log(`[DISCOVER] MATCHED 3-WAY [${seriesPrefix}]: ${e1.name} vs ${e2.name} (draw) → ${pmSlug}`);
+      console.log(`[DISCOVER] MATCHED 3-WAY [${seriesPrefix}]: ${e1.name} vs ${e2.name} (draw) -> ${pmSlug}`);
       continue;
     }
 
@@ -1505,10 +1534,10 @@ export async function discoverWatchlist(): Promise<{ watchlist: WatchEntry[]; no
       continue;
     }
 
-    // ── Cross-validate PM tokenId mapping by fetching actual CLOB prices ──────
+    // -- Cross-validate PM tokenId mapping by fetching actual CLOB prices ------
     // IMPORTANT: Only apply price-based swap when BOTH name matches are ambiguous
     // (e.g. abbreviation-only matches). When findToken() made confident name matches,
-    // trust the names — price divergence between platforms is expected (that's the arb).
+    // trust the names -- price divergence between platforms is expected (that's the arb).
     const pm1NameConfident = namesMatch(e1.name, pm1Info.outcome);
     const pm2NameConfident = namesMatch(e2.name, pm2Info.outcome);
     const bothNamesConfident = pm1NameConfident && pm2NameConfident;
@@ -1524,22 +1553,22 @@ export async function discoverWatchlist(): Promise<{ watchlist: WatchEntry[]; no
         const diff_swapped = Math.abs(e1.yesAsk - ask2) + Math.abs(e2.yesAsk - ask1);
         if (diff_swapped < diff_correct - 0.10) {
           if (bothNamesConfident) {
-            // Names matched confidently — price divergence is the arb opportunity, not a mapping error.
+            // Names matched confidently -- price divergence is the arb opportunity, not a mapping error.
             // Log but do NOT swap.
             console.log(
               `[DISCOVER] Price divergence (expected for arb): ${e1.name}/${e2.name}` +
               ` KAL=[${fmtPct(e1.yesAsk)},${fmtPct(e2.yesAsk)}]` +
               ` PM=[${fmtPct(ask1)},${fmtPct(ask2)}]` +
               ` diff_correct=${diff_correct.toFixed(2)} diff_swapped=${diff_swapped.toFixed(2)}` +
-              ` — names confident, NOT swapping`
+              ` -- names confident, NOT swapping`
             );
           } else {
             console.warn(
-              `[DISCOVER] ⚠ TOKEN SWAP DETECTED: ${e1.name}/${e2.name}` +
+              `[DISCOVER] [!] TOKEN SWAP DETECTED: ${e1.name}/${e2.name}` +
               ` KAL=[${fmtPct(e1.yesAsk)},${fmtPct(e2.yesAsk)}]` +
               ` PM=[${fmtPct(ask1)},${fmtPct(ask2)}]` +
               ` diff_correct=${diff_correct.toFixed(2)} diff_swapped=${diff_swapped.toFixed(2)}` +
-              ` — swapping pm1↔pm2`
+              ` -- swapping pm1↔pm2`
             );
             [pm1Info, pm2Info] = [pm2Info, pm1Info];
           }
@@ -1547,6 +1576,15 @@ export async function discoverWatchlist(): Promise<{ watchlist: WatchEntry[]; no
       }
     } catch (e) {
       console.warn(`[DISCOVER] Token validation fetch failed: ${(e as Error).message}`);
+    }
+
+    // Final safety-net: reject if PM slug date doesn't match Kalshi date
+    // Tennis gets ±1 day tolerance (Kalshi uses tournament-day dates, PM uses ET calendar dates)
+    const pmDateFinal = parseDateFromPmSlug(pmSlug);
+    const dateCheckFinal = TENNIS_SERIES.has(seriesPrefix) ? datesMatchTennis : datesMatch;
+    if (cand.date && pmDateFinal && !dateCheckFinal(cand.date, pmDateFinal)) {
+      console.warn(`[DISCOVER] DATE MISMATCH (safety-net): KAL=${cand.date} PM=${pmDateFinal} slug=${pmSlug} -- REJECTING ${e1.name} vs ${e2.name}`);
+      seenPairs.add(pairKey); noMatchPairs.push(pairKey); continue;
     }
 
     seenPairs.add(pairKey);
@@ -1558,9 +1596,85 @@ export async function discoverWatchlist(): Promise<{ watchlist: WatchEntry[]; no
       pm1: { outcome: pm1Info.outcome, tokenId: pm1Info.tokenId, tickSize, minSize, negRisk },
       pm2: { outcome: pm2Info.outcome, tokenId: pm2Info.tokenId, tickSize, minSize, negRisk },
     });
-    console.log(`[DISCOVER] MATCHED [${seriesPrefix || cand.eventTicker}] ${marketType}: ${e1.name} vs ${e2.name} → ${pmSlug} (tick=${tickSize} negRisk=${negRisk})`);
+    console.log(`[DISCOVER] MATCHED [${seriesPrefix || cand.eventTicker}] ${marketType}: ${e1.name} vs ${e2.name} -> ${pmSlug} (tick=${tickSize} negRisk=${negRisk})`);
   }
 
   console.log(`[DISCOVER] Watchlist: ${watchlist.length} matched cross-platform pairs`);
   return { watchlist, noMatchPairs };
+}
+
+// --- Quick new-market scanner ------------------------------------------------
+// Lightweight check that runs between full discoveries. Only fetches Kalshi
+// event tickers and compares against current watchlist. If new tickers are
+// found, runs a full discovery and returns the delta.
+// Cost: 1 paginated Kalshi API call (~200ms) if no new markets.
+//       Full discovery (~5-10s) only when new markets appear.
+
+export async function quickScanNewMarkets(
+  currentWatchlist: WatchEntry[]
+): Promise<WatchEntry[]> {
+  const kalBase = process.env.KALSHI_BASE_URL ?? "https://api.elections.kalshi.com/trade-api/v2";
+  const t0 = performance.now();
+
+  // Collect all Kalshi tickers we're already watching
+  const knownTickers = new Set<string>();
+  for (const e of currentWatchlist) {
+    knownTickers.add(e.kal1.ticker);
+    knownTickers.add(e.kal2.ticker);
+  }
+
+  // Also load the no-match pairs from cache so we don't re-discover known misses
+  let knownNoMatch = new Set<string>();
+  try {
+    const cache = loadDiscoveryCache();
+    if (cache?.noMatchPairs) {
+      knownNoMatch = new Set(cache.noMatchPairs);
+    }
+  } catch { /* ignore */ }
+
+  // Fetch current Kalshi candidates (just tickers + names)
+  let candidates: KalCandidate[];
+  try {
+    candidates = await fetchKalshiCandidates(kalBase);
+  } catch (err) {
+    console.warn(`[QUICK-SCAN] Kalshi fetch failed: ${(err as Error).message}`);
+    return [];
+  }
+
+  // Check if any candidate has tickers NOT in the current watchlist
+  const newCandidates = candidates.filter(c => {
+    const hasNew = !knownTickers.has(c.e1.ticker) || !knownTickers.has(c.e2.ticker);
+    if (!hasNew) return false;
+    // Skip if this pair was already tried and had no PM match
+    const pairKey = [normalizeName(c.e1.name), normalizeName(c.e2.name)].sort().join("|") + ":" + c.marketType;
+    return !knownNoMatch.has(pairKey);
+  });
+
+  const elapsed = (performance.now() - t0).toFixed(0);
+
+  if (newCandidates.length === 0) {
+    console.log(`[QUICK-SCAN] No new markets (${candidates.length} total, ${elapsed}ms)`);
+    return [];
+  }
+
+  console.log(`[QUICK-SCAN] Found ${newCandidates.length} new Kalshi candidates! Running full discovery... (${elapsed}ms)`);
+
+  // New tickers found -- run full discovery to match them against PM
+  const result = await discoverWatchlist();
+
+  // Find entries in the new discovery that aren't in the current watchlist
+  const currentMatchCodes = new Set(currentWatchlist.map(w => w.matchCode));
+  const newEntries = result.watchlist.filter(w => !currentMatchCodes.has(w.matchCode));
+
+  if (newEntries.length > 0) {
+    // Update cache with the full new discovery
+    saveDiscoveryCache(result.watchlist, result.noMatchPairs);
+    console.log(`[QUICK-SCAN] ${newEntries.length} new pairs added to watchlist!`);
+  } else {
+    console.log(`[QUICK-SCAN] New Kalshi tickers found but no new PM matches.`);
+    // Still update cache to record the no-match pairs (avoids re-scanning them)
+    saveDiscoveryCache(result.watchlist, result.noMatchPairs);
+  }
+
+  return newEntries;
 }

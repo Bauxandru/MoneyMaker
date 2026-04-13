@@ -1,5 +1,5 @@
 /**
- * ttReconcile.ts — Reconciliation, ghost-fill handling, and book tracking.
+ * ttReconcile.ts -- Reconciliation, ghost-fill handling, and book tracking.
  *
  * Extracted from tradeTennis.ts.  Contains:
  *   • handleGhostFill          – detect & handle delayed PM fills that appear on-chain
@@ -16,6 +16,8 @@
 import fs from "fs";
 import path from "path";
 import { Wallet } from "@ethersproject/wallet";
+import { audit, startTimer } from "./ttAuditLog.js";
+import { appendEvent, type SettlementDetectedEvent } from "./ttEventLog.js";
 
 import { sleep, pickString, parseJsonArray, totalCostForTrade, kalSideForDir, normCents, normDollarsOrCents } from "../utils.js";
 import { fetchJsonWithRetry } from "../http.js";
@@ -27,12 +29,12 @@ import type { ArbTradeRecord, ExecMetric, PmPosition, KalshiMarket, WatchEntry, 
 import {
   loadArbTrades, saveArbTrades, completePendingFill, getIncompletePendingFills,
   loadPendingFills, resolveArbTrade, loadMetrics, logArbTrade, saveBookTrack,
-  _activePendingFillId, setActivePendingFillId,
+  _activePendingFillId, setActivePendingFillId, getActivePendingFillId,
   _reconcileRecoveredTrades, setReconcileRecoveredTrades,
   BOOK_SNAPSHOTS_PATH, loadHedgeStates,
 } from "./ttPersistence.js";
 import { getWsKalBook, getWsPmAsks, getWsPmBids, getWsPmBestAsk, wsKalBooks, wsPmBooks, getWsKalBestAsk } from "./ttWebSocket.js";
-import { createPmClient, fetchPmAsk } from "./ttPmOrders.js";
+import { createPmClient, fetchPmAsk, getActualPmFillCost } from "./ttPmOrders.js";
 import { namesMatch } from "./ttNameMatch.js";
 import {
   fetchAllKalshiFills, fetchAllKalshiSettlements, getKalshiPositionMap,
@@ -40,53 +42,102 @@ import {
   type KalFill, type KalSettlement,
 } from "../kalshiTrade.js";
 
-// ─── Module-level state ───────────────────────────────────────────────────────
+// --- Module-level state -------------------------------------------------------
 
 let _reconcileSnapshot = new Map<string, Record<string, unknown>>();
 let _reconcileTrigger = "startup";
 let _pmPosCache: { data: PmPosition[]; ts: number } | null = null;
 let _cachedFunder: string | null = null;
 
-// ─── Book tracker constants ───────────────────────────────────────────────────
+// --- Date guard: prevent reconciler from modifying past-day resolved trades --
+
+/** Returns today's date string in YYYY-MM-DD format (UTC). */
+function todayUTC(): string { return new Date().toISOString().slice(0, 10); }
+
+/** Check if a resolved trade is from a previous day (should not be modified). */
+function isResolvedPastDay(trade: ArbTradeRecord): boolean {
+  if (trade.status !== "resolved") return false;
+  const tradeDate = (trade.resolvedTs ?? trade.ts ?? "").slice(0, 10);
+  if (!tradeDate) return false;
+  return tradeDate < todayUTC();
+}
+
+// --- Book tracker constants ---------------------------------------------------
 
 const BOOK_TRACK_DURATION_MS = 20_000;
 const BOOK_TRACK_INTERVAL_MS = 50;
 
-// ─── Ghost fill handler ──────────────────────────────────────────────────────
+// --- Ghost fill handler ------------------------------------------------------
 
 export async function handleGhostFill(tokenId: string, shares: number, txHash: string): Promise<void> {
   const pendingFills = loadPendingFills();
   const ghostPf = pendingFills.find(pf =>
     !pf.completed && pf.exchange === "pm" && pf.pmTokenId === tokenId
   );
-  if (!ghostPf) return; // Not a ghost fill — normal fill, ignore
+  if (!ghostPf) return; // Not a ghost fill -- normal fill, ignore
 
   // Guard: if this pending fill belongs to the CURRENTLY RUNNING execution, skip.
-  // The WSS on-chain event fires 2-4s before the PM API poll confirms — during that
+  // The WSS on-chain event fires 2-4s before the PM API poll confirms -- during that
   // window the pending fill is still incomplete but the execution is actively waiting
   // for it. Let the execution path handle it; don't create a duplicate ghost trade.
-  if (_activePendingFillId === ghostPf.id) {
-    console.log(`[GHOST] Skipping — pending fill ${ghostPf.id} belongs to active execution (WSS arrived before PM API confirm). Execution will handle it.`);
+  if (getActivePendingFillId() === ghostPf.id) {
+    console.log(`[GHOST] Skipping -- pending fill ${ghostPf.id} belongs to active execution (WSS arrived before PM API confirm). Execution will handle it.`);
     return;
   }
 
   console.warn(
-    `\n[GHOST] Detected ghost fill: ${shares}× token=...${tokenId.slice(-12)} (tx=${txHash.slice(0, 18)}...)` +
+    `\n[GHOST] Detected ghost fill: ${shares}x token=...${tokenId.slice(-12)} (tx=${txHash.slice(0, 18)}...)` +
     `\n[GHOST] Matches pending fill ${ghostPf.id}: ${ghostPf.match} ${ghostPf.pmOutcome} @$${ghostPf.price}` +
     `\n[GHOST] This was a delayed PM order that appeared to fail but settled on-chain.`
   );
 
   // Mark pending fill as completed
   completePendingFill(ghostPf.id);
+  audit({ module: "ghost", fn: "handleGhostFill", action: "ghost-fill-detected", tradeId: ghostPf.id, kalTicker: ghostPf.kalTicker, pmSlug: ghostPf.pmSlug, shares, price: ghostPf.price, trigger: "pm-user-ws", context: { tokenId, txHash, pmOutcome: ghostPf.pmOutcome, match: ghostPf.match } });
+  // Ghost fill event — price is from the original pending fill (limit price, not actual).
+  // source: "onchain" indicates this was detected from wallet balance, not order API.
+  // A later clob-trades event may provide the actual fill price.
+  appendEvent({
+    type: "fill-detected", tradeId: ghostPf.id, exchange: "pm", orderId: txHash || "",
+    ticker: ghostPf.pmSlug, tokenId, side: "BUY",
+    fillShares: shares, fillPrice: ghostPf.price, fillCost: shares * ghostPf.price,
+    fees: 0, cumulativeFilled: shares, source: "onchain",
+  });
+  // Verify actual fill price via CLOB API (fire-and-forget)
+  getActualPmFillCost(tokenId, null, shares, 0, ghostPf.price).then(actual => {
+    if (!actual || Math.abs(actual.avgPrice - ghostPf.price) <= 0.005) return;
+    console.log(`[FILL-VERIFY] Ghost PM ${tokenId.slice(-12)}: correcting ${(ghostPf.price * 100).toFixed(1)}c -> ${(actual.avgPrice * 100).toFixed(1)}c`);
+    appendEvent({ type: "fill-correction", tradeId: ghostPf.id, exchange: "pm", orderId: txHash || "", ticker: ghostPf.pmSlug, tokenId, field: "fillPrice", oldValue: ghostPf.price, newValue: actual.avgPrice, reason: "rest-clob-verify" } as any);
+    if (Math.abs(actual.totalCost - shares * ghostPf.price) > 0.01) {
+      appendEvent({ type: "fill-correction", tradeId: ghostPf.id, exchange: "pm", orderId: txHash || "", ticker: ghostPf.pmSlug, tokenId, field: "fillCost", oldValue: shares * ghostPf.price, newValue: actual.totalCost, reason: "rest-clob-verify" } as any);
+    }
+  }).catch(() => {});
+
+  // Guard: if a resolved/filled trade already exists for the same KAL ticker
+  // with PM shares filled, this ghost fill is a stale duplicate from a previous
+  // pm-delayed-zero attempt. The market was re-executed successfully later.
+  // Don't create a duplicate ghost trade.
+  const trades = loadArbTrades();
+  const alreadyResolved = trades.find(t =>
+    (t.status === "resolved" || t.status === "filled") &&
+    t.kalTicker === ghostPf.kalTicker && t.pmCost > 0
+  );
+  if (alreadyResolved) {
+    console.log(
+      `[GHOST] Skipping ghost trade -- resolved trade ${alreadyResolved.id} already exists for ` +
+      `${ghostPf.kalTicker} with PM cost $${alreadyResolved.pmCost.toFixed(2)}. ` +
+      `This ghost fill is from a stale pm-delayed-zero pending fill.`
+    );
+    return;
+  }
 
   // Look for a "hedging" trade on the same KAL ticker that needs PM shares
-  const trades = loadArbTrades();
   const hedgingTrade = trades.find(t =>
     t.status === "hedging" && t.kalTicker === ghostPf.kalTicker && t.pmCost === 0
   );
 
   if (hedgingTrade) {
-    // The hedge trade was waiting for PM shares — they just arrived as a ghost fill!
+    // The hedge trade was waiting for PM shares -- they just arrived as a ghost fill!
     // Use the actual fill price from the CLOB API if possible, fall back to pending fill price
     const actualPrice = ghostPf.price;
     const pmCost = Math.round(hedgingTrade.shares * actualPrice * 100) / 100;
@@ -94,7 +145,7 @@ export async function handleGhostFill(tokenId: string, shares: number, txHash: s
     const costPerShare = totalCost / Math.max(hedgingTrade.shares, 1);
 
     if (costPerShare < 1) {
-      // Profitable — resolve the trade
+      // Profitable -- resolve the trade
       hedgingTrade.status = "resolved";
       hedgingTrade.resolutionMethod = "hedge-complete";
       hedgingTrade.resolvedTs = new Date().toISOString();
@@ -104,16 +155,17 @@ export async function handleGhostFill(tokenId: string, shares: number, txHash: s
       hedgingTrade.realizedPnl = Math.round((hedgingTrade.shares - totalCost) * 100) / 100;
       saveArbTrades(trades);
       console.warn(
-        `[GHOST] Resolved trade ${hedgingTrade.id}: ${hedgingTrade.match} — ghost PM fill @${(actualPrice * 100).toFixed(0)}¢ ` +
-        `combined $${costPerShare.toFixed(2)}/sh → P&L=$${hedgingTrade.realizedPnl!.toFixed(2)}`
+        `[GHOST] Resolved trade ${hedgingTrade.id}: ${hedgingTrade.match} -- ghost PM fill @${(actualPrice * 100).toFixed(0)}c ` +
+        `combined $${costPerShare.toFixed(2)}/sh -> P&L=$${hedgingTrade.realizedPnl!.toFixed(2)}`
       );
+      audit({ module: "ghost", fn: "handleGhostFill", action: "ghost-fill-resolved", tradeId: hedgingTrade.id, kalTicker: ghostPf.kalTicker, shares: hedgingTrade.shares, cost: totalCost, trigger: "ghost-linked-to-hedging", context: { pmFillPrice: actualPrice, pmCost, kalCost: hedgingTrade.kalCost, costPerShare, realizedPnl: hedgingTrade.realizedPnl } });
     } else {
-      // Cost >= $1 — linking them would be a guaranteed loss.
+      // Cost >= $1 -- linking them would be a guaranteed loss.
       // Treat as 2 independent unhedged positions, each hedging at breakeven via normal hedge loop.
-      // Don't link ghost PM to the KAL trade — create a separate trade for the ghost PM position.
+      // Don't link ghost PM to the KAL trade -- create a separate trade for the ghost PM position.
       console.warn(
         `[GHOST] Combined cost $${costPerShare.toFixed(2)}/sh >= $1.00 for ${hedgingTrade.match}. ` +
-        `Treating as 2 independent positions — each will hedge at breakeven.`
+        `Treating as 2 independent positions -- each will hedge at breakeven.`
       );
       const ghostTrade: ArbTradeRecord = {
         id: `arb-ghost-${Date.now()}-pm`,
@@ -138,13 +190,14 @@ export async function handleGhostFill(tokenId: string, shares: number, txHash: s
       trades.push(ghostTrade);
       saveArbTrades(trades);
       console.warn(
-        `[GHOST] Created ghost trade ${ghostTrade.id}: ${ghostTrade.shares}×${ghostPf.pmOutcome} @${(actualPrice * 100).toFixed(0)}¢ — ` +
-        `will hedge at max ${((1 - actualPrice) * 100).toFixed(0)}¢ on KAL. ` +
-        `Original KAL trade ${hedgingTrade.id} stays in hedge mode — will hedge at max ${((1 - hedgingTrade.kalCost / Math.max(hedgingTrade.shares, 1)) * 100).toFixed(0)}¢ on PM.`
+        `[GHOST] Created ghost trade ${ghostTrade.id}: ${ghostTrade.shares}x${ghostPf.pmOutcome} @${(actualPrice * 100).toFixed(0)}c -- ` +
+        `will hedge at max ${((1 - actualPrice) * 100).toFixed(0)}c on KAL. ` +
+        `Original KAL trade ${hedgingTrade.id} stays in hedge mode -- will hedge at max ${((1 - hedgingTrade.kalCost / Math.max(hedgingTrade.shares, 1)) * 100).toFixed(0)}c on PM.`
       );
+      audit({ module: "ghost", fn: "handleGhostFill", action: "ghost-fill-independent", tradeId: ghostTrade.id, kalTicker: ghostPf.kalTicker, shares: ghostTrade.shares, cost: ghostTrade.totalCost, trigger: "combined-cost-gte-1", context: { costPerShare, originalTradeId: hedgingTrade.id, pmFillPrice: actualPrice } });
     }
   } else {
-    // No matching hedging trade — create a new hedge trade for the ghost PM position.
+    // No matching hedging trade -- create a new hedge trade for the ghost PM position.
     const ghostTrade: ArbTradeRecord = {
       id: `arb-ghost-${Date.now()}-pm`,
       ts: new Date().toISOString(),
@@ -171,13 +224,14 @@ export async function handleGhostFill(tokenId: string, shares: number, txHash: s
     // Signal the main loop to pick up this new hedging trade immediately
     setReconcileRecoveredTrades(true);
     console.warn(
-      `[GHOST] Created orphan ghost trade ${ghostTrade.id}: ${shares}×${ghostPf.pmOutcome} @${(ghostPf.price * 100).toFixed(0)}¢ — ` +
-      `entering hedge mode (max KAL hedge = ${((1 - ghostPf.price) * 100).toFixed(0)}¢).`
+      `[GHOST] Created orphan ghost trade ${ghostTrade.id}: ${shares}x${ghostPf.pmOutcome} @${(ghostPf.price * 100).toFixed(0)}c -- ` +
+      `entering hedge mode (max KAL hedge = ${((1 - ghostPf.price) * 100).toFixed(0)}c).`
     );
+    audit({ module: "ghost", fn: "handleGhostFill", action: "ghost-fill-orphan", tradeId: ghostTrade.id, kalTicker: ghostPf.kalTicker, pmSlug: ghostPf.pmSlug, shares, price: ghostPf.price, cost: ghostTrade.totalCost, trigger: "no-matching-hedging-trade", context: { pmOutcome: ghostPf.pmOutcome, match: ghostPf.match } });
   }
 }
 
-// ─── Continuous book snapshot tracker ─────────────────────────────────────────
+// --- Continuous book snapshot tracker -----------------------------------------
 // On arb discovery, samples both orderbooks every 500ms for 20s and saves to disk.
 // Lets you audit exactly what the books looked like around execution time.
 
@@ -207,7 +261,7 @@ export function startBookTracker(
     const t = Date.now() - startMs;
     let source: BookSample["source"] = "ws";
 
-    // Kalshi: WS first — capture full book (both bids and derived asks)
+    // Kalshi: WS first -- capture full book (both bids and derived asks)
     const kalWs = getWsKalBook(kalTicker);
     let kalYesBids: [number, number][] = [];
     let kalNoBids: [number, number][] = [];
@@ -222,7 +276,7 @@ export function startBookTracker(
       kalNoAsks = kalYesBids.map(([p, s]) => [100 - p, s] as [number, number]).sort((a, b) => a[0] - b[0]);
     } else {
       source = "rest";
-      // Fire-and-forget REST fetch — will appear in next sample
+      // Fire-and-forget REST fetch -- will appear in next sample
       fetchKalshiOrderbook(kalTicker).then(book => {
         if (book) {
           const wsBook: WsLiveBook = {
@@ -235,7 +289,7 @@ export function startBookTracker(
       }).catch(() => {});
     }
 
-    // PM: WS first — capture top 20 levels
+    // PM: WS first -- capture top 20 levels
     const pmWsAsks = getWsPmAsks(pmTokenId);
     const pmWsBids = getWsPmBids(pmTokenId);
     const pmAsks: [number, number][] = pmWsAsks ? pmWsAsks.slice(0, 20) : [];
@@ -259,15 +313,28 @@ export function startBookTracker(
   }, BOOK_TRACK_INTERVAL_MS);
 }
 
-// ─── Post-Resolution Fill Audit (Option D) ──────────────────────────────────
+// --- Post-Resolution Fill Audit (Option D) ----------------------------------
 // After resolving a hedge-complete trade, checks Kalshi fills for untracked buys
 // (e.g., race condition where GTC fills after cancel). Corrects costs and P&L.
 
 export async function postResolutionFillAudit(kalTicker: string, tradeId: string): Promise<void> {
   try {
     const allFills = await fetchAllKalshiFills();
-    const tickerFills = allFills.filter(f => f.ticker === kalTicker && f.action === "buy");
+    let tickerFills = allFills.filter(f => f.ticker === kalTicker && f.action === "buy");
     if (tickerFills.length === 0) return;
+
+    // Load the trade first so we can filter fills by side for hedge-complete trades.
+    const trades = loadArbTrades();
+    const trade = trades.find(t => t.id === tradeId);
+
+    // For hedge-complete trades, only audit fills on the INITIAL side.
+    // The opposite side is the hedge leg, already tracked via hedgeCost.
+    // Counting both sides inflates kalCost and corrupts kalFillPrice.
+    if (trade && trade.resolutionMethod === "hedge-complete" && (trade.hedgeCost ?? 0) > 0 && trade.pmCost === 0) {
+      const initialSide = kalSideForDir(trade.dir);
+      tickerFills = tickerFills.filter(f => f.side === initialSide);
+      if (tickerFills.length === 0) return;
+    }
 
     // Sum actual KAL buys from exchange
     let actualBuyCost = 0;
@@ -281,10 +348,6 @@ export async function postResolutionFillAudit(kalTicker: string, tradeId: string
     }
     actualBuyCost = Math.round(actualBuyCost * 100) / 100;
     actualFees = Math.round(actualFees * 100) / 100;
-
-    // Load the trade and check for discrepancy
-    const trades = loadArbTrades();
-    const trade = trades.find(t => t.id === tradeId);
     if (!trade || trade.status !== "resolved") return;
 
     // Compare: are there more fills on exchange than tracked?
@@ -299,55 +362,75 @@ export async function postResolutionFillAudit(kalTicker: string, tradeId: string
     // Check if another trade shares this ticker (shared ticker = don't audit)
     const sharedCount = trades.filter(t => t.kalTicker === kalTicker).length;
     if (sharedCount > 1) {
-      console.log(`[AUDIT] Ticker ${kalTicker} shared by ${sharedCount} trades — skipping fill audit`);
+      console.log(`[AUDIT] Ticker ${kalTicker} shared by ${sharedCount} trades -- skipping fill audit`);
       return;
     }
 
     console.warn(
-      `\n[AUDIT] ⚠ Fill discrepancy for ${kalTicker} (trade ${tradeId}):\n` +
+      `\n[AUDIT] [!] Fill discrepancy for ${kalTicker} (trade ${tradeId}):\n` +
       `  Exchange: ${actualBuyCount} buys, cost=$${actualBuyCost.toFixed(2)}, fees=$${actualFees.toFixed(2)}, total=$${totalExchangeCost.toFixed(2)}\n` +
       `  Tracked:  kalCost=$${trackedKalCost.toFixed(2)}, kalFees=$${trackedKalFees.toFixed(2)}, total=$${totalTrackedCost.toFixed(2)}\n` +
-      `  Δ = $${discrepancy.toFixed(2)} — correcting trade record`
+      `  Δ = $${discrepancy.toFixed(2)} -- correcting trade record`
     );
 
-    // Correct the trade: update kalCost to include ALL exchange buys
+    // Correct the trade: update kalCost to include ALL exchange buys.
+    // But DON'T touch totalCost/realizedPnl for hedge-complete trades -- the resolution
+    // code already computed these correctly. The fill audit should only correct kalCost/kalFees,
+    // not recompute totalCost (which would miss hedgeCost or double-count it).
     const correctedKalCost = actualBuyCost;
     const correctedKalFees = actualFees;
-    const correctedTotalCost = Math.round((correctedKalCost + correctedKalFees + (trade.pmCost ?? 0)) * 100) / 100;
-    const correctedPnl = Math.round((trade.shares - correctedTotalCost) * 100) / 100;
 
     trade.kalCost = correctedKalCost;
     trade.kalFees = correctedKalFees;
+
+    // Recalculate totalCost from corrected values.
+    const correctedTotalCost = Math.round((correctedKalCost + correctedKalFees + (trade.pmCost ?? 0)) * 100) / 100;
     trade.totalCost = correctedTotalCost;
-    trade.realizedPnl = correctedPnl;
+    // Only recalculate P&L for both-legs and hedge-complete (payout = shares).
+    // Settlement P&L depends on who won — the resolve code already computed it correctly.
+    // Don't overwrite it with the both-legs formula (shares - totalCost).
+    if (trade.resolutionMethod === "hedge-complete" || trade.resolutionMethod === "both-legs") {
+      trade.realizedPnl = Math.round((trade.shares - correctedTotalCost) * 100) / 100;
+    }
+    // Don't overwrite hedgeCost -- it represents the PM hedge fill cost, not KAL cost.
+    // The audit only corrects KAL fields; hedgeCost was set correctly by the hedge resolution.
+
     trade.resolutionNote = `audit-corrected: +$${discrepancy.toFixed(2)} untracked KAL fills (${actualBuyCount} buys vs ${trade.shares} shares)`;
     saveArbTrades(trades);
 
     console.log(
-      `[AUDIT] Corrected: kalCost=$${correctedKalCost.toFixed(2)} totalCost=$${correctedTotalCost.toFixed(2)} P&L=$${correctedPnl.toFixed(2)}`
+      `[AUDIT] Corrected: kalCost=$${correctedKalCost.toFixed(2)} totalCost=$${trade.totalCost.toFixed(2)} P&L=$${(trade.realizedPnl ?? 0).toFixed(2)}`
     );
+    audit({ module: "reconcile", fn: "postResolutionFillAudit", action: "fill-audit-correction", tradeId, kalTicker: kalTicker, shares: trade.shares, cost: trade.totalCost, trigger: "exchange-fill-discrepancy", context: { discrepancy, actualBuyCount, actualBuyCost, actualFees, prevKalCost: trackedKalCost, realizedPnl: trade.realizedPnl, pmCost: trade.pmCost, hedgeComplete: trade.resolutionMethod === "hedge-complete" } });
   } catch (e) {
     console.warn(`[AUDIT] Post-resolution fill audit failed: ${(e as Error).message}`);
   }
 }
 
-// ─── Position Reconciliation ─────────────────────────────────────────────────
+// --- Position Reconciliation -------------------------------------------------
 // Fetches ground truth from both exchanges and corrects arb_trades.json.
 // Runs on startup + every hour to keep P&L log accurate.
 
-// ── Reconcile sub-steps (extracted for readability) ──────────────────────────
+// -- Reconcile sub-steps (extracted for readability) --------------------------
 
 /** (c2) Repair PM costs using CLOB getTrades() API + on-chain fallback. Mutates trades in place. */
 export async function repairPmCostsFromClob(trades: ArbTradeRecord[]): Promise<{ repaired: number; changed: boolean }> {
   let repaired = 0;
   let changed = false;
-  // Include resolved trades with pmCost=0 — section (a) may have resolved via settlement
+  // Include resolved trades with pmCost=0 -- section (a) may have resolved via settlement
   // before CLOB repair ran, leaving pmCost=0 on trades that actually had PM fills.
-  const needRepair = trades.filter(t => t.pmTokenId && t.pmCost === 0 && t.pmFillPrice === 0);
+  // Skip past-day resolved trades -- their records are finalized.
+  // Skip hedge-complete trades where the hedge was on KAL (initialExchange=kal, pmCost=0 is correct).
+  // repairPmCostsFromClob would find PM fills from other trades sharing the same slug and
+  // incorrectly assign them to this trade, inflating totalCost and turning profits into losses.
+  const needRepair = trades.filter(t =>
+    t.pmTokenId && t.pmCost === 0 && t.pmFillPrice === 0 && !isResolvedPastDay(t) &&
+    !(t.initialExchange === "kal" && (t.resolutionMethod === "hedge-complete" || t.resolutionMethod === "settlement"))
+  );
   if (needRepair.length === 0) return { repaired, changed };
 
   // Retry CLOB getTrades() up to 5 times with exponential backoff.
-  // No estimated fallback — we only use actual exchange data.
+  // No estimated fallback -- we only use actual exchange data.
   const MAX_CLOB_RETRIES = 5;
   type ClobFill = { asset_id: string; size: string; price: string; fee_rate_bps: string; side: string; status: string; match_time: string };
   let clobTrades: ClobFill[] | null = null;
@@ -393,7 +476,7 @@ export async function repairPmCostsFromClob(trades: ArbTradeRecord[]): Promise<{
         const dist = Math.abs(fillSec - tradeSec);
         if (dist < bestDist) { bestDist = dist; bestIdx = i; }
       }
-      // Hedge trades may have PM fills minutes/hours after KAL fill — allow wider window
+      // Hedge trades may have PM fills minutes/hours after KAL fill -- allow wider window
       const maxDistSec = (trade.status === "resolved" || trade.initialExchange === "kal") ? 7200 : 60;
       if (bestIdx < 0 || bestDist > maxDistSec) continue;
       used.add(bestIdx);
@@ -402,9 +485,23 @@ export async function repairPmCostsFromClob(trades: ArbTradeRecord[]): Promise<{
       const price = Number(f.price);
       const feeBps = Number(f.fee_rate_bps);
       const feePerShare = price * (feeBps / 10000);
-      const avgPrice = Math.round((price + feePerShare) * 100) / 100;
+      let avgPrice = Math.round((price + feePerShare) * 100) / 100;
+      // Binary market price inversion guard: CLOB may report the complementary price.
+      // If using CLOB price makes combined cost > $1/share, invert.
+      let pmCostCandidate = Math.round(trade.shares * avgPrice * 100) / 100;
+      const combinedCheck = (trade.kalCost + pmCostCandidate) / Math.max(trade.shares, 1);
+      if (combinedCheck > 1.0 && avgPrice > 0.5) {
+        const inverted = Math.round((1 - price + feePerShare) * 100) / 100;
+        const invertedCost = Math.round(trade.shares * inverted * 100) / 100;
+        const combinedInverted = (trade.kalCost + invertedCost) / Math.max(trade.shares, 1);
+        if (combinedInverted < 1.0) {
+          console.log(`[RECONCILE]   PM price inverted: ${avgPrice} -> ${inverted} (combined $${combinedCheck.toFixed(2)}/sh -> $${combinedInverted.toFixed(2)}/sh)`);
+          avgPrice = inverted;
+          pmCostCandidate = invertedCost;
+        }
+      }
       trade.pmFillPrice = avgPrice;
-      trade.pmCost = Math.round(trade.shares * avgPrice * 100) / 100;
+      trade.pmCost = pmCostCandidate;
       trade.totalCost = totalCostForTrade(trade);
       // Recalculate P&L for resolved trades that were settled with pmCost=0
       if (trade.status === "resolved" && trade.realizedPnl != null) {
@@ -412,9 +509,9 @@ export async function repairPmCostsFromClob(trades: ArbTradeRecord[]): Promise<{
         const payout = trade.shares; // arb guarantees $1/share when both legs exist
         const oldPnl = trade.realizedPnl;
         trade.realizedPnl = Math.round((payout - trade.kalCost - trade.pmCost - hedgeCost) * 100) / 100;
-        console.log(`[RECONCILE]   PM CLOB P&L fix: ${trade.match} → P&L $${oldPnl.toFixed(2)}→$${trade.realizedPnl.toFixed(2)} (pmCost was missing)`);
+        console.log(`[RECONCILE]   PM CLOB P&L fix: ${trade.match} -> P&L $${oldPnl.toFixed(2)}->$${trade.realizedPnl.toFixed(2)} (pmCost was missing)`);
       }
-      console.log(`[RECONCILE]   PM CLOB repair: ${trade.match} → pmFP=${avgPrice} pmCost=$${trade.pmCost.toFixed(2)} (ts-matched)`);
+      console.log(`[RECONCILE]   PM CLOB repair: ${trade.match} -> pmFP=${avgPrice} pmCost=$${trade.pmCost.toFixed(2)} (ts-matched)`);
       repaired++;
       changed = true;
     }
@@ -432,6 +529,8 @@ export async function verifyAndFixPnl(
 
   for (const trade of trades) {
     if (trade.status !== "resolved") continue;
+    // Never modify past-day resolved trades -- their P&L is finalized.
+    if (isResolvedPastDay(trade)) continue;
     // Scalar-settled trades have manually-verified P&L from actual settlement values.
     // Never overwrite with the binary formula.
     if (trade.scalarSettlement) continue;
@@ -439,30 +538,18 @@ export async function verifyAndFixPnl(
     let correctPnl: number;
 
     if (trade.resolutionMethod === "hedge-complete") {
+      // Hedge-complete trades have totalCost and realizedPnl set correctly by the hedge
+      // resolution code in monitorLoop. Don't recompute -- the cost structure (which fields
+      // include hedge fills) varies by initialExchange and hedge path. Recomputing here
+      // with heuristics causes double-counting that turns profits into losses.
+      // Only verify the basic invariant: pnl should equal shares - totalCost.
       const payout = trade.shares;
-      // New-style trades (initialExchange set): the hedge loop already merged hedge costs into
-      // kalCost+pmCost (e.g., PM-initial → pmCost = initialCost + hedgeFillCostPm). Don't double-count.
-      // EXCEPTION: partial-fill trades have 3 independent cost components (kalCost + pmCost + hedgeCost)
-      // when both KAL partially filled AND PM hedge covered remaining. Detect by checking if
-      // both kalCost > 0 AND pmCost > 0 AND hedgeCost > 0 AND hedgeCost ≠ kalCost/pmCost.
-      // Legacy trades (no initialExchange): hedgeCost may need to be added if one side is 0.
-      let hc: number;
-      const hedgeCostVal = trade.hedgeCost ?? 0;
-      if (!trade.initialExchange) {
-        // Legacy: add hedgeCost when one side is 0
-        hc = ((trade.pmCost === 0 || trade.kalCost === 0) && hedgeCostVal > 0) ? hedgeCostVal : 0;
-      } else if (hedgeCostVal > 0 && trade.kalCost > 0 && trade.pmCost > 0
-        && Math.abs(hedgeCostVal - trade.kalCost) > 0.05
-        && Math.abs(hedgeCostVal - trade.pmCost) > 0.05) {
-        // New-style partial-fill: hedgeCost is a third independent component
-        hc = hedgeCostVal;
+      const expectedPnl = Math.round((payout - trade.totalCost) * 100) / 100;
+      if (trade.realizedPnl != null && Math.abs(trade.realizedPnl - expectedPnl) > 0.03) {
+        correctPnl = expectedPnl;
       } else {
-        // New-style standard: hedgeCost is a duplicate of one leg
-        hc = 0;
+        continue; // P&L is consistent with totalCost, don't touch
       }
-      // kalCost already includes kalFees (baked in at resolve time) — do NOT add kalFees again
-      trade.totalCost = Math.round((trade.kalCost + hc + trade.pmCost) * 100) / 100;
-      correctPnl = payout - trade.totalCost;
     } else {
       const settlement = settlementByTicker.get(trade.kalTicker);
       let kalResult = settlement?.marketResult ?? "";
@@ -480,16 +567,23 @@ export async function verifyAndFixPnl(
       const hasKal = trade.kalCost > 0 || trade.kalFillPrice > 0;
 
       {
-        // Same logic: new-style trades have hedge costs merged into kalCost/pmCost by the hedge loop.
-        const hcS = !trade.initialExchange && ((trade.pmCost === 0 || trade.kalCost === 0) && (trade.hedgeCost ?? 0) > 0) ? (trade.hedgeCost ?? 0) : 0;
-        // If hedge exists (opposite side bought on either exchange), both sides covered → payout = shares
-        const kalPayout = hcS > 0 ? trade.shares : ((hasKal && kalSideWon) ? trade.shares : 0);
-        const pmPayout = hcS > 0 ? 0 : ((hasPm && !kalSideWon) ? trade.shares : 0);
-        // kalCost already includes kalFees — do NOT subtract kalFees separately
-        correctPnl = kalPayout + pmPayout - trade.kalCost - hcS - trade.pmCost;
+        // hedgeCost is additive when one side is 0 (fills the missing side), regardless of trade style.
+        const hcS = ((trade.pmCost === 0 || trade.kalCost === 0) && (trade.hedgeCost ?? 0) > 0) ? (trade.hedgeCost ?? 0) : 0;
+        // Fully hedged (both legs or hedge cost) → payout = shares regardless of result
+        const isFullyHedged = (hasKal && hasPm) || hcS > 0;
+        const hedgedShares = isFullyHedged ? trade.shares : 0;
+        const unhedgedShares = trade.shares - hedgedShares;
+        // Unhedged: KAL-only pays when kalSideWon, PM-only pays when !kalSideWon
+        const unhedgedKalPayout = (hasKal && !hasPm && kalSideWon) ? unhedgedShares : 0;
+        const unhedgedPmPayout = (hasPm && !hasKal && !kalSideWon) ? unhedgedShares : 0;
+        const kalPayout = hedgedShares + unhedgedKalPayout;
+        const pmPayout = unhedgedPmPayout;
+        // kalCost may or may not include kalFees (post-audit separates them).
+        // Always subtract kalFees explicitly to handle both cases safely.
+        correctPnl = kalPayout + pmPayout - trade.kalCost - (trade.kalFees ?? 0) - hcS - trade.pmCost;
       }
-      const hcS2 = !trade.initialExchange && ((trade.pmCost === 0 || trade.kalCost === 0) && (trade.hedgeCost ?? 0) > 0) ? (trade.hedgeCost ?? 0) : 0;
-      trade.totalCost = Math.round((trade.kalCost + hcS2 + trade.pmCost) * 100) / 100;
+      const hcS2 = ((trade.pmCost === 0 || trade.kalCost === 0) && (trade.hedgeCost ?? 0) > 0) ? (trade.hedgeCost ?? 0) : 0;
+      trade.totalCost = Math.round((trade.kalCost + (trade.kalFees ?? 0) + hcS2 + trade.pmCost) * 100) / 100;
     }
     correctPnl = Math.round(correctPnl * 100) / 100;
 
@@ -537,6 +631,8 @@ export function writeReconcileAudit(trades: ArbTradeRecord[]): void {
 
 export async function reconcilePositions(trigger: string = "startup"): Promise<void> {
   _reconcileTrigger = trigger;
+  const _reconTimer = startTimer();
+  audit({ module: "reconcile", fn: "reconcilePositions", action: "reconcile-started", trigger });
   console.log("[RECONCILE] Fetching exchange data...");
   let kalFills: KalFill[] = [];
   let kalSettlements: KalSettlement[] = [];
@@ -609,7 +705,7 @@ export async function reconcilePositions(trigger: string = "startup"): Promise<v
 
   // Also keep aggregate fillsByTicker for settlement fee proportioning (step a)
   const fillsByTicker = new Map<string, { totalShares: number; totalCostCents: number; totalFeeDollars: number; side: string; avgPriceCents: number }>();
-  // Per-side fills: key = "ticker:yes" or "ticker:no" → detect hedge fills on opposite side
+  // Per-side fills: key = "ticker:yes" or "ticker:no" -> detect hedge fills on opposite side
   const fillsByTickerSide = new Map<string, { totalShares: number; totalCostDollars: number; totalFeeDollars: number }>();
   for (const f of kalFills) {
     if (f.action !== "buy" || !f.ticker) continue;
@@ -658,7 +754,7 @@ export async function reconcilePositions(trigger: string = "startup"): Promise<v
   let costsCorrected = 0;
   let changed = false;
 
-  // ── (pre) Ghost/duplicate consolidation: merge multiple records per ticker into one ──
+  // -- (pre) Ghost/duplicate consolidation: merge multiple records per ticker into one --
   // When ghost/recovered/excess trades share a kalTicker with a normal trade, consolidate
   // into a single record using actual exchange data as source of truth.
   {
@@ -699,7 +795,7 @@ export async function reconcilePositions(trigger: string = "startup"): Promise<v
         ?? group.sort((a, b) => new Date(a.ts).getTime() - new Date(b.ts).getTime())[0];
       const mergedIds = group.filter(g => g !== primary).map(g => g.id);
 
-      // Aggregate PM costs — use the FIRST trade's pmCost per share, don't double-count
+      // Aggregate PM costs -- use the FIRST trade's pmCost per share, don't double-count
       const pmCostPerShare = primary.pmCost > 0 && primary.shares > 0
         ? primary.pmCost / primary.shares
         : group.find(g => g.pmCost > 0 && g.shares > 0)
@@ -721,7 +817,7 @@ export async function reconcilePositions(trigger: string = "startup"): Promise<v
         : 0;
       const excessCost = Math.round((actualKalCost - cappedKalCost + actualPmShares * pmCostPerShare - cappedPmCost) * 100) / 100;
 
-      console.log(`[RECONCILE]   CONSOLIDATE: ${ticker} — merging ${group.length} records → 1. Removing: ${mergedIds.join(", ")}`);
+      console.log(`[RECONCILE]   CONSOLIDATE: ${ticker} -- merging ${group.length} records -> 1. Removing: ${mergedIds.join(", ")}`);
       console.log(`[RECONCILE]     Arb: ${arbShares} shares | KAL: $${cappedKalCost} | PM: $${cappedPmCost}${excessCost > 0.01 ? ` | Excess: $${excessCost}` : ""}`);
 
       primary.shares = arbShares;
@@ -768,17 +864,17 @@ export async function reconcilePositions(trigger: string = "startup"): Promise<v
   }
 
   for (const trade of trades) {
-    // Skip scalar-settled trades — their P&L is manually corrected based on actual settlement
+    // Skip scalar-settled trades -- their P&L is manually corrected based on actual settlement
     // values and should never be recalculated using the binary formula.
     if (trade.scalarSettlement) continue;
 
-    // (a) Fix stale "hedging" → check if market settled
+    // (a) Fix stale "hedging" -> check if market settled
     if (trade.status === "hedging") {
       const settlement = settlementByTicker.get(trade.kalTicker);
       if (settlement) {
         const kalFee = settlement.feeCost;
 
-        // Try to find PM cost from positions — only if this trade's hedge actually went to PM.
+        // Try to find PM cost from positions -- only if this trade's hedge actually went to PM.
         // Don't assign PM cost from positions that belong to other trades on the same slug.
         let pmCost = trade.pmCost;
         if (pmCost === 0 || trade.pmFillPrice === 0) {
@@ -793,10 +889,10 @@ export async function reconcilePositions(trigger: string = "startup"): Promise<v
               const size = Number(p.size ?? p.amount ?? 0);
               const availableShares = size - otherPmClaimed;
               if (avgPrice > 0 && availableShares >= trade.shares) {
-                // Sanity check: if combined cost/share >= $1, PM avgPrice is likely market price, not fill price — skip
+                // Sanity check: if combined cost/share >= $1, PM avgPrice is likely market price, not fill price -- skip
                 const estCombined = (trade.kalCost + trade.shares * avgPrice) / Math.max(trade.shares, 1);
                 if (estCombined >= 1) {
-                  console.warn(`[RECONCILE]   PM avgPrice ${(avgPrice * 100).toFixed(0)}¢ for ${trade.match} gives combined $${estCombined.toFixed(2)}/sh >= $1.00 — skipping PM cost backfill`);
+                  console.warn(`[RECONCILE]   PM avgPrice ${(avgPrice * 100).toFixed(0)}c for ${trade.match} gives combined $${estCombined.toFixed(2)}/sh >= $1.00 -- skipping PM cost backfill`);
                 } else {
                   pmCost = trade.shares * avgPrice;
                   trade.pmFillPrice = avgPrice;
@@ -808,18 +904,18 @@ export async function reconcilePositions(trigger: string = "startup"): Promise<v
           }
         }
 
-        // Per-trade P&L — don't use aggregate settlement kalCostExact/kalRevenue
+        // Per-trade P&L -- don't use aggregate settlement kalCostExact/kalRevenue
         // as it sums ALL fills for the ticker, double-counting when multiple trades share it.
         const kalSide = kalSideForDir(trade.dir);
         const kalOppSide = kalSide === "yes" ? "no" : "yes";
         const kalSideWon = (kalSide === "yes" && settlement.marketResult === "yes") || (kalSide === "no" && settlement.marketResult === "no");
         const hasPmLeg = pmCost > 0 || trade.pmFillPrice > 0;
 
-        // ── Check for hedge fills on OPPOSITE Kalshi side ──
+        // -- Check for hedge fills on OPPOSITE Kalshi side --
         // If the bot hedged by buying the opposite side on Kalshi (e.g., bought YES initially,
-        // then bought NO as hedge), both sides are covered → payout = shares × $1 regardless.
+        // then bought NO as hedge), both sides are covered -> payout = shares x $1 regardless.
         // IMPORTANT: Only count opposite-side fills as hedges if no OTHER trade on this ticker
-        // already accounts for them — otherwise we'd fabricate hedge data from unrelated trades.
+        // already accounts for them -- otherwise we'd fabricate hedge data from unrelated trades.
         const oppSideFills = fillsByTickerSide.get(`${trade.kalTicker}:${kalOppSide}`);
         let hedgeCostKal = trade.hedgeCost ?? 0;
         let kalHedgeShares = 0;
@@ -834,20 +930,28 @@ export async function reconcilePositions(trigger: string = "startup"): Promise<v
           if (unclaimedOppShares > 0) {
             kalHedgeShares = Math.min(unclaimedOppShares, trade.shares);
             hedgeCostKal = Math.round((oppSideFills.totalCostDollars + oppSideFills.totalFeeDollars) * (kalHedgeShares / oppSideFills.totalShares) * 100) / 100;
-            console.log(`[RECONCILE]   Found KAL hedge fills: ${kalHedgeShares}×${kalOppSide.toUpperCase()} cost=$${hedgeCostKal.toFixed(2)} on ${trade.kalTicker} (${unclaimedOppShares} unclaimed of ${oppSideFills.totalShares} total)`);
+            console.log(`[RECONCILE]   Found KAL hedge fills: ${kalHedgeShares}x${kalOppSide.toUpperCase()} cost=$${hedgeCostKal.toFixed(2)} on ${trade.kalTicker} (${unclaimedOppShares} unclaimed of ${oppSideFills.totalShares} total)`);
           }
         }
 
-        // Payout calculation: hedged shares always pay $1, unhedged depend on result
-        const hedgedShares = hasPmLeg ? trade.shares : kalHedgeShares;
+        // Payout calculation: hedged shares (both KAL+PM) always pay $1.
+        // Having PM alone doesn't mean hedged -- need BOTH sides.
+        // PM-only detect trades (kalCost=0) are one-sided bets on PM outcome.
+        const hasKalLeg = trade.kalCost > 0 || trade.kalFillPrice > 0;
+        const isFullyHedged = hasPmLeg && hasKalLeg;
+        const hedgedShares = isFullyHedged ? trade.shares : kalHedgeShares;
         const unhedgedShares = trade.shares - hedgedShares;
-        const kalPayout = hedgedShares + (kalSideWon ? unhedgedShares : 0);
-        const pmPayout = (hasPmLeg && !kalSideWon) ? trade.shares : 0;
+        // Hedged shares always pay $1 (one side wins).
+        // Unhedged KAL-only shares pay when kalSideWon. Unhedged PM-only shares pay when !kalSideWon.
+        const unhedgedKalPayout = (hasKalLeg && kalSideWon) ? unhedgedShares : 0;
+        const unhedgedPmPayout = (hasPmLeg && !hasKalLeg && !kalSideWon) ? unhedgedShares : 0;
+        const kalPayout = hedgedShares + unhedgedKalPayout;
+        const pmPayout = unhedgedPmPayout;
 
         // Keep per-trade kalCost (set by makeUnhedged). Add proportional fee if missing.
         if (trade.kalCost > 0 && trade.kalFillPrice > 0) {
           const rawCost = trade.shares * trade.kalFillPrice;
-          // If kalCost ≈ shares × fillPrice, fee isn't included yet — add proportional fee
+          // If kalCost ≈ shares x fillPrice, fee isn't included yet -- add proportional fee
           if (Math.abs(trade.kalCost - rawCost) < 0.05 && kalFee > 0) {
             const fillData = fillsByTicker.get(trade.kalTicker);
             const totalShares = fillData?.totalShares ?? trade.shares;
@@ -855,16 +959,27 @@ export async function reconcilePositions(trigger: string = "startup"): Promise<v
             trade.kalCost = Math.round((rawCost + perTradeFee) * 100) / 100;
           }
         } else if (trade.kalCost === 0 && fillsByTicker.has(trade.kalTicker)) {
-          // kalCost lost — backfill from proportional fill data
+          // kalCost lost -- backfill from proportional fill data.
+          // But first check if other trades already claim the KAL fills for this ticker.
+          // Don't double-assign fills (e.g., detect trades that have PM-only exposure).
           const fillData = fillsByTicker.get(trade.kalTicker)!;
-          const proportion = fillData.totalShares > 0 ? trade.shares / fillData.totalShares : 1;
-          const backfilledKalCost = Math.round((fillData.totalCostCents / 100 + fillData.totalFeeDollars) * proportion * 100) / 100;
-          const combinedPerShare = (backfilledKalCost + pmCost) / Math.max(trade.shares, 1);
-          if (combinedPerShare >= 1) {
-            console.log(`[RECONCILE]   WARNING: backfill for ${trade.match} gives combined cost $${combinedPerShare.toFixed(2)}/share >= $1.00 — bad recovery, money already spent`);
+          const otherKalClaimed = trades
+            .filter(t => t.id !== trade.id && t.kalTicker === trade.kalTicker && t.kalCost > 0)
+            .reduce((s, t) => s + t.shares, 0);
+          const unclaimedKalShares = Math.max(0, fillData.totalShares - otherKalClaimed);
+          if (unclaimedKalShares > 0) {
+            const sharesToAssign = Math.min(trade.shares, unclaimedKalShares);
+            const proportion = fillData.totalShares > 0 ? sharesToAssign / fillData.totalShares : 1;
+            const backfilledKalCost = Math.round((fillData.totalCostCents / 100 + fillData.totalFeeDollars) * proportion * 100) / 100;
+            const combinedPerShare = (backfilledKalCost + pmCost) / Math.max(trade.shares, 1);
+            if (combinedPerShare >= 1) {
+              console.log(`[RECONCILE]   WARNING: backfill for ${trade.match} gives combined cost $${combinedPerShare.toFixed(2)}/share >= $1.00 -- bad recovery, money already spent`);
+            }
+            trade.kalCost = backfilledKalCost;
+            trade.kalFillPrice = fillData.avgPriceCents / 100;
+          } else {
+            console.log(`[RECONCILE]   Skip KAL backfill for ${trade.match}: all ${fillData.totalShares} fills claimed by other trades`);
           }
-          trade.kalCost = backfilledKalCost;
-          trade.kalFillPrice = fillData.avgPriceCents / 100;
         }
 
         // Include hedge cost in total
@@ -879,6 +994,14 @@ export async function reconcilePositions(trigger: string = "startup"): Promise<v
         trade.totalCost = Math.round((trade.kalCost + hedgeCostKal + pmCost) * 100) / 100;
         trade.realizedPnl = Math.round(pnl * 100) / 100;
         console.log(`[RECONCILE]   Resolved ${trade.match} (dir ${trade.dir}): ${trade.resolutionMethod}, kalPayout=$${kalPayout}${kalHedgeShares > 0 ? ` hedgeKal=$${hedgeCostKal.toFixed(2)}` : ""} pmPayout=$${pmPayout} P&L=$${trade.realizedPnl.toFixed(2)}`);
+        if (trade.resolutionMethod === "settlement") {
+          appendEvent({
+            type: "settlement-detected", tradeId: trade.id, exchange: "kal",
+            orderId: "", ticker: trade.kalTicker,
+            result: settlement.marketResult, settlementValue: settlement.marketResult === "yes" ? 1 : 0,
+            payout: kalPayout + pmPayout, source: "reconcile",
+          } as Omit<SettlementDetectedEvent, "seq" | "ts">);
+        }
         staleResolved++;
         changed = true;
         continue;
@@ -891,7 +1014,10 @@ export async function reconcilePositions(trigger: string = "startup"): Promise<v
     //      Check if PM wallet has tokens matching the trade's pmOutcome on the same slug.
     //      IMPORTANT: Subtract PM shares already claimed by other trades on the same slug
     //      to avoid double-counting the same PM position across multiple trades.
-    if (trade.status === "hedging" && trade.pmCost === 0 && trade.kalFillPrice > 0) {
+    //      ONLY resolve if the Kalshi market has settled. If the market is still live,
+    //      leave in hedging mode -- the hedge loop will manage the PM position properly.
+    const isSettled_a2 = settlementByTicker.has(trade.kalTicker);
+    if (trade.status === "hedging" && trade.pmCost === 0 && trade.kalFillPrice > 0 && isSettled_a2) {
       // Count PM shares already claimed by other trades on the same slug
       const otherPmSharesClaimed = trades
         .filter(t => t.id !== trade.id && t.pmSlug === trade.pmSlug && t.pmCost > 0)
@@ -910,15 +1036,15 @@ export async function reconcilePositions(trigger: string = "startup"): Promise<v
             namesMatch(pf.pmOutcome, trade.pmOutcome) && pf.price > 0
           );
           const avgPrice = pfMatch ? pfMatch.price : posAvgPrice;
-          // Validate combined cost: if cost/share >= $1, the avgPrice is unreliable — don't resolve, let hedge loop handle it.
+          // Validate combined cost: if cost/share >= $1, the avgPrice is unreliable -- don't resolve, let hedge loop handle it.
           const pmCost = Math.round(trade.shares * avgPrice * 100) / 100;
           const totalCost = Math.round((trade.kalCost + pmCost) * 100) / 100;
           const costPerShare = totalCost / Math.max(trade.shares, 1);
           if (costPerShare >= 1) {
             console.warn(
-              `[RECONCILE]   PM wallet hedge found but avgPrice unreliable: ${trade.match} — ` +
-              `${size}×${outcome} @${(avgPrice * 100).toFixed(0)}¢ on PM → combined $${costPerShare.toFixed(2)}/sh >= $1.00. ` +
-              `Leaving in hedge mode (max hedge price = ${((1 - trade.kalCost / Math.max(trade.shares, 1)) * 100).toFixed(0)}¢).`
+              `[RECONCILE]   PM wallet hedge found but avgPrice unreliable: ${trade.match} -- ` +
+              `${size}x${outcome} @${(avgPrice * 100).toFixed(0)}c on PM -> combined $${costPerShare.toFixed(2)}/sh >= $1.00. ` +
+              `Leaving in hedge mode (max hedge price = ${((1 - trade.kalCost / Math.max(trade.shares, 1)) * 100).toFixed(0)}c).`
             );
             break;
           }
@@ -932,8 +1058,8 @@ export async function reconcilePositions(trigger: string = "startup"): Promise<v
           trade.totalCost = totalCost;
           trade.realizedPnl = realizedPnl;
           console.log(
-            `[RECONCILE]   PM wallet hedge found: ${trade.match} — ` +
-            `${size}×${outcome} @${(avgPrice * 100).toFixed(0)}¢ on PM. ` +
+            `[RECONCILE]   PM wallet hedge found: ${trade.match} -- ` +
+            `${size}x${outcome} @${(avgPrice * 100).toFixed(0)}c on PM. ` +
             `Resolved: P&L=$${realizedPnl.toFixed(2)}`
           );
           staleResolved++;
@@ -944,18 +1070,20 @@ export async function reconcilePositions(trigger: string = "startup"): Promise<v
       if (trade.status !== "hedging") continue;
     }
 
-    // (b) Fix "filled" instant-arbs → mark resolved if both legs have prices
+    // (b) Fix "filled" instant-arbs -> mark resolved if both legs have prices.
+    //     LEGACY: new trades are logged as "resolved" directly in executeArb.
+    //     This only fires for pre-existing "filled" records from older code.
     if (trade.status === "filled" && trade.kalFillPrice > 0 && trade.pmFillPrice > 0 && trade.realizedPnl != null) {
       trade.status = "resolved";
       trade.resolutionMethod = "both-legs";
       trade.resolvedTs = trade.resolvedTs ?? trade.ts;
-      console.log(`[RECONCILE]   Fixed status: ${trade.match} (filled→resolved)`);
+      console.log(`[RECONCILE]   Fixed status: ${trade.match} (filled->resolved)`);
       filledToResolved++;
       changed = true;
     }
 
     // (b2) Fix "hedging" trades that already have both legs filled but never got resolved.
-    //      This happens when hedge_state.json is lost (crash/restart) — the hedge cycle
+    //      This happens when hedge_state.json is lost (crash/restart) -- the hedge cycle
     //      can't find the trade, so it stays stuck in "hedging" forever.
     if (trade.status === "hedging" && trade.kalCost > 0 && trade.pmCost > 0) {
       trade.status = "resolved";
@@ -964,16 +1092,26 @@ export async function reconcilePositions(trigger: string = "startup"): Promise<v
       trade.hedgeCost = trade.initialExchange === "pm" ? trade.kalCost : trade.pmCost;
       trade.totalCost = totalCostForTrade(trade);
       trade.realizedPnl = Math.round((trade.shares - trade.totalCost) * 100) / 100;
-      console.log(`[RECONCILE]   Fixed status: ${trade.match} (hedging→resolved, both legs filled: KAL=$${trade.kalCost.toFixed(2)} PM=$${trade.pmCost.toFixed(2)} P&L=$${trade.realizedPnl.toFixed(2)})`);
+      console.log(`[RECONCILE]   Fixed status: ${trade.match} (hedging->resolved, both legs filled: KAL=$${trade.kalCost.toFixed(2)} PM=$${trade.pmCost.toFixed(2)} P&L=$${trade.realizedPnl.toFixed(2)})`);
       filledToResolved++;
       changed = true;
     }
 
     // (c) Backfill missing kalCost or fix cost discrepancies using timestamp-matched fills.
     //     Skip hedge-complete trades UNLESS kalCost=0 (ghost/recovered trades resolved before backfill).
-    //     Skip resolved trades UNLESS kalCost=0 (same reason — settlement resolved before cost was known).
+    //     Skip resolved trades UNLESS kalCost=0 (same reason -- settlement resolved before cost was known).
     const kalNeedsBackfill = trade.kalCost === 0;
     if (trade.kalTicker && (kalNeedsBackfill || (trade.resolutionMethod !== "hedge-complete" && trade.status !== "resolved"))) {
+      // Before attempting timestamp match, check if other trades already claim all KAL fills
+      // for this ticker. Prevents double-assigning fills to detect/overfill trades.
+      const otherKalClaimedC = trades
+        .filter(t => t.id !== trade.id && t.kalTicker === trade.kalTicker && t.kalCost > 0)
+        .reduce((s, t) => s + t.shares, 0);
+      const fillDataC = fillsByTicker.get(trade.kalTicker);
+      const unclaimedC = fillDataC ? Math.max(0, fillDataC.totalShares - otherKalClaimedC) : 0;
+      if (kalNeedsBackfill && unclaimedC <= 0) {
+        // All fills already claimed by other trades -- skip backfill
+      } else {
       const kalSide = kalSideForDir(trade.dir);
       const kalKey = `${trade.kalTicker}:${kalSide}`;
       const matched = matchKalFillsForTrade(kalKey, trade.ts, trade.shares);
@@ -992,9 +1130,9 @@ export async function reconcilePositions(trigger: string = "startup"): Promise<v
             const payout = trade.shares;
             const oldPnl = trade.realizedPnl;
             trade.realizedPnl = Math.round((payout - trade.kalCost - trade.pmCost - hedgeCost) * 100) / 100;
-            console.log(`[RECONCILE]   Backfilled kalCost + P&L fix: ${trade.match} dir=${trade.dir} → kalCost=$${kalCostWithFees.toFixed(2)} P&L ${oldPnl.toFixed(2)}→${trade.realizedPnl.toFixed(2)}`);
+            console.log(`[RECONCILE]   Backfilled kalCost + P&L fix: ${trade.match} dir=${trade.dir} -> kalCost=$${kalCostWithFees.toFixed(2)} P&L ${oldPnl.toFixed(2)}->${trade.realizedPnl.toFixed(2)}`);
           } else {
-            console.log(`[RECONCILE]   Backfilled kalCost: ${trade.match} dir=${trade.dir} → $${kalCostWithFees.toFixed(2)} (ts-matched, fee=$${matched.fees.toFixed(2)})`);
+            console.log(`[RECONCILE]   Backfilled kalCost: ${trade.match} dir=${trade.dir} -> $${kalCostWithFees.toFixed(2)} (ts-matched, fee=$${matched.fees.toFixed(2)})`);
           }
           costsCorrected++;
           changed = true;
@@ -1003,11 +1141,12 @@ export async function reconcilePositions(trigger: string = "startup"): Promise<v
           trade.kalCost = kalCostWithFees;
           trade.kalFillPrice = avgPrice;
           trade.totalCost = totalCostForTrade(trade);
-          console.log(`[RECONCILE]   Fixed kalCost: ${trade.match} $${oldCost.toFixed(2)}→$${kalCostWithFees.toFixed(2)} (ts-matched, fee=$${matched.fees.toFixed(2)})`);
+          console.log(`[RECONCILE]   Fixed kalCost: ${trade.match} $${oldCost.toFixed(2)}->$${kalCostWithFees.toFixed(2)} (ts-matched, fee=$${matched.fees.toFixed(2)})`);
           costsCorrected++;
           changed = true;
         }
       }
+      } // end else (unclaimed fills available)
     }
   }
 
@@ -1019,9 +1158,10 @@ export async function reconcilePositions(trigger: string = "startup"): Promise<v
   // (d0) Fix corrupted kalCost from old settlement-based reconciler.
   //      The old reconciler used aggregate settlement data which double-counted when
   //      multiple trades shared a Kalshi ticker. Detect and fix: if kalCost is >50%
-  //      above kalFillPrice × shares, it was inflated by settlement aggregation.
+  //      above kalFillPrice x shares, it was inflated by settlement aggregation.
   let kalCostFixed = 0;
   for (const trade of trades) {
+    if (isResolvedPastDay(trade)) continue;
     const fp = trade.kalFillPrice ?? 0;
     const cost = trade.kalCost ?? 0;
     const sh = trade.shares ?? 0;
@@ -1029,7 +1169,7 @@ export async function reconcilePositions(trigger: string = "startup"): Promise<v
       const expected = fp * sh;
       if (cost > expected * 1.5) {
         const corrected = Math.round(expected * 100) / 100;
-        console.log(`[RECONCILE]   Fix kalCost: ${trade.match} — was $${cost.toFixed(2)}, corrected to $${corrected.toFixed(2)} (${sh}×${fp})`);
+        console.log(`[RECONCILE]   Fix kalCost: ${trade.match} -- was $${cost.toFixed(2)}, corrected to $${corrected.toFixed(2)} (${sh}x${fp})`);
         trade.kalCost = corrected;
         trade.totalCost = totalCostForTrade(trade);
         kalCostFixed++;
@@ -1040,12 +1180,13 @@ export async function reconcilePositions(trigger: string = "startup"): Promise<v
 
   // (d0b) Backfill missing fill prices and fix costs for hedge-complete trades.
   //       Determines which side was the initial entry vs the hedge using a heuristic:
-  //       if kalFillPrice × shares ≈ hedgeCost, then kalFillPrice was backfilled → PM-initial.
-  //       Otherwise kalFillPrice is the real entry price → KAL-initial.
+  //       if kalFillPrice x shares ≈ hedgeCost, then kalFillPrice was backfilled -> PM-initial.
+  //       Otherwise kalFillPrice is the real entry price -> KAL-initial.
   //       Uses hedgeCost (per-trade fill cost from resolveArbTrade) as ground truth for hedge side.
   //       NOTE: The hedge can go to EITHER exchange (KAL or PM opposite token).
   //       New trades have per-exchange cost tracking, so this heuristic is mainly for legacy data.
   for (const trade of trades) {
+    if (isResolvedPastDay(trade)) continue;
     const hc = trade.hedgeCost ?? 0;
     if (hc <= 0 || trade.resolutionMethod !== "hedge-complete") continue;
     const sh = trade.shares ?? 0;
@@ -1054,7 +1195,7 @@ export async function reconcilePositions(trigger: string = "startup"): Promise<v
     // Skip if costs are already set and consistent with totalCost.
     // New trades (initialExchange set) have per-exchange cost tracking from resolveArbTrade.
     // One side can be legitimately 0 when the hedge went entirely to PM opposite token,
-    // so don't require both > 0 — only require totalCost consistency.
+    // so don't require both > 0 -- only require totalCost consistency.
     // Partial-fill trades can have 3 cost components: kalCost + pmCost + hedgeCost
     // (e.g., partial KAL fill + PM initial + PM opposite hedge). In that case,
     // totalCost = kalCost + pmCost + hedgeCost, and costSum < totalCost is expected.
@@ -1081,7 +1222,7 @@ export async function reconcilePositions(trigger: string = "startup"): Promise<v
         || (kalFP > 0 && Math.abs(kalFP * sh - hc) < 0.10);
 
     if (isPmInitial) {
-      // PM-initial → hedge could be KAL or PM-opposite.
+      // PM-initial -> hedge could be KAL or PM-opposite.
       // Without per-exchange breakdown, assume hedge went to KAL (legacy behavior).
       if (kalFP === 0) {
         trade.kalFillPrice = Math.round((hc / sh) * 100) / 100;
@@ -1099,20 +1240,43 @@ export async function reconcilePositions(trigger: string = "startup"): Promise<v
         changed = true;
       }
     } else {
-      // KAL-initial → hedge could be PM or KAL-opposite (soccer 3-way dirs G-I).
+      // KAL-initial -> hedge could be PM or KAL-opposite (soccer 3-way dirs G-I).
+      // Detect KAL-hedged trades FIRST using fillsByTickerSide, before correcting kalCost.
+      // This prevents the kalCost correction from using a blended fill price that
+      // includes hedge fills (which the postResolutionFillAudit may have set).
+      const kalSideD1 = kalSideForDir(trade.dir);
+      const kalOppSideD1 = kalSideD1 === "yes" ? "no" : "yes";
+      const oppFillsD1 = fillsByTickerSide.get(`${trade.kalTicker}:${kalOppSideD1}`);
+      const initFillsD1 = fillsByTickerSide.get(`${trade.kalTicker}:${kalSideD1}`);
+      const kalHedged = hc > 0 && oppFillsD1 && oppFillsD1.totalShares > 0;
+
       const kalFees = trade.kalFees ?? 0;
-      const correctKalCost = Math.round((kalFP * sh + kalFees) * 100) / 100;
-      if (Math.abs(trade.kalCost - correctKalCost) > 0.01) {
-        trade.kalCost = correctKalCost;
-        changed = true;
+      if (kalHedged && initFillsD1 && initFillsD1.totalShares > 0) {
+        // KAL-hedged: kalCost should reflect only the INITIAL side fills, not blended.
+        // kalFillPrice may have been corrupted by fill audit blending both sides.
+        const initCostPerShare = initFillsD1.totalCostDollars / initFillsD1.totalShares;
+        const initSharesForTrade = Math.min(sh, initFillsD1.totalShares);
+        const correctInitFP = Math.round(initCostPerShare * 100) / 100;
+        const correctInitCost = Math.round((initCostPerShare * initSharesForTrade + kalFees) * 100) / 100;
+        if (Math.abs(trade.kalFillPrice - correctInitFP) > 0.01) {
+          trade.kalFillPrice = correctInitFP;
+          changed = true;
+        }
+        if (Math.abs(trade.kalCost - correctInitCost) > 0.01) {
+          trade.kalCost = correctInitCost;
+          changed = true;
+        }
+      } else {
+        // Normal case: kalCost = kalFillPrice * shares + fees
+        const correctKalCost = Math.round((kalFP * sh + kalFees) * 100) / 100;
+        if (Math.abs(trade.kalCost - correctKalCost) > 0.01) {
+          trade.kalCost = correctKalCost;
+          changed = true;
+        }
       }
-      // Only backfill PM cost if hedge actually went to PM (not KAL-opposite).
-      // If hedgeCost > 0 and pmCost === 0, check if the trade already has totalCost
-      // that accounts for hedgeCost via the KAL side (totalCost ≈ kalCost + hedgeCost).
-      // Soccer 3-way KAL-hedged trades have hedgeCost on the KAL side, not PM.
-      const kalHedged = hc > 0 && Math.abs(trade.totalCost - (trade.kalCost + hc)) < 0.10;
+
       if (!kalHedged) {
-        // Hedge went to PM — backfill pmFillPrice + pmCost from hedgeCost
+        // Hedge went to PM -- backfill pmFillPrice + pmCost from hedgeCost
         if (pmFP === 0) {
           trade.pmFillPrice = Math.round((hc / sh) * 100) / 100;
           changed = true;
@@ -1136,6 +1300,7 @@ export async function reconcilePositions(trigger: string = "startup"): Promise<v
   //      but Kalshi fills show buys on BOTH sides of the ticker, the hedge actually filled.
   for (const trade of trades) {
     if (trade.status !== "resolved") continue;
+    if (isResolvedPastDay(trade)) continue;
     if (trade.resolutionMethod !== "settlement") continue;
     if ((trade.realizedPnl ?? 0) >= 0) continue; // only repair losses
     if ((trade.hedgeCost ?? 0) > 0) continue;     // hedge already recorded
@@ -1150,13 +1315,13 @@ export async function reconcilePositions(trigger: string = "startup"): Promise<v
     const hedgeShares = Math.min(oppFills.totalShares, trade.shares);
     const hedgeProportion = hedgeShares / oppFills.totalShares;
     const hedgeCost = Math.round((oppFills.totalCostDollars + oppFills.totalFeeDollars) * hedgeProportion * 100) / 100;
-    const payout = trade.shares; // both sides covered → $1 per share
+    const payout = trade.shares; // both sides covered -> $1 per share
     const totalCost = Math.round((trade.kalCost + hedgeCost) * 100) / 100;
     const pnl = Math.round((payout - totalCost) * 100) / 100;
 
     console.log(
-      `[RECONCILE]   REPAIR: ${trade.match} — found lost KAL hedge: ${hedgeShares}×${kalOppSide.toUpperCase()} cost=$${hedgeCost.toFixed(2)}. ` +
-      `P&L corrected: $${(trade.realizedPnl ?? 0).toFixed(2)} → $${pnl.toFixed(2)}`
+      `[RECONCILE]   REPAIR: ${trade.match} -- found lost KAL hedge: ${hedgeShares}x${kalOppSide.toUpperCase()} cost=$${hedgeCost.toFixed(2)}. ` +
+      `P&L corrected: $${(trade.realizedPnl ?? 0).toFixed(2)} -> $${pnl.toFixed(2)}`
     );
     trade.resolutionMethod = "hedge-complete";
     trade.hedgeCost = hedgeCost;
@@ -1176,7 +1341,7 @@ export async function reconcilePositions(trigger: string = "startup"): Promise<v
   let recoveredFromPending = 0;
   const pendingFills = getIncompletePendingFills();
   if (pendingFills.length > 0) {
-    console.log(`[RECONCILE] Found ${pendingFills.length} incomplete pending fill(s) — checking for orphaned positions...`);
+    console.log(`[RECONCILE] Found ${pendingFills.length} incomplete pending fill(s) -- checking for orphaned positions...`);
 
     // Group by kalTicker+pmSlug so crash-loop fills become one recovery trade
     const pfGroups = new Map<string, typeof pendingFills>();
@@ -1215,7 +1380,7 @@ export async function reconcilePositions(trigger: string = "startup"): Promise<v
           // Cap at actual exchange position to avoid over-counting
           const exchangeShares = Math.max(kalPos.yesCount, kalPos.noCount);
           if (actualShares > exchangeShares) {
-            console.log(`[RECONCILE]   NOTE: ${group.length} pending fills sum to ${actualShares} shares but exchange shows ${exchangeShares} — using exchange count`);
+            console.log(`[RECONCILE]   NOTE: ${group.length} pending fills sum to ${actualShares} shares but exchange shows ${exchangeShares} -- using exchange count`);
             actualShares = exchangeShares;
           }
         }
@@ -1227,7 +1392,7 @@ export async function reconcilePositions(trigger: string = "startup"): Promise<v
           hasPosition = true;
           const exchangeShares = Math.round(Number(pmPos.size ?? pmPos.amount ?? 0));
           if (actualShares > exchangeShares) {
-            console.log(`[RECONCILE]   NOTE: ${group.length} pending fills sum to ${actualShares} shares but PM shows ${exchangeShares} — using PM count`);
+            console.log(`[RECONCILE]   NOTE: ${group.length} pending fills sum to ${actualShares} shares but PM shows ${exchangeShares} -- using PM count`);
             actualShares = exchangeShares;
           }
         }
@@ -1236,12 +1401,12 @@ export async function reconcilePositions(trigger: string = "startup"): Promise<v
       if (hasPosition) {
         const rawKalCost = pf.exchange === "kal" ? Math.round(actualShares * avgPrice * 100) / 100 : 0;
         const pmCost = pf.exchange === "pm" ? Math.round(actualShares * avgPrice * 100) / 100 : 0;
-        // Calculate Kalshi fees: KALSHI_FEE_RATE × P × (1-P) per contract
+        // Calculate Kalshi fees: KALSHI_FEE_RATE x P x (1-P) per contract
         const kalFees = pf.exchange === "kal"
           ? Math.round(actualShares * KALSHI_FEE_RATE * avgPrice * (1 - avgPrice) * 100) / 100
           : 0;
         const kalCost = rawKalCost + kalFees; // kalCost includes fees (matches normal trade behavior)
-        console.log(`[RECONCILE]   RECOVERED: ${pf.match} — ${actualShares} shares on ${pf.exchange} @ ${avgPrice} (${group.length} pending fill(s), fees=$${kalFees.toFixed(2)})`);
+        console.log(`[RECONCILE]   RECOVERED: ${pf.match} -- ${actualShares} shares on ${pf.exchange} @ ${avgPrice} (${group.length} pending fill(s), fees=$${kalFees.toFixed(2)})`);
         trades.push({
           id: `arb-recovered-${Date.now()}`,
           ts: pf.ts,
@@ -1284,19 +1449,22 @@ export async function reconcilePositions(trigger: string = "startup"): Promise<v
     const posSide = pos.yesCount >= pos.noCount ? "yes" : "no";
     if (posCount <= 0) continue;
 
-    // Count shares tracked across ALL trades (resolved + active) for this ticker
+    // Count shares tracked across ALL trades (resolved + active) for this ticker.
+    // Include overHedgeShares -- these are excess KAL fills from the double-execution bug
+    // that are already recorded on the trade. Without this, reconciliation sees the excess
+    // on the exchange but not in tracked shares, and creates an infinite recovery loop.
     const allTrackedShares = trades
       .filter(t => t.kalTicker === ticker)
-      .reduce((s, t) => s + t.shares, 0);
+      .reduce((s, t) => s + t.shares + (t.overHedgeShares ?? 0), 0);
     const excessShares = posCount - allTrackedShares;
     if (excessShares <= 0) continue;
 
-    // Skip if there's an active hedge on this ticker — the hedge loop is still buying
+    // Skip if there's an active hedge on this ticker -- the hedge loop is still buying
     // contracts, so the current position count is mid-flight and will change.
     // Auto-recovering now would create duplicate hedging trades.
     const hasActiveHedge = trades.some(t => t.kalTicker === ticker && t.status === "hedging");
     if (hasActiveHedge) {
-      console.log(`[RECONCILE]   Skipping KAL auto-recover for ${ticker} — active hedge in progress (excess=${excessShares}, hedging trade exists)`);
+      console.log(`[RECONCILE]   Skipping KAL auto-recover for ${ticker} -- active hedge in progress (excess=${excessShares}, hedging trade exists)`);
       continue;
     }
 
@@ -1308,7 +1476,7 @@ export async function reconcilePositions(trigger: string = "startup"): Promise<v
       const kalFees = Math.round(excessShares * KALSHI_FEE_RATE * avgPrice * (1 - avgPrice) * 100) / 100;
       const kalCost = Math.round((excessShares * avgPrice + kalFees) * 100) / 100;
 
-      console.log(`[RECONCILE]   AUTO-RECOVER: ${resolvedRef.match} — ${excessShares}× ${posSide.toUpperCase()} on ${ticker} (exchange=${posCount}, tracked=${allTrackedShares}, avg ${(avgPrice * 100).toFixed(0)}¢, fees=$${kalFees.toFixed(2)})`);
+      console.log(`[RECONCILE]   AUTO-RECOVER: ${resolvedRef.match} -- ${excessShares}x ${posSide.toUpperCase()} on ${ticker} (exchange=${posCount}, tracked=${allTrackedShares}, avg ${(avgPrice * 100).toFixed(0)}c, fees=$${kalFees.toFixed(2)})`);
       trades.push({
         id: `arb-recovered-${Date.now()}-${ticker.slice(-6)}`,
         ts: new Date().toISOString(),
@@ -1333,7 +1501,7 @@ export async function reconcilePositions(trigger: string = "startup"): Promise<v
       changed = true;
       autoRecoveredPositions++;
     } else {
-      console.log(`[RECONCILE]   Untracked Kalshi position: ${ticker} ${posCount}× ${posSide.toUpperCase()} (no matching resolved trade — cannot auto-recover)`);
+      console.log(`[RECONCILE]   Untracked Kalshi position: ${ticker} ${posCount}x ${posSide.toUpperCase()} (no matching resolved trade -- cannot auto-recover)`);
       untrackedKal++;
     }
   }
@@ -1351,15 +1519,15 @@ export async function reconcilePositions(trigger: string = "startup"): Promise<v
     if (!tracked) {
       // Check if there's excess PM shares beyond what resolved trades account for
       const pmShares = Math.round(size);
-      // Only auto-recover PM positions for RECENT matches (≤3 days old).
-      // Older positions are likely unredeemed winning tokens — don't hedge them.
+      // Only auto-recover PM positions for RECENT matches (<=3 days old).
+      // Older positions are likely unredeemed winning tokens -- don't hedge them.
       const slugDate = slug.match(/\d{4}-\d{2}-\d{2}/)?.[0];
       const daysSinceMatch = slugDate
         ? (Date.now() - new Date(slugDate).getTime()) / 86_400_000
         : 999;
       if (daysSinceMatch > 3) {
-        // Old match — just log, don't create hedging trade
-        console.log(`[RECONCILE]   Stale PM position: ${outcome} ${pmShares}× on ${slug} (match ${slugDate ?? "?"}, ${Math.round(daysSinceMatch)}d ago — skipping auto-recover)`);
+        // Old match -- just log, don't create hedging trade
+        console.log(`[RECONCILE]   Stale PM position: ${outcome} ${pmShares}x on ${slug} (match ${slugDate ?? "?"}, ${Math.round(daysSinceMatch)}d ago -- skipping auto-recover)`);
         continue;
       }
       // Resolved trades' PM positions are still held until settlement, so
@@ -1369,22 +1537,38 @@ export async function reconcilePositions(trigger: string = "startup"): Promise<v
         .reduce((s, t) => s + t.shares, 0);
       if (pmShares > allTrackedPmShares) {
         const excess = pmShares - allTrackedPmShares;
-        // Skip if there's an active hedge on this slug — the hedge loop is still buying
+        // Skip if there's an active hedge on this slug -- the hedge loop is still buying
         // contracts on the opposite exchange, so position counts are mid-flight.
         const hasActiveHedgePm = trades.some(t => t.pmSlug === slug && t.status === "hedging");
         if (hasActiveHedgePm) {
-          console.log(`[RECONCILE]   Skipping PM auto-recover for ${slug} — active hedge in progress (excess=${excess}, hedging trade exists)`);
+          console.log(`[RECONCILE]   Skipping PM auto-recover for ${slug} -- active hedge in progress (excess=${excess}, hedging trade exists)`);
           continue;
         }
-        // Skip recovery for markets that already settled — resolved trades still hold PM tokens
+        // Skip recovery for markets that already settled -- resolved trades still hold PM tokens
         // until redeemed, so excess is expected and doesn't need hedging.
         const isMarketSettled = trades.some(t =>
           t.pmSlug === slug &&
           t.status === "resolved" &&
-          (t.resolutionMethod === "settlement" || t.resolutionMethod === "market-settled" || t.resolutionMethod === "both-legs")
+          (t.resolutionMethod === "settlement" || t.resolutionMethod === "market-settled" || t.resolutionMethod === "both-legs" || t.resolutionMethod === "hedge-complete")
         );
         if (isMarketSettled) {
-          console.log(`[RECONCILE]   Skipping PM auto-recover for ${slug} — market already settled (excess=${excess} PM shares)`);
+          console.log(`[RECONCILE]   Skipping PM auto-recover for ${slug} -- market already settled (excess=${excess} PM shares)`);
+          continue;
+        }
+        // Skip if a recovery-error trade already exists for this slug+outcome -- don't re-create phantom recoveries.
+        const hasRecoveryError = trades.some(t =>
+          t.pmSlug === slug &&
+          t.resolutionMethod === "recovery-error" &&
+          namesMatch(t.pmOutcome, outcome)
+        );
+        if (hasRecoveryError) {
+          console.log(`[RECONCILE]   Skipping PM auto-recover for ${slug}/${outcome} -- recovery-error already exists`);
+          continue;
+        }
+        // Skip recovery for past-day matches -- excess PM shares from yesterday are likely unredeemed hedge tokens.
+        const matchDate = slug.match(/\d{4}-\d{2}-\d{2}/)?.[0];
+        if (matchDate && matchDate < todayUTC()) {
+          console.log(`[RECONCILE]   Skipping PM auto-recover for ${slug} -- match date ${matchDate} is in the past (excess=${excess})`);
           continue;
         }
         const resolvedRef = trades.find(t => t.pmSlug === slug);
@@ -1398,7 +1582,9 @@ export async function reconcilePositions(trigger: string = "startup"): Promise<v
           // The hedge loop will enforce the real max via maxKalPrice = 1 - pmCostBasis - edge.
           const estPrice = estPriceRaw < 1 - MIN_EDGE ? estPriceRaw : 0;
           const pmCost = Math.round(excess * estPrice * 100) / 100;
-          console.log(`[RECONCILE]   AUTO-RECOVER: ${excess} excess PM ${outcome} shares on ${slug} (est. $${estPrice}/share${pfMatch ? " from pending fill" : ""})`);
+          // Use actual PM position's tokenId, not the reference trade's (which may be a different outcome)
+          const actualPmTokenId = pickString(p.asset ?? p.tokenId ?? p.conditionId ?? "") || resolvedRef.pmTokenId;
+          console.log(`[RECONCILE]   AUTO-RECOVER: ${excess} excess PM ${outcome} shares on ${slug} (est. $${estPrice}/share${pfMatch ? " from pending fill" : ""}, token=...${(actualPmTokenId ?? "").slice(-12)})`);
           trades.push({
             id: `arb-recovered-${Date.now()}-pm`,
             ts: new Date().toISOString(),
@@ -1411,7 +1597,7 @@ export async function reconcilePositions(trigger: string = "startup"): Promise<v
             kalCost: 0,
             pmOutcome: outcome,
             pmSlug: slug,
-            pmTokenId: resolvedRef.pmTokenId,
+            pmTokenId: actualPmTokenId,
             pmFillPrice: estPrice,
             pmCost,
             totalCost: pmCost,
@@ -1421,8 +1607,9 @@ export async function reconcilePositions(trigger: string = "startup"): Promise<v
           });
           changed = true;
           autoRecoveredPositions++;
+          audit({ module: "reconcile", fn: "reconcilePositions", action: "pm-position-auto-recovered", kalTicker: resolvedRef.kalTicker, pmSlug: slug, shares: excess, price: estPrice, cost: pmCost, trigger: "excess-pm-shares", context: { outcome, totalPmShares: Math.round(Number(p.size ?? p.amount ?? 0)), allTrackedPmShares, estPrice, match: resolvedRef.match } });
         } else {
-          console.log(`[RECONCILE]   Untracked PM position: ${outcome} ${excess}× excess on ${slug} (no trade ref — cannot auto-recover)`);
+          console.log(`[RECONCILE]   Untracked PM position: ${outcome} ${excess}x excess on ${slug} (no trade ref -- cannot auto-recover)`);
           untrackedPm++;
         }
       }
@@ -1431,14 +1618,16 @@ export async function reconcilePositions(trigger: string = "startup"): Promise<v
 
   // Defensive invariant: totalCost MUST equal kalCost + pmCost (+ hedgeCost when one leg is 0) for resolved trades.
   // kalCost already includes kalFees (baked in at resolve time). hedgeCost is only additive for hedge-only legs.
-  // Skip trades with initialExchange set (new-style) — verifyAndFixPnl() already computed their
+  // Skip trades with initialExchange set (new-style) -- verifyAndFixPnl() already computed their
   // totalCost with smarter hedge-cost logic that avoids double-counting merged costs.
+  // Skip past-day resolved trades -- their records are finalized.
   for (const trade of trades) {
     if (trade.status !== "resolved") continue;
+    if (isResolvedPastDay(trade)) continue;
     if (!trade.initialExchange) {
       const expected = totalCostForTrade(trade);
       if (Math.abs(trade.totalCost - expected) > 0.01) {
-        console.log(`[RECONCILE]   Invariant fix: ${trade.match} totalCost $${trade.totalCost.toFixed(2)}→$${expected.toFixed(2)} (kalCost+hedgeCost+pmCost)`);
+        console.log(`[RECONCILE]   Invariant fix: ${trade.match} totalCost $${trade.totalCost.toFixed(2)}->$${expected.toFixed(2)} (kalCost+hedgeCost+pmCost)`);
         trade.totalCost = expected;
         changed = true;
       }
@@ -1449,7 +1638,7 @@ export async function reconcilePositions(trigger: string = "startup"): Promise<v
       if (trade.realizedPnl != null && trade.resolutionMethod === "hedge-complete") {
         const correctPnl = Math.round((trade.shares - expected) * 100) / 100;
         if (Math.abs(trade.realizedPnl - correctPnl) > 0.01) {
-          console.log(`[RECONCILE]   P&L fix: ${trade.match} realizedPnl $${trade.realizedPnl.toFixed(2)}→$${correctPnl.toFixed(2)}`);
+          console.log(`[RECONCILE]   P&L fix: ${trade.match} realizedPnl $${trade.realizedPnl.toFixed(2)}->$${correctPnl.toFixed(2)}`);
           trade.realizedPnl = correctPnl;
           changed = true;
         }
@@ -1461,20 +1650,167 @@ export async function reconcilePositions(trigger: string = "startup"): Promise<v
     saveArbTrades(trades);
     writeReconcileAudit(trades);
   }
+  // -- Re-audit: for every resolved trade with a kalTicker, verify kalCost against
+  // the exchange and recalculate totalCost/hedgeCost/realizedPnl from ground truth.
+  // This catches trades that were resolved with wrong WS prices and only partially
+  // corrected by the old postResolutionFillAudit (which didn't fix totalCost/pnl).
+  {
+    const allTrades = loadArbTrades();
+    let repaired = 0;
+    // Build fills map from already-fetched kalFills, keyed by ticker+side
+    type FillBucket = { buyCost: number; buyCount: number; fees: number };
+    const fillsByTickerSide = new Map<string, FillBucket>();
+    const fillsByTicker = new Map<string, FillBucket>();
+    for (const f of kalFills) {
+      if (f.action !== "buy") continue;
+      const price = (f.side === "yes" ? f.yesPrice : f.noPrice) / 100;
+      const cost = f.count * price;
+      // Per-ticker totals
+      let total = fillsByTicker.get(f.ticker);
+      if (!total) { total = { buyCost: 0, buyCount: 0, fees: 0 }; fillsByTicker.set(f.ticker, total); }
+      total.buyCost += cost; total.buyCount += f.count; total.fees += f.feeCost;
+      // Per-ticker+side totals
+      const key = `${f.ticker}:${f.side}`;
+      let side = fillsByTickerSide.get(key);
+      if (!side) { side = { buyCost: 0, buyCount: 0, fees: 0 }; fillsByTickerSide.set(key, side); }
+      side.buyCost += cost; side.buyCount += f.count; side.fees += f.feeCost;
+    }
+
+    for (const t of allTrades) {
+      if (t.status !== "resolved" || !t.kalTicker) continue;
+      // Skip tickers shared by multiple trades (can't attribute fills)
+      const sharedCount = allTrades.filter(x => x.kalTicker === t.kalTicker).length;
+      if (sharedCount > 1) continue;
+
+      // For KAL-initial hedge-complete trades with pmCost=0, both legs are on Kalshi.
+      // kalCost = initial side only. hedgeCost = opposite side.
+      const isKalBothSides = t.resolutionMethod === "hedge-complete" && t.initialExchange === "kal" && t.pmCost === 0;
+      const initialSide = kalSideForDir(t.dir);
+
+      let exKalCost: number, exKalFees: number, exHedgeCost: number, exHedgeFees: number;
+
+      if (isKalBothSides) {
+        // Split by side: initial side → kalCost, opposite side → hedgeCost
+        const initFills = fillsByTickerSide.get(`${t.kalTicker}:${initialSide}`);
+        const hedgeSide = initialSide === "yes" ? "no" : "yes";
+        const hedgeFills = fillsByTickerSide.get(`${t.kalTicker}:${hedgeSide}`);
+        if (!initFills && !hedgeFills) continue;
+        exKalCost = Math.round((initFills?.buyCost ?? 0) * 100) / 100;
+        exKalFees = Math.round((initFills?.fees ?? 0) * 100) / 100;
+        exHedgeCost = Math.round((hedgeFills?.buyCost ?? 0) * 100) / 100;
+        exHedgeFees = Math.round((hedgeFills?.fees ?? 0) * 100) / 100;
+      } else {
+        // PM-initial or both-legs: all KAL fills are one side
+        const exFills = fillsByTicker.get(t.kalTicker);
+        if (!exFills || exFills.buyCount === 0) {
+          // Exchange has zero fills but trade has kalCost > 0 → phantom fill, zero it out
+          if (t.kalCost > 0) {
+            exKalCost = 0; exKalFees = 0; exHedgeCost = 0; exHedgeFees = 0;
+          } else {
+            continue;
+          }
+        } else {
+          exKalCost = Math.round(exFills.buyCost * 100) / 100;
+          exKalFees = Math.round(exFills.fees * 100) / 100;
+          exHedgeCost = 0;
+          exHedgeFees = 0;
+        }
+      }
+
+      const exTotal = Math.round((exKalCost + exKalFees + exHedgeCost + exHedgeFees + t.pmCost) * 100) / 100;
+
+      // Check if anything needs fixing
+      const kalDrift = Math.abs(t.kalCost - exKalCost);
+      const totalDrift = Math.abs(t.totalCost - exTotal);
+      if (kalDrift < 0.01 && totalDrift < 0.01) continue;
+
+      const oldKalCost = t.kalCost;
+      const oldTotal = t.totalCost;
+      const oldPnl = t.realizedPnl;
+
+      t.kalCost = exKalCost;
+      t.kalFees = exKalFees;
+      t.kalFillPrice = t.shares > 0 ? Math.round((exKalCost / t.shares) * 10000) / 10000 : 0;
+      t.totalCost = exTotal;
+
+      if (t.resolutionMethod === "hedge-complete" || t.resolutionMethod === "both-legs") {
+        t.realizedPnl = Math.round((t.shares - exTotal) * 100) / 100;
+      }
+
+      if (isKalBothSides) {
+        t.hedgeCost = Math.round((exHedgeCost + exHedgeFees) * 100) / 100;
+      } else if (t.resolutionMethod === "hedge-complete" && t.initialExchange === "pm") {
+        t.hedgeCost = Math.round((exKalCost + exKalFees) * 100) / 100;
+      }
+
+      // Clean up stale resolutionNote
+      if (t.resolutionNote?.startsWith("audit-corrected")) {
+        delete t.resolutionNote;
+      }
+
+      console.log(`[RECONCILE] Re-audit ${t.match}: kalCost $${oldKalCost.toFixed(2)}->${exKalCost.toFixed(2)} total $${oldTotal.toFixed(2)}->${exTotal.toFixed(2)} pnl $${(oldPnl ?? 0).toFixed(2)}->${(t.realizedPnl ?? 0).toFixed(2)}`);
+      repaired++;
+    }
+    // -- Check for untracked PM hedge fills (opposite token bought but not recorded) --
+    // For PM-initial hedge-complete trades: if the PM wallet holds the OPPOSITE outcome
+    // on the same slug, and hedgeCost doesn't account for it, add it.
+    for (const t of allTrades) {
+      if (t.status !== "resolved" || !t.pmSlug || !t.pmTokenId) continue;
+      if (t.resolutionMethod !== "hedge-complete" && t.resolutionMethod !== "settlement") continue;
+      if (t.initialExchange !== "pm") continue;
+
+      // Find PM positions on the same slug that are NOT the initial token
+      const oppHeld = pmPositions.filter((p: PmPosition) => {
+        const slug = p.slug ?? p.marketSlug ?? "";
+        const tokenId = p.asset ?? p.tokenId ?? "";
+        const size = Number(p.size ?? p.amount ?? 0);
+        return slug === t.pmSlug && tokenId !== t.pmTokenId && size >= t.shares * 0.8;
+      });
+
+      if (oppHeld.length === 0) continue;
+
+      const oppPos = oppHeld[0];
+      const oppSize = Number(oppPos.size ?? oppPos.amount ?? 0);
+      const oppAvgPrice = Number(oppPos.avgPrice ?? oppPos.averagePrice ?? oppPos.price ?? 0);
+      const oppCost = Math.round(oppSize * oppAvgPrice * 100) / 100;
+
+      if (oppCost <= 0) continue;
+
+      // Check if hedgeCost already accounts for this
+      const currentHedge = t.hedgeCost ?? 0;
+      if (currentHedge >= oppCost * 0.8) continue; // already tracked
+
+      const oldTotal = t.totalCost;
+      const oldPnl = t.realizedPnl;
+      t.hedgeCost = oppCost;
+      t.totalCost = Math.round((t.kalCost + (t.kalFees ?? 0) + t.pmCost + oppCost) * 100) / 100;
+      t.realizedPnl = Math.round((t.shares - t.totalCost) * 100) / 100;
+
+      console.log(`[RECONCILE] PM hedge fix ${t.match}: found untracked PM opp-token ${oppSize} shares @${(oppAvgPrice*100).toFixed(0)}c = $${oppCost.toFixed(2)}. total $${oldTotal.toFixed(2)}->${t.totalCost.toFixed(2)} pnl $${(oldPnl??0).toFixed(2)}->${(t.realizedPnl??0).toFixed(2)}`);
+      repaired++;
+    }
+
+    if (repaired > 0) {
+      saveArbTrades(allTrades);
+      console.log(`[RECONCILE] Re-audited ${repaired} trade(s) from exchange fill data`);
+    }
+  }
+
   // Signal the hedge loop to re-scan for new hedging trades created by auto-recovery
   if (autoRecoveredPositions > 0) {
     setReconcileRecoveredTrades(true);
   }
   console.log(
-    `[RECONCILE] Done: ${staleResolved} stale resolved, ${filledToResolved} filled→resolved, ` +
+    `[RECONCILE] Done: ${staleResolved} stale resolved, ${filledToResolved} filled->resolved, ` +
     `${kalCostFixed} kalCost fixed, ${costsCorrected} costs corrected, ${pnlFixed} P&L fixed, ` +
     `${pmClobRepaired} PM cost repaired, ${untrackedKal} untracked KAL, ` +
     `${untrackedPm} untracked PM, ${recoveredFromPending} recovered from pending, ` +
     `${autoRecoveredPositions} auto-recovered positions`
   );
+  audit({ module: "reconcile", fn: "reconcilePositions", action: "reconcile-completed", trigger, durationMs: _reconTimer(), context: { staleResolved, filledToResolved, kalCostFixed, costsCorrected, pnlFixed, pmClobRepaired, untrackedKal, untrackedPm, recoveredFromPending, autoRecoveredPositions } });
 }
 
-// ─── PM position helpers (module-level, shared by executeArb + monitorLoop) ──
+// --- PM position helpers (module-level, shared by executeArb + monitorLoop) --
 
 export function getPmFunder(): string {
   if (_cachedFunder) return _cachedFunder;
@@ -1502,12 +1838,12 @@ export function sumPmHeld(pmPositions: PmPosition[], tokenId: string): number {
   }, 0));
 }
 
-// ─── Execution metadata extractors ────────────────────────────────────────────
+// --- Execution metadata extractors --------------------------------------------
 
 export function extractPmMeta(v: unknown) {
   if (!v || typeof v !== "object") return {};
   const obj = v as PmOrderResponse;
-  // Check nested .order field — some SDK versions wrap the response
+  // Check nested .order field -- some SDK versions wrap the response
   const inner = obj.order ?? obj;
   const txHashes = inner.transactionsHashes ?? obj.transactionsHashes;
   const txHash = Array.isArray(txHashes) ? txHashes[0] : inner.transactionHash ?? obj.transactionHash ?? obj.txHash;

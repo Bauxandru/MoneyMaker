@@ -81,7 +81,7 @@ export async function fetchJsonWithRetry<T>(
 /**
  * Create a rate-limited fetch function with its own queue.
  * Each call is serialized and spaced by at least `intervalMs`.
- * Each instance has an independent queue — Kalshi and Polymarket won't block each other.
+ * Each instance has an independent queue -- Kalshi and Polymarket won't block each other.
  */
 export function createRateLimitedFetcher(
   intervalMs: number,

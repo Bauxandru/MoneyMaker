@@ -16,8 +16,8 @@ const KAL_BASE = "https://api.elections.kalshi.com/trade-api/v2";
 const CLOB_BASE = process.env.POLY_CLOB_URL ?? "https://clob.polymarket.com";
 const GAMMA_BASE = "https://gamma-api.polymarket.com";
 
-// Fees — matching tradeTennis.ts exactly
-// Kalshi taker fee: 7% × P × (1-P) per contract. Max ~1.75¢ at P=0.50.
+// Fees -- matching tradeTennis.ts exactly
+// Kalshi taker fee: 7% x P x (1-P) per contract. Max ~1.75c at P=0.50.
 const KALSHI_FEE_RATE = 0.07;
 // PM fee: 0 for tennis/esports markets
 const PM_FEE_RATE = 0;
@@ -38,7 +38,7 @@ interface KalMarket {
 
 type AnyRecord = Record<string, unknown>;
 
-// ─── Helpers ───────────────────────────────────────────────────────────────
+// --- Helpers ---------------------------------------------------------------
 
 function sleep(ms: number) { return new Promise(r => setTimeout(r, ms)); }
 
@@ -91,7 +91,7 @@ function sweepPmAsks(asks: [number, number][], maxPrice: number): { qty: number;
   return { qty: totalQty, avgPrice: totalQty > 0 ? totalCost / totalQty : 0 };
 }
 
-// ─── Main ──────────────────────────────────────────────────────────────────
+// --- Main ------------------------------------------------------------------
 
 async function main() {
   console.log("=== ARB DEPTH ANALYSIS ===\n");
@@ -168,7 +168,7 @@ async function main() {
     const prefixes = SERIES_PREFIXES[seriesTicker] ?? ["atp"];
     const isTennis = seriesTicker.includes("ATP") || seriesTicker.includes("WTA");
 
-    // Extract date from ticker (e.g., 26MAR06 → 2026-03-06)
+    // Extract date from ticker (e.g., 26MAR06 -> 2026-03-06)
     const dateMatch = matchCode.match(/(\d{2})([A-Z]{3})(\d{2})/);
     if (!dateMatch) continue;
     const months: Record<string, string> = { JAN: "01", FEB: "02", MAR: "03", APR: "04", MAY: "05", JUN: "06", JUL: "07", AUG: "08", SEP: "09", OCT: "10", NOV: "11", DEC: "12" };
@@ -265,7 +265,7 @@ async function main() {
     const matchName = `${sur1} vs ${sur2}`;
 
     // Check all 4 directions
-    // Dir A: buy KAL P1 YES + PM P2 → kalYesAsk levels + PM P2 asks
+    // Dir A: buy KAL P1 YES + PM P2 -> kalYesAsk levels + PM P2 asks
     // Dir B: buy KAL P2 YES + PM P1
     // Dir C: buy KAL P1 NO  + PM P1
     // Dir D: buy KAL P2 NO  + PM P2
@@ -326,7 +326,7 @@ async function main() {
     await sleep(100); // rate limit
   }
 
-  console.log(`\nScan: ${pairs.length} pairs → ${pairs.length - dbgNoPm} PM matched → ${pairs.length - dbgNoPm - dbgNoBook} with books → ${dbgChecked} directions checked\n`);
+  console.log(`\nScan: ${pairs.length} pairs -> ${pairs.length - dbgNoPm} PM matched -> ${pairs.length - dbgNoPm - dbgNoBook} with books -> ${dbgChecked} directions checked\n`);
 
   // Sort results by capital, near-misses by raw edge
   results.sort((a, b) => b.maxCapital - a.maxCapital);

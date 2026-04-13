@@ -6,33 +6,33 @@
  *
  * Arb logic:
  *   For a match between P1 and P2:
- *     Direction A: Buy KAL_P1_YES + PM_P2_token  → edge = 1 - kalP1YesAsk - pmP2Ask
- *     Direction B: Buy KAL_P2_YES + PM_P1_token  → edge = 1 - kalP2YesAsk - pmP1Ask
- *   Both legs pay $1 in every outcome → guaranteed profit if edge > 0.
+ *     Direction A: Buy KAL_P1_YES + PM_P2_token  -> edge = 1 - kalP1YesAsk - pmP2Ask
+ *     Direction B: Buy KAL_P2_YES + PM_P1_token  -> edge = 1 - kalP2YesAsk - pmP1Ask
+ *   Both legs pay $1 in every outcome -> guaranteed profit if edge > 0.
  *
  * Execution order: KALSHI FIRST (IOC), then Polymarket sized to actual Kalshi fills.
- *   - If Kalshi fills 0 → abort, PM never fires → no exposure.
- *   - If Kalshi fills N contracts → place PM FOK for exactly N shares.
- *   - If PM fails after Kalshi filled → recovery: buy PM P1_token to own both sides.
+ *   - If Kalshi fills 0 -> abort, PM never fires -> no exposure.
+ *   - If Kalshi fills N contracts -> place PM FOK for exactly N shares.
+ *   - If PM fails after Kalshi filled -> recovery: buy PM P1_token to own both sides.
  *
  * Safety guards:
  *   - DRY_RUN defaults to TRUE. Must set DRY_RUN=false explicitly for live trading.
- *   - MAX_CONTRACTS per trade (default 5 — prevents over-committing on thin books).
+ *   - MAX_CONTRACTS per trade (default 5 -- prevents over-committing on thin books).
  *   - Cooldown applied before every trade attempt (not just successes).
  *   - No retry on the same match while on cooldown.
  *
  * Env vars:
- *   DRY_RUN=true/false            (default true — MUST be false for live trading)
+ *   DRY_RUN=true/false            (default true -- MUST be false for live trading)
  *   TRADE_USD=10                  budget per arb (default $10)
  *   MAX_CONTRACTS=5               max Kalshi contracts per trade (default 5)
  *   MIN_EDGE=0.02                 minimum edge to trade (default 2%)
  *   POLL_INTERVAL_MS=0            ms between poll cycles (default 0 = max speed)
  *   TRADE_COOLDOWN_MS=60000       ms to wait after any trade attempt (default 60s)
- *   MIN_DEPTH_MULT=2              require N× order size depth on counterpart (default 2, 0=off)
+ *   MIN_DEPTH_MULT=2              require Nx order size depth on counterpart (default 2, 0=off)
  *   POLY_ORDER_TYPE=FOK           PM order type: FOK | GTC (default FOK)
- *   KALSHI_REQUEST_INTERVAL_MS=50   (20 req/s — Basic tier safe)
- *   POLY_GAMMA_INTERVAL_MS=35      (~29 req/s — gamma-api 30/s limit)
- *   POLY_CLOB_INTERVAL_MS=7        (~143 req/s — clob-api 150/s limit)
+ *   KALSHI_REQUEST_INTERVAL_MS=50   (20 req/s -- Basic tier safe)
+ *   POLY_GAMMA_INTERVAL_MS=35      (~29 req/s -- gamma-api 30/s limit)
+ *   POLY_CLOB_INTERVAL_MS=7        (~143 req/s -- clob-api 150/s limit)
  *   POLY_WALLET_PRIVATE_KEY=...
  *   POLY_CHAIN_ID=137
  *   POLY_SIGNATURE_TYPE=0
@@ -61,7 +61,7 @@ import { type ArbTradeRecord, type ExecMetric } from "./types.js";
 import { sleep, numEnv, boolEnv, strEnv, r2, pickString, parseJsonArray, normCents, normDollarsOrCents, bestAskFromSide, bestBidFromSide, kalSideForDir, totalCostForTrade } from "./utils.js";
 import { isLateGame, isMatchFinished, isMatchCancelled, getMatchState } from "./liveScores.js";
 
-// ─── Atomic file write (write-to-temp + rename) ──────────────────────────────
+// --- Atomic file write (write-to-temp + rename) ------------------------------
 // Prevents data corruption if the process crashes mid-write.
 function atomicWriteFileSync(filePath: string, data: string): void {
   const dir = path.dirname(filePath);
@@ -71,7 +71,7 @@ function atomicWriteFileSync(filePath: string, data: string): void {
   fs.renameSync(tmp, filePath);
 }
 
-// ─── Terminal colors (auto-colorize [TAG] patterns in console.log) ────────────
+// --- Terminal colors (auto-colorize [TAG] patterns in console.log) ------------
 const _C = {
   reset: "\x1b[0m", bold: "\x1b[1m", dim: "\x1b[2m",
   red: "\x1b[31m", green: "\x1b[32m", yellow: "\x1b[33m",
@@ -79,39 +79,39 @@ const _C = {
   white: "\x1b[37m", bgRed: "\x1b[41m", bgGreen: "\x1b[42m",
 };
 const _tagColors: Record<string, string> = {
-  // Trading execution — bright green
+  // Trading execution -- bright green
   "LIVE":           _C.green + _C.bold,
   "ARB FOUND":      _C.green + _C.bold,
   "ARB EXECUTE":    _C.green + _C.bold,
   "BOTH FILLED":    _C.green + _C.bold,
-  // Dry run — yellow
+  // Dry run -- yellow
   "DRY":            _C.yellow + _C.bold,
-  // Depth & liquidity — yellow
+  // Depth & liquidity -- yellow
   "DEPTH":          _C.yellow,
   "DEPTH FIX":      _C.yellow + _C.dim,
   "DEPTH OPP":      _C.yellow,
   "DEPTH CHECK":    _C.yellow + _C.bold,
-  // Hedging — cyan
+  // Hedging -- cyan
   "HEDGE":          _C.cyan,
   "HEDGE MODE":     _C.cyan + _C.bold,
   "HEDGE RESUME":   _C.cyan,
   "HEDGE-ONLY":     _C.cyan,
-  // Safety & abort — red
+  // Safety & abort -- red
   "SAFETY ABORT":   _C.red + _C.bold,
   "ABORT":          _C.red,
   "CIRCUIT BREAKER":_C.bgRed + _C.white + _C.bold,
   "CANC-MON":       _C.red,
-  // Cooldowns — dim red/yellow
+  // Cooldowns -- dim red/yellow
   "SOFT COOLDOWN":  _C.yellow + _C.bold,
   "ABORT COOLDOWN": _C.yellow,
   "SKIP":           _C.dim,
   "ARB SKIP":       _C.dim,
-  // P&L — colored by value in line
+  // P&L -- colored by value in line
   "P&L":            _C.green + _C.bold,
-  // Data & reconciliation — magenta
+  // Data & reconciliation -- magenta
   "RECONCILE":      _C.magenta,
   "PM-CLOB":        _C.magenta,
-  // Startup & system — blue
+  // Startup & system -- blue
   "STARTUP":        _C.blue,
   "SYNC":           _C.blue,
   "DISCOVER":       _C.blue + _C.dim,
@@ -120,7 +120,7 @@ const _tagColors: Record<string, string> = {
   "PM LEG":         _C.magenta,
   "KAL LEG":        _C.blue,
   "IMMEDIATE PM HEDGE": _C.cyan + _C.bold,
-  // Websocket — dim
+  // Websocket -- dim
   "WS":             _C.dim,
   "WS DIAG":        _C.dim,
   // Cost tracking
@@ -131,7 +131,7 @@ const _tagColors: Record<string, string> = {
   // Timing
   "TIMING":         _C.dim,
   "POLL":           _C.dim,
-  // Cycle — dim (high frequency)
+  // Cycle -- dim (high frequency)
   "CYCLE":          _C.dim,
 };
 // P&L value coloring: detect $X.XX or -$X.XX and color green/red
@@ -167,7 +167,7 @@ console.log = (...args: unknown[]) => {
   _origLog(...args);
 };
 
-// ─── Env setup ────────────────────────────────────────────────────────────────
+// --- Env setup ----------------------------------------------------------------
 
 import { loadCsvConfig } from "./csvConfig.js";
 import { validateLicense, startPeriodicRevalidation, isLicenseValid } from "./licenseClient.js";
@@ -178,7 +178,7 @@ if (!loadCsvConfig("./settings.csv")) {
   dotenv.config();
 }
 
-// DRY_RUN defaults to TRUE for safety — must set DRY_RUN=false explicitly
+// DRY_RUN defaults to TRUE for safety -- must set DRY_RUN=false explicitly
 const DRY_RUN = boolEnv("DRY_RUN", true);
 const TRADE_USD = numEnv("TRADE_USD", 10);
 const MAX_CONTRACTS = Math.max(1, Math.floor(numEnv("MAX_CONTRACTS", 999)));
@@ -193,7 +193,7 @@ const TRADE_COOLDOWN_MS = numEnv("TRADE_COOLDOWN_MS", numEnv("TRADE_LOOP_COOLDOW
 // HEDGE_TARGET: "payout" = hedge fills accepted at breakeven (1 - costBasis);
 //               "profit"  = hedge fills only at original MIN_EDGE profit
 const HEDGE_TARGET = strEnv("HEDGE_TARGET", "payout") === "payout" ? "payout" : "profit";
-// STRICT_HEDGE: when true, suppress exit orders in hedge mode — only complete orders
+// STRICT_HEDGE: when true, suppress exit orders in hedge mode -- only complete orders
 const STRICT_HEDGE = boolEnv("STRICT_HEDGE", false);
 // Single-exchange hedging: try PM-only for this many cycles before switching to KAL-only.
 // Each hedge cycle is ~400ms, so 15 cycles ≈ 6 seconds.
@@ -201,7 +201,7 @@ const PM_ONLY_MAX_CYCLES = numEnv("PM_ONLY_MAX_CYCLES", 15);
 // FORCE_DISCOVER: when true, skip discovery cache and scan all markets fresh
 const FORCE_DISCOVER = boolEnv("FORCE_DISCOVER", false);
 // Circuit breaker: stop opening new arbs when thresholds are hit.
-// Existing hedge cycles continue — only NEW arb execution is blocked.
+// Existing hedge cycles continue -- only NEW arb execution is blocked.
 const MAX_CONSECUTIVE_ERRORS = numEnv("MAX_CONSECUTIVE_ERRORS", 5);
 const MAX_HEDGE_POSITIONS = numEnv("MAX_HEDGE_POSITIONS", 8);
 // WS orderbook staleness thresholds (ms). Kalshi snapshots persist until replaced; PM updates frequently.
@@ -209,22 +209,22 @@ const KAL_WS_STALE_MS = numEnv("KAL_WS_STALE_MS", 600_000);   // 10 min default
 const PM_WS_STALE_MS  = numEnv("PM_WS_STALE_MS",   30_000);    // 30 sec default
 // Discovery cache TTL (ms). 0 = date-based (stale at midnight UTC, legacy behavior).
 const DISCOVERY_CACHE_TTL_MS = numEnv("DISCOVERY_CACHE_TTL_MS", 3_600_000); // 1 hour default
-// Liquidity depth check: require counterpart exchange to have at least N× our
+// Liquidity depth check: require counterpart exchange to have at least Nx our
 // order size available before executing.  Prevents one-legged exposure when the
 // other side has thin liquidity.  Set to 0 to disable.
 const MIN_DEPTH_MULT = numEnv("MIN_DEPTH_MULT", 2);
 // PM minimum order size: per-market `orderMinSize` field (typically 5 shares).
-// PM CLOB enforces $1 minimum for any order that is "marketable" (bid ≥ ask).
+// PM CLOB enforces $1 minimum for any order that is "marketable" (bid >= ask).
 // This applies to FOK/IOC AND GTC bids that would immediately match.
 const PM_MARKETABLE_MIN_VALUE = 1.0;
 // Fee rates for accurate edge calculation.
-// KALSHI_FEE_RATE: Kalshi taker fee multiplier. Formula: rate × P × (1-P) per contract.
-//   Standard rate is 7% (0.07). Max fee ≈ 1.75¢/contract at P=0.50.
+// KALSHI_FEE_RATE: Kalshi taker fee multiplier. Formula: rate x P x (1-P) per contract.
+//   Standard rate is 7% (0.07). Max fee ≈ 1.75c/contract at P=0.50.
 // PM_FEE_RATE: Polymarket taker fee. ATP tennis markets currently have ZERO fees.
 //   Set > 0 only if trading fee-enabled markets (crypto, NCAAB, Serie A).
 const KALSHI_FEE_RATE = numEnv("KALSHI_FEE_RATE", 0.07);
 const PM_FEE_RATE = numEnv("PM_FEE_RATE", 0);
-// KAL_MAKER_MODE: when true, first tries a GTC bid at ask-1¢ (maker fee: 1.75%)
+// KAL_MAKER_MODE: when true, first tries a GTC bid at ask-1c (maker fee: 1.75%)
 // instead of IOC at ask (taker fee: 7%). Falls back to IOC after KAL_MAKER_WAIT_MS.
 const KAL_MAKER_MODE = boolEnv("KAL_MAKER_MODE", false);
 const KAL_MAKER_WAIT_MS = numEnv("KAL_MAKER_WAIT_MS", 5000);
@@ -240,7 +240,7 @@ for (const k of ["HTTP_PROXY","HTTPS_PROXY","ALL_PROXY","http_proxy","https_prox
   delete process.env[k];
 process.env.NODE_USE_ENV_PROXY = "false";
 
-// ─── Live WebSocket orderbook feeds ──────────────────────────────────────────
+// --- Live WebSocket orderbook feeds ------------------------------------------
 // Maintains real-time orderbook state for both Kalshi and Polymarket via WS.
 // Data is stored in Maps and read synchronously by the scan loop and executeArb.
 
@@ -263,15 +263,15 @@ function _kalshiWsSign(ts: string): string {
 }
 
 // In-memory live orderbook state
-type WsBookSide = Map<number, number>; // priceCents → size
+type WsBookSide = Map<number, number>; // priceCents -> size
 interface WsLiveBook {
   yes: WsBookSide;
   no: WsBookSide;
   ts: number; // last update timestamp
 }
 
-const wsKalBooks = new Map<string, WsLiveBook>(); // ticker → book
-const wsPmBooks = new Map<string, { bids: WsBookSide; asks: WsBookSide; ts: number }>(); // tokenId → book
+const wsKalBooks = new Map<string, WsLiveBook>(); // ticker -> book
+const wsPmBooks = new Map<string, { bids: WsBookSide; asks: WsBookSide; ts: number }>(); // tokenId -> book
 
 let _kalWs: WebSocket | null = null;
 let _kalWsReady = false;
@@ -284,7 +284,7 @@ let _pmWsReady = false;
 let _pmPingInterval: ReturnType<typeof setInterval> | null = null;
 const _pmWsSubs = new Set<string>();
 
-// Convert WsBookSide Map → sorted [price, size][] array (same format as fetchKalshiOrderbook)
+// Convert WsBookSide Map -> sorted [price, size][] array (same format as fetchKalshiOrderbook)
 function wsBookToArray(m: WsBookSide): [number, number][] {
   const arr: [number, number][] = [];
   for (const [price, size] of m) {
@@ -294,7 +294,7 @@ function wsBookToArray(m: WsBookSide): [number, number][] {
 }
 
 // Get Kalshi orderbook from WS cache (returns null if not available/stale)
-// KAL snapshots remain valid until replaced by a new snapshot/delta — use long TTL (10min).
+// KAL snapshots remain valid until replaced by a new snapshot/delta -- use long TTL (10min).
 // Low-activity markets may not get deltas for minutes but the snapshot is still the true state.
 function getWsKalBook(ticker: string): { yes: [number, number][]; no: [number, number][] } | null {
   const book = wsKalBooks.get(ticker);
@@ -308,7 +308,7 @@ function getWsPmAsks(tokenId: string): [number, number][] | null {
   if (!book || Date.now() - book.ts > PM_WS_STALE_MS) return null;
   const arr: [number, number][] = [];
   for (const [price, size] of book.asks) {
-    if (size > 0) arr.push([price / 100, size]); // convert cents → decimal for PM
+    if (size > 0) arr.push([price / 100, size]); // convert cents -> decimal for PM
   }
   return arr.sort((a, b) => a[0] - b[0]);
 }
@@ -326,7 +326,7 @@ function getWsKalBestAsk(ticker: string, side: "yes" | "no"): number | null {
     if (size > 0 && price > bestBidCents) bestBidCents = price;
   }
   if (bestBidCents === 0) return null;
-  return (100 - bestBidCents) / 100; // cents → decimal
+  return (100 - bestBidCents) / 100; // cents -> decimal
 }
 
 // Get PM best ask price from WS cache (returns null if not available)
@@ -337,7 +337,7 @@ function getWsPmBestAsk(tokenId: string): number | null {
   for (const [price, size] of book.asks) {
     if (size > 0 && price < best) best = price;
   }
-  return best === Infinity ? null : best / 100; // cents → decimal
+  return best === Infinity ? null : best / 100; // cents -> decimal
 }
 
 function getWsPmBestBid(tokenId: string): number | null {
@@ -350,7 +350,7 @@ function getWsPmBestBid(tokenId: string): number | null {
   return best === 0 ? null : best / 100;
 }
 
-// ─── Rolling Price Buffer (momentum detection) ────────────────────────────────
+// --- Rolling Price Buffer (momentum detection) --------------------------------
 // Tracks last 60 seconds of best-ask snapshots per market, sampled on every WS
 // update.  Used at arb-execution time to determine which leg's price is "moving
 // against us" so we can fill that leg first.
@@ -534,7 +534,7 @@ function connectPmWs() {
 
 function _pmWsSubscribe(tokenId: string) {
   _pmWsSubs.add(tokenId);
-  // Don't send individual messages here — batch subscribe is done on open
+  // Don't send individual messages here -- batch subscribe is done on open
   // and via subscribeWatchlist. Only send for dynamic additions after startup.
 }
 
@@ -559,10 +559,10 @@ function subscribeWatchlist(watchlist: { kal1: { ticker: string }; kal2: { ticke
   console.log(`[WS] Subscribed to ${_kalWsSubs.size} Kalshi tickers + ${_pmWsSubs.size} PM tokens`);
 }
 
-// ─── PM service-down backoff ─────────────────────────────────────────────────
+// --- PM service-down backoff -------------------------------------------------
 // When PM CLOB returns 425 "service not ready", back off to avoid hammering it.
-// Exponential backoff: 30s → 60s → 120s → max 300s. Resets on any successful PM order.
-let pmServiceDownUntil = 0;          // timestamp — skip PM orders until this time
+// Exponential backoff: 30s -> 60s -> 120s -> max 300s. Resets on any successful PM order.
+let pmServiceDownUntil = 0;          // timestamp -- skip PM orders until this time
 let pmConsecutive425 = 0;            // consecutive 425 failures
 const PM_BACKOFF_BASE_MS = 30_000;   // 30s initial backoff
 const PM_BACKOFF_MAX_MS  = 300_000;  // 5 min max backoff
@@ -575,7 +575,7 @@ function markPmDown(): void {
   pmConsecutive425++;
   const delay = Math.min(PM_BACKOFF_MAX_MS, PM_BACKOFF_BASE_MS * Math.pow(2, pmConsecutive425 - 1));
   pmServiceDownUntil = Date.now() + delay;
-  console.warn(`[PM] Service down — backing off ${(delay / 1000).toFixed(0)}s (failure #${pmConsecutive425})`);
+  console.warn(`[PM] Service down -- backing off ${(delay / 1000).toFixed(0)}s (failure #${pmConsecutive425})`);
 }
 
 function markPmUp(): void {
@@ -595,11 +595,11 @@ function isPm425(res: unknown): boolean {
   return false;
 }
 
-// ─── Small utils ──────────────────────────────────────────────────────────────
+// --- Small utils --------------------------------------------------------------
 
-// ─── API response types ──────────────────────────────────────────────────────
+// --- API response types ------------------------------------------------------
 // Lightweight interfaces covering the fields we actually read from each API.
-// All fields optional — external APIs may omit any field at any time.
+// All fields optional -- external APIs may omit any field at any time.
 
 /** Kalshi market object (from /markets/{ticker} or nested inside events). */
 type KalshiMarket = {
@@ -646,18 +646,18 @@ type KalshiOrder = {
   orderId?: string;
   status?: string;
   fill_count?: number;
-  fill_count_fp?: string;    // "13.00" — newer API format
+  fill_count_fp?: string;    // "13.00" -- newer API format
   filled_count?: number;
   filled_contracts?: number;
   filled?: number;
   remaining_count?: number;
   taker_fees?: number;
   maker_fees?: number;
-  taker_fees_dollars?: string;   // "0.1234" — newer API format
+  taker_fees_dollars?: string;   // "0.1234" -- newer API format
   maker_fees_dollars?: string;
   taker_fill_cost?: number;       // actual fill cost in cents (taker)
   maker_fill_cost?: number;       // actual fill cost in cents (maker)
-  taker_fill_cost_dollars?: string; // "11.18" — newer API format
+  taker_fill_cost_dollars?: string; // "11.18" -- newer API format
   maker_fill_cost_dollars?: string;
   order?: KalshiOrder;
 };
@@ -674,7 +674,7 @@ type GammaMarket = {
   active?: boolean;
   closed?: boolean;
   sportsMarketType?: string;
-  _eventSlug?: string;  // transient — set by discovery code
+  _eventSlug?: string;  // transient -- set by discovery code
   [key: string]: unknown; // allow arbitrary fields for forward compat
 };
 
@@ -740,10 +740,10 @@ function fmtPct(v: number, d = 1): string { return (v * 100).toFixed(d) + "%"; }
 function ts(): string { return new Date().toISOString().replace("T", " ").slice(0, 23); }
 
 // Estimate total fees for one arb direction (per share).
-// Kalshi taker fee: KALSHI_FEE_RATE × P × (1 - P) per contract.
+// Kalshi taker fee: KALSHI_FEE_RATE x P x (1 - P) per contract.
 //   Kalshi rounds the TOTAL fee for N contracts, not per-contract.
-//   Actual total = round(N × rate × P × (1-P) × 100) / 100.
-// PM fee: PM_FEE_RATE × P × (1-P) per share (currently 0 for tennis).
+//   Actual total = round(N x rate x P x (1-P) x 100) / 100.
+// PM fee: PM_FEE_RATE x P x (1-P) per share (currently 0 for tennis).
 // Returns the exact per-share fee cost (no rounding) for accurate edge calculation.
 // Rounding only matters at order time when computing total cost for N shares.
 function estimateFees(kalAsk: number, pmAsk: number): number {
@@ -752,15 +752,15 @@ function estimateFees(kalAsk: number, pmAsk: number): number {
   return kalFee + pmFee;
 }
 
-// ─── Rate-limited fetch helpers ───────────────────────────────────────────────
+// --- Rate-limited fetch helpers -----------------------------------------------
 
 const retryOpts = { timeoutMs: 12000, maxRetries: 3, baseDelayMs: 600, maxDelayMs: 8000, jitterMs: 200 };
 const kalFetch = createRateLimitedFetcher(numEnv("KALSHI_REQUEST_INTERVAL_MS", 50), retryOpts);
-// Two separate PM queues — gamma (discovery, 30/s) and CLOB (orderbook, 150/s) don't block each other.
-const polyFetch = createRateLimitedFetcher(numEnv("POLY_GAMMA_INTERVAL_MS", 35), retryOpts);       // gamma-api.polymarket.com — 30/s limit
-const polyClobFetch = createRateLimitedFetcher(numEnv("POLY_CLOB_INTERVAL_MS", 7), retryOpts);     // clob.polymarket.com — 150/s limit
+// Two separate PM queues -- gamma (discovery, 30/s) and CLOB (orderbook, 150/s) don't block each other.
+const polyFetch = createRateLimitedFetcher(numEnv("POLY_GAMMA_INTERVAL_MS", 35), retryOpts);       // gamma-api.polymarket.com -- 30/s limit
+const polyClobFetch = createRateLimitedFetcher(numEnv("POLY_CLOB_INTERVAL_MS", 7), retryOpts);     // clob.polymarket.com -- 150/s limit
 
-// ─── Types ────────────────────────────────────────────────────────────────────
+// --- Types --------------------------------------------------------------------
 
 type KalshiLeg = {
   ticker: string;
@@ -798,7 +798,7 @@ type WatchEntry = {
   isBinary?: boolean;
 };
 
-// ─── Hedge mode types ─────────────────────────────────────────────────────────
+// --- Hedge mode types ---------------------------------------------------------
 
 type UnhedgedPosition = {
   tradeId: string;              // links back to ArbTradeRecord.id for precise resolution
@@ -828,7 +828,7 @@ type HedgeOrder = {
   shares: number;               // original size
   filledSoFar: number;          // cumulative fills seen so far (for delta tracking)
   fetchFailures: number;        // consecutive status-check errors; order removed after 3
-  placedAt: number;             // Date.now() when placed — used for timeout rotation
+  placedAt: number;             // Date.now() when placed -- used for timeout rotation
   // Transient tracking fields (not persisted, used within hedge cycle)
   _lastFeeSeen?: number;        // cumulative Kalshi fees from last poll (for delta calc)
   _feeDelta?: number;           // fee increment since last poll
@@ -837,33 +837,33 @@ type HedgeOrder = {
 
 type HedgeState = {
   position: UnhedgedPosition;
-  activeOrders: Map<string, HedgeOrder>; // orderId → HedgeOrder
+  activeOrders: Map<string, HedgeOrder>; // orderId -> HedgeOrder
   kalNextRetryAt: number;               // timestamp: don't retry Kalshi until after this
   lastCompleteExchange?: "pm" | "kal";  // for sequential hedge rotation
   pmOnlyCycles: number;                 // consecutive cycles with no PM fill (for single-exchange hedging)
 };
 
-// ─── Execution metrics (ExecMetric type imported from types.ts) ─────────────
+// --- Execution metrics (ExecMetric type imported from types.ts) -------------
 
-// ─── Arb P&L tracking ────────────────────────────────────────────────────────
+// --- Arb P&L tracking --------------------------------------------------------
 
 // ArbTradeRecord imported from ./types.ts (shared with dashboard + repairTrades)
 
-// ─── Player name / slug helpers ───────────────────────────────────────────────
+// --- Player name / slug helpers -----------------------------------------------
 
 function extractEntityName(title: string): string {
   // Tennis: "Will Vacherot win the Vacherot vs Monfils match?"
   const mWin = title.match(/^Will\s+(.+?)\s+win\b/i);
   if (mWin) return mWin[1].trim();
-  // NBA/soccer: "Will the Utah Jazz beat the Sacramento Kings?" → "Utah Jazz"
+  // NBA/soccer: "Will the Utah Jazz beat the Sacramento Kings?" -> "Utah Jazz"
   const mBeat = title.match(/^Will\s+(?:the\s+)?(.+?)\s+beat\b/i);
   if (mBeat) return mBeat[1].trim();
-  // Soccer tie/draw: "Will the match end in a tie/draw?" → "Tie"/"Draw"
+  // Soccer tie/draw: "Will the match end in a tie/draw?" -> "Tie"/"Draw"
   if (/\b(?:tie|draw)\b/i.test(title)) {
     if (/\bdraw\b/i.test(title)) return "Draw";
     return "Tie";
   }
-  // Generic fallback: "Will X [verb] ..." — capture up to common verbs
+  // Generic fallback: "Will X [verb] ..." -- capture up to common verbs
   const mGeneric = title.match(/^Will\s+(?:the\s+)?(.+?)\s+(?:defeat|advance|qualify|make|reach|finish)\b/i);
   if (mGeneric) return mGeneric[1].trim();
   return "";
@@ -890,22 +890,22 @@ function matchCodePrefix(ticker: string): string {
   return ticker.replace(/-[^-]+$/, "");
 }
 
-// Map Kalshi series prefix → Polymarket slug prefix for fast slug-guessing.
+// Map Kalshi series prefix -> Polymarket slug prefix for fast slug-guessing.
 // Add entries as new series are discovered.
 const SERIES_TO_PM_PREFIX: Record<string, string> = {
   // Esports
   KXATPMATCH: "atp",    KXWTAMATCH: "wta",
-  KXATPCHALLENGERMATCH: "atp",   // ATP Challenger — same PM "atp-" prefix
-  KXWTACHALLENGERMATCH: "wta",   // WTA Challenger / WTA 125 — same PM "wta-" prefix
-  KXATPSETWINNER: "atp",        // ATP Set 1 Winners — same PM "atp-" prefix
-  KXATPGAMETOTAL: "atp",        // ATP Match Totals — same PM "atp-" prefix
+  KXATPCHALLENGERMATCH: "atp",   // ATP Challenger -- same PM "atp-" prefix
+  KXWTACHALLENGERMATCH: "wta",   // WTA Challenger / WTA 125 -- same PM "wta-" prefix
+  KXATPSETWINNER: "atp",        // ATP Set 1 Winners -- same PM "atp-" prefix
+  KXATPGAMETOTAL: "atp",        // ATP Match Totals -- same PM "atp-" prefix
   KXCS2GAME: "cs2",     KXCS2MAP: "cs2",     KXCS2TOTALMAPS: "cs2",
   KXLOLGAME: "lol",     KXLOLMAP: "lol",     KXLOLTOTALMAPS: "lol",
   KXDOTA2GAME: "dota2", KXDOTA2MAP: "dota2",
   KXVALORANTGAME: "val",  KXVALORANTMAP: "val",
   KXCSGAME: "cs2",        KXCSMAP: "cs2",
   KXCODGAME: "codmw",     KXCODMAP: "codmw",
-  // Basketball — NBA + international (PM uses "bk" prefix for intl basketball)
+  // Basketball -- NBA + international (PM uses "bk" prefix for intl basketball)
   KXNBAGAME: "nba",     KXNBASPREAD: "nba",   KXNBATOTAL: "nba",
   KXNBLGAME: "bknbl",
   KXCBAGAME: "bkcba",
@@ -918,7 +918,7 @@ const SERIES_TO_PM_PREFIX: Record<string, string> = {
   KXEUROLEAGUEGAME: "euroleague",
   KXARGLNBGAME: "bkarg",        // Argentina Liga Nacional Basketball
   KXBBSERIEAGAME: "bkseriea",   // Italy Serie A Basketball
-  // Hockey — NHL
+  // Hockey -- NHL
   KXNHLGAME: "nhl",     KXNHLSPREAD: "nhl",   KXNHLTOTAL: "nhl",
   // Baseball
   KXMLBGAME: "mlb",
@@ -926,18 +926,18 @@ const SERIES_TO_PM_PREFIX: Record<string, string> = {
   // College basketball
   KXNCAAMBGAME: "cbb",   KXNCAAMBSPREAD: "cbb",   // NCAA Men's Basketball (March Madness)
   KXNCAAWBGAME: "cwbb",  // NCAA Women's Basketball
-  // Soccer — Top 5 leagues (moneyline + spreads + totals)
+  // Soccer -- Top 5 leagues (moneyline + spreads + totals)
   KXEPLGAME: "epl",         KXEPLSPREAD: "epl",         KXEPLTOTAL: "epl",
   KXLALIGAGAME: "lal",      KXLALIGASPREAD: "lal",      KXLALIGATOTAL: "lal",
   KXBUNDESLIGAGAME: "bun",  KXBUNDESLIGASPREAD: "bun",  KXBUNDESLIGATOTAL: "bun",
   KXSERIEAGAME: "sea",      KXSERIEASPREAD: "sea",      KXSERIEATOTAL: "sea",
   KXLIGUE1GAME: "fl1",      KXLIGUE1SPREAD: "fl1",      KXLIGUE1TOTAL: "fl1",
-  // Soccer — MLS
+  // Soccer -- MLS
   KXMLSGAME: "mls",         KXMLSSPREAD: "mls",         KXMLSTOTAL: "mls",
-  // Soccer — European cups
+  // Soccer -- European cups
   KXUCLGAME: "ucl",         KXUCLSPREAD: "ucl",         KXUCLTOTAL: "ucl",
   KXUELGAME: "uel",         KXUELSPREAD: "uel",         KXUELTOTAL: "uel",
-  // Soccer — Other European leagues
+  // Soccer -- Other European leagues
   KXEFLCHAMPIONSHIPGAME: "elc",
   KXSCOTTISHPREMGAME: "scop",
   KXEREDIVISIEGAME: "ere",
@@ -949,11 +949,11 @@ const SERIES_TO_PM_PREFIX: Record<string, string> = {
   KXSWISSLEAGUEGAME: "swi",    // needs verification
   KXDENSUPERLIGAGAME: "den",
   KXHNLGAME: "cro",            // needs verification
-  // Soccer — Second divisions
+  // Soccer -- Second divisions
   KXBUNDESLIGA2GAME: "bl2",
   KXLALIGA2GAME: "es2",
   KXSERIEBGAME: "itsb",
-  // Soccer — Americas
+  // Soccer -- Americas
   KXLIGAMXGAME: "mex",
   KXBRASILEIROGAME: "bra",     KXBRASILEIROSPREAD: "bra",   KXBRASILEIROTOTAL: "bra",
   KXARGPREMDIVGAME: "arg",
@@ -966,7 +966,7 @@ const SERIES_TO_PM_PREFIX: Record<string, string> = {
   KXUSLGAME: "usl",            // needs verification
   KXNWSLGAME: "nwsl",          // needs verification
   KXCONCACAFCCUPGAME: "conc",  // needs verification
-  // Soccer — Asia / Middle East / Other
+  // Soccer -- Asia / Middle East / Other
   KXSAUDIPLGAME: "spl",       KXSAUDIPLSPREAD: "spl",     KXSAUDIPLTOTAL: "spl",
   KXKLEAGUEGAME: "kor",
   KXJLEAGUEGAME: "j1-100",
@@ -974,13 +974,13 @@ const SERIES_TO_PM_PREFIX: Record<string, string> = {
   KXCHNSLGAME: "chi",
   KXTHAIL1GAME: "tha",         // needs verification
   KXAFCCLGAME: "afc",          // needs verification
-  // Soccer — International
+  // Soccer -- International
   KXINTLFRIENDLYGAME: "fif",
   KXFIFAGAME: "uef",           // FIFA/UEFA qualifiers
-  // Soccer — Cups (seasonal, may have 0 open markets)
+  // Soccer -- Cups (seasonal, may have 0 open markets)
   KXFACUPGAME: "efa",
   KXEFLCUPGAME: "efl",
-  // Soccer — Women
+  // Soccer -- Women
   KXEWSLGAME: "ewsl",          // needs verification
 };
 const TENNIS_SERIES = new Set(["KXATPMATCH", "KXWTAMATCH", "KXATPCHALLENGERMATCH", "KXWTACHALLENGERMATCH"]);
@@ -998,7 +998,7 @@ const NON_MONEYLINE_BINARY_SERIES = new Set([
   "KXNCAAMBSPREAD",                    // CBB spreads
   "KXATPGAMETOTAL",                    // ATP match totals
   "KXCS2TOTALMAPS", "KXLOLTOTALMAPS", // CS2/LoL total maps
-  // Soccer spreads & totals — all major leagues
+  // Soccer spreads & totals -- all major leagues
   "KXEPLSPREAD", "KXEPLTOTAL",
   "KXMLSSPREAD", "KXMLSTOTAL",
   "KXUCLSPREAD", "KXUCLTOTAL",
@@ -1015,7 +1015,7 @@ const NON_MONEYLINE_BINARY_SERIES = new Set([
 // Set-winner series: 2-market events (like moneyline) but for set outcomes
 const SET_WINNER_SERIES = new Set(["KXATPSETWINNER"]);
 
-// CBB name aliases: Kalshi abbreviations → expanded name that appears in PM outcomes.
+// CBB name aliases: Kalshi abbreviations -> expanded name that appears in PM outcomes.
 // Only needed where Kalshi's entity name is NOT a substring of PM's "School Mascot" format.
 const CBB_NAME_ALIASES: Record<string, string> = {
   "uconn": "connecticut",
@@ -1076,7 +1076,7 @@ const SOCCER_SERIES = new Set([
   "KXFACUPGAME", "KXEFLCUPGAME",
   // Women
   "KXEWSLGAME",
-  // Spreads & totals (same leagues — for slug guessing via soccerNameToAbbr)
+  // Spreads & totals (same leagues -- for slug guessing via soccerNameToAbbr)
   "KXEPLSPREAD", "KXEPLTOTAL",
   "KXMLSSPREAD", "KXMLSTOTAL",
   "KXUCLSPREAD", "KXUCLTOTAL",
@@ -1096,8 +1096,8 @@ type SoccerDir = "A" | "B" | "C" | "D" | "E" | "F" | "G" | "H" | "I" | "J" | "K"
 // Combined direction type for all sports
 type ArbDir = "A" | "B" | "C" | "D" | "E" | "F" | "G" | "H" | "I" | "J" | "K" | "L";
 
-// NBA team full name → 3-letter PM slug abbreviation
-// NHL team name → PM slug abbreviation (3-letter codes used in polymarket slugs)
+// NBA team full name -> 3-letter PM slug abbreviation
+// NHL team name -> PM slug abbreviation (3-letter codes used in polymarket slugs)
 const NHL_TEAM_ABBRS: Record<string, string> = {
   "anaheim ducks": "ana", "arizona coyotes": "ari", "boston bruins": "bos",
   "buffalo sabres": "buf", "calgary flames": "cal", "carolina hurricanes": "car",
@@ -1126,7 +1126,7 @@ const NBA_TEAM_ABBRS: Record<string, string> = {
   "toronto raptors": "tor", "utah jazz": "uta", "washington wizards": "was",
 };
 
-// EPL team name → 3-letter PM slug abbreviation
+// EPL team name -> 3-letter PM slug abbreviation
 // Kalshi uses codes like CFC, WHU, MCI in tickers; PM uses first-3-chars of name like che, wes, mac
 // This maps the Kalshi entity name (from title) to PM's 3-char slug code
 const SOCCER_TEAM_ABBRS: Record<string, string> = {
@@ -1199,7 +1199,7 @@ function soccerNameToAbbr(entityName: string): string {
   return norm.replace(/[^a-z]/g, "").slice(0, 3);
 }
 
-// MLB team name → 3-letter PM slug abbreviation
+// MLB team name -> 3-letter PM slug abbreviation
 // Kalshi sub_title uses city names ("Los Angeles D"), PM slug uses standard 3-letter codes
 const MLB_TEAM_ABBRS: Record<string, string> = {
   "arizona diamondbacks": "ari", "diamondbacks": "ari", "arizona": "ari",
@@ -1251,9 +1251,9 @@ function mlbNameToAbbr(entityName: string): string {
 
 function nbaNameToAbbr(entityName: string): string {
   const norm = entityName.toLowerCase().trim().replace(/^the\s+/, "");
-  // Full name match ("Utah Jazz" → "uta")
+  // Full name match ("Utah Jazz" -> "uta")
   if (NBA_TEAM_ABBRS[norm]) return NBA_TEAM_ABBRS[norm];
-  // City-only or nickname match ("Sacramento" → "sac", "Jazz" → "uta")
+  // City-only or nickname match ("Sacramento" -> "sac", "Jazz" -> "uta")
   for (const [full, abbr] of Object.entries(NBA_TEAM_ABBRS)) {
     const parts = full.split(" ");
     const nickname = parts[parts.length - 1]; // "kings", "jazz"
@@ -1279,20 +1279,20 @@ function nhlNameToAbbr(entityName: string): string {
   for (const [full, abbr] of Object.entries(NHL_TEAM_ABBRS)) {
     if (norm.includes(full) || full.includes(norm)) return abbr;
   }
-  // Handle Kalshi abbreviated format: "TOR Maple Leafs" → strip first token, match nickname
+  // Handle Kalshi abbreviated format: "TOR Maple Leafs" -> strip first token, match nickname
   const spaceIdx = norm.indexOf(" ");
   if (spaceIdx > 0 && spaceIdx <= 4) {
     const nicknamePart = norm.slice(spaceIdx + 1); // "maple leafs", "rangers", "blue jackets", etc.
     for (const [full, abbr] of Object.entries(NHL_TEAM_ABBRS)) {
       const parts = full.split(" ");
       // Try matching against nickname portion (everything after city)
-      // e.g., "toronto maple leafs" → city=["toronto"] nick=["maple","leafs"]
+      // e.g., "toronto maple leafs" -> city=["toronto"] nick=["maple","leafs"]
       for (let i = 1; i < parts.length; i++) {
         if (nicknamePart === parts.slice(i).join(" ")) return abbr;
       }
     }
   }
-  // Handle Kalshi spread abbreviations: "New York R" → Rangers, "New York I" → Islanders
+  // Handle Kalshi spread abbreviations: "New York R" -> Rangers, "New York I" -> Islanders
   if (norm === "new york r") return "nyr";
   if (norm === "new york i") return "nyi";
   return "";
@@ -1314,8 +1314,8 @@ function namesMatch(kalName: string, pmOutcome: string): boolean {
   if (shorter.length === 1 && shorter[0].length >= 4 && shorter.every(w => longer.includes(w))) return true;
   if (shorter.length > 1 && shorter.every(w => longer.includes(w))) return true;
   // Abbreviation fallback: Polymarket esports markets often use abbreviated outcome labels
-  // e.g. "SE1" → strip digits → "se" → matches initials of "Sakura Esports"
-  //      "WC1" → strip digits → "wc" → is a prefix of "wildcard"
+  // e.g. "SE1" -> strip digits -> "se" -> matches initials of "Sakura Esports"
+  //      "WC1" -> strip digits -> "wc" -> is a prefix of "wildcard"
   for (const [full, abbr] of [[k, p], [p, k]] as [string, string][]) {
     const a = abbr.replace(/\d+$/, "").replace(/\s/g, ""); // strip trailing digits and spaces
     if (a.length < 2) continue;
@@ -1329,7 +1329,7 @@ function namesMatch(kalName: string, pmOutcome: string): boolean {
 
 /** Fuzzy name match for international sports where Kalshi and PM use very different team names.
  *  Strips common European prefixes (BC, KK, FK, FC, Saski, etc.) and checks for shared
- *  significant words (≥5 chars). Only safe when scoped to specific series — NOT for use globally. */
+ *  significant words (>=5 chars). Only safe when scoped to specific series -- NOT for use globally. */
 function fuzzyIntlNamesMatch(kalName: string, pmName: string): boolean {
   const k = normalizeName(kalName);
   const p = normalizeName(pmName);
@@ -1408,13 +1408,13 @@ async function searchPolymarketByNames(
   return null;
 }
 
-// ─── Discovery caching ────────────────────────────────────────────────────────
+// --- Discovery caching --------------------------------------------------------
 
 const DISCOVERY_CACHE_PATH = "discovery_cache.json";
 
 type DiscoveryCache = {
-  date: string;              // "YYYY-MM-DD" — legacy date check (used when DISCOVERY_CACHE_TTL_MS=0)
-  savedAt?: number;          // epoch ms — used for TTL-based invalidation
+  date: string;              // "YYYY-MM-DD" -- legacy date check (used when DISCOVERY_CACHE_TTL_MS=0)
+  savedAt?: number;          // epoch ms -- used for TTL-based invalidation
   watchlist: WatchEntry[];
   noMatchPairs: string[];    // sorted normalized name pairs that had no PM match
 };
@@ -1442,13 +1442,13 @@ function loadDiscoveryCache(): DiscoveryCache | null {
     if (DISCOVERY_CACHE_TTL_MS > 0 && raw.savedAt) {
       const ageMs = Date.now() - raw.savedAt;
       if (ageMs > DISCOVERY_CACHE_TTL_MS) {
-        console.log(`[DISCOVER] Cache expired (age ${Math.round(ageMs / 60000)}min > TTL ${Math.round(DISCOVERY_CACHE_TTL_MS / 60000)}min) — will re-discover`);
+        console.log(`[DISCOVER] Cache expired (age ${Math.round(ageMs / 60000)}min > TTL ${Math.round(DISCOVERY_CACHE_TTL_MS / 60000)}min) -- will re-discover`);
         return null;
       }
     } else {
       const today = new Date().toISOString().slice(0, 10);
       if (raw.date !== today) {
-        console.log(`[DISCOVER] Cache is stale (${raw.date} vs today ${today}) — will re-discover`);
+        console.log(`[DISCOVER] Cache is stale (${raw.date} vs today ${today}) -- will re-discover`);
         return null;
       }
     }
@@ -1460,7 +1460,7 @@ function loadDiscoveryCache(): DiscoveryCache | null {
   }
 }
 
-// ─── Static pairs loader ──────────────────────────────────────────────────────
+// --- Static pairs loader ------------------------------------------------------
 // Reads data/static_pairs.csv with columns: kalshi, pm
 // Each row has a Kalshi URL and a Polymarket URL.
 // Fetches both APIs on startup to build WatchEntry objects.
@@ -1526,13 +1526,13 @@ async function loadStaticPairs(): Promise<WatchEntry[]> {
     const eventTicker = extractKalshiEventTicker(pair.kalshiUrl);
     const pmSlug = extractPmSlug(pair.pmUrl);
     if (!eventTicker || !pmSlug) {
-      console.warn(`[STATIC] SKIP — missing ticker or slug: kal=${pair.kalshiUrl} pm=${pair.pmUrl}`);
+      console.warn(`[STATIC] SKIP -- missing ticker or slug: kal=${pair.kalshiUrl} pm=${pair.pmUrl}`);
       continue;
     }
 
     console.log(`[STATIC] Loading: ${eventTicker} ↔ ${pmSlug}`);
 
-    // ── Fetch Kalshi event with nested markets ──
+    // -- Fetch Kalshi event with nested markets --
     let kalNames: string[] = [], kalAsks: number[] = [], kalNoAsks: number[] = [], kalTickers: string[] = [];
     let kalYesAskSizes: number[] = [], kalNoAskSizes: number[] = [];
     try {
@@ -1540,7 +1540,7 @@ async function loadStaticPairs(): Promise<WatchEntry[]> {
       const ev = evRes.event ?? evRes as unknown as KalshiEvent;
       const mlist = ev.markets ?? [];
       if (mlist.length !== 2) {
-        console.warn(`[STATIC] SKIP — Kalshi event ${eventTicker} has ${mlist.length} markets (need 2)`);
+        console.warn(`[STATIC] SKIP -- Kalshi event ${eventTicker} has ${mlist.length} markets (need 2)`);
         continue;
       }
       for (const m of mlist) {
@@ -1557,15 +1557,15 @@ async function loadStaticPairs(): Promise<WatchEntry[]> {
         kalNoAskSizes.push(Number(m.no_ask_size_fp ?? m.no_ask_size ?? 0) || 0);
       }
       if (kalNames.length !== 2 || !kalTickers[0] || !kalTickers[1]) {
-        console.warn(`[STATIC] SKIP — could not parse Kalshi markets for ${eventTicker}`);
+        console.warn(`[STATIC] SKIP -- could not parse Kalshi markets for ${eventTicker}`);
         continue;
       }
     } catch (err) {
-      console.warn(`[STATIC] SKIP — Kalshi fetch failed for ${eventTicker}: ${(err as Error).message}`);
+      console.warn(`[STATIC] SKIP -- Kalshi fetch failed for ${eventTicker}: ${(err as Error).message}`);
       continue;
     }
 
-    // ── Fetch PM market from slug ──
+    // -- Fetch PM market from slug --
     let pmMarket: GammaMarket | null = null;
     try {
       const raw = await polyFetch<unknown>(`${gammaBase}/markets?slug=${encodeURIComponent(pmSlug)}`);
@@ -1589,14 +1589,14 @@ async function loadStaticPairs(): Promise<WatchEntry[]> {
     }
 
     if (!pmMarket) {
-      console.warn(`[STATIC] SKIP — PM market not found for slug: ${pmSlug}`);
+      console.warn(`[STATIC] SKIP -- PM market not found for slug: ${pmSlug}`);
       continue;
     }
 
     const outcomes = parseJsonArray(pmMarket.outcomes ?? "");
     const tokenIds = parseJsonArray(pmMarket.clobTokenIds ?? "");
     if (outcomes.length !== 2 || tokenIds.length < 2) {
-      console.warn(`[STATIC] SKIP — PM ${pmSlug} has ${outcomes.length} outcomes (need 2)`);
+      console.warn(`[STATIC] SKIP -- PM ${pmSlug} has ${outcomes.length} outcomes (need 2)`);
       continue;
     }
 
@@ -1604,7 +1604,7 @@ async function loadStaticPairs(): Promise<WatchEntry[]> {
     const minSize = Number(pmMarket.orderMinSize ?? 1);
     const negRisk = Boolean(pmMarket.negRisk);
 
-    // ── Map Kalshi names to PM outcomes ──
+    // -- Map Kalshi names to PM outcomes --
     function findPmToken(kalName: string): { outcome: string; tokenId: string } | null {
       for (let i = 0; i < outcomes.length; i++) {
         if (namesMatch(kalName, outcomes[i])) return { outcome: outcomes[i], tokenId: tokenIds[i] };
@@ -1616,12 +1616,12 @@ async function loadStaticPairs(): Promise<WatchEntry[]> {
     let pm2Info = findPmToken(kalNames[1]);
 
     if (!pm1Info || !pm2Info || pm1Info.tokenId === pm2Info.tokenId) {
-      console.warn(`[STATIC] SKIP — outcome mismatch: KAL=[${kalNames[0]}, ${kalNames[1]}] PM=${JSON.stringify(outcomes)}`);
+      console.warn(`[STATIC] SKIP -- outcome mismatch: KAL=[${kalNames[0]}, ${kalNames[1]}] PM=${JSON.stringify(outcomes)}`);
       continue;
     }
 
-    // ── Cross-validate token mapping via CLOB prices ──
-    // Only swap when name matches were ambiguous — price divergence is expected for arb opportunities.
+    // -- Cross-validate token mapping via CLOB prices --
+    // Only swap when name matches were ambiguous -- price divergence is expected for arb opportunities.
     const staticPm1Confident = namesMatch(kalNames[0], pm1Info.outcome);
     const staticPm2Confident = namesMatch(kalNames[1], pm2Info.outcome);
     const staticBothConfident = staticPm1Confident && staticPm2Confident;
@@ -1635,9 +1635,9 @@ async function loadStaticPairs(): Promise<WatchEntry[]> {
         const diff_swapped = Math.abs(kalAsks[0] - ask2) + Math.abs(kalAsks[1] - ask1);
         if (diff_swapped < diff_correct - 0.10) {
           if (staticBothConfident) {
-            console.log(`[STATIC] Price divergence for ${pmSlug} — names confident, NOT swapping`);
+            console.log(`[STATIC] Price divergence for ${pmSlug} -- names confident, NOT swapping`);
           } else {
-            console.warn(`[STATIC] TOKEN SWAP DETECTED for ${pmSlug} — swapping pm1↔pm2`);
+            console.warn(`[STATIC] TOKEN SWAP DETECTED for ${pmSlug} -- swapping pm1↔pm2`);
             [pm1Info, pm2Info] = [pm2Info, pm1Info];
           }
         }
@@ -1654,13 +1654,13 @@ async function loadStaticPairs(): Promise<WatchEntry[]> {
       pm1: { outcome: pm1Info.outcome, tokenId: pm1Info.tokenId, tickSize, minSize, negRisk },
       pm2: { outcome: pm2Info.outcome, tokenId: pm2Info.tokenId, tickSize, minSize, negRisk },
     });
-    console.log(`[STATIC] LOADED: ${kalNames[0]} vs ${kalNames[1]} → ${pmSlug}`);
+    console.log(`[STATIC] LOADED: ${kalNames[0]} vs ${kalNames[1]} -> ${pmSlug}`);
   }
 
   return entries;
 }
 
-// ─── Discovery ────────────────────────────────────────────────────────────────
+// --- Discovery ----------------------------------------------------------------
 
 type KalEntity = { ticker: string; name: string; yesAsk: number; noAsk: number; yesAskSize?: number; noAskSize?: number };
 type KalCandidate = {
@@ -1741,7 +1741,7 @@ function buildBinarySlugSuffix(
 
   // Spreads: NBA, CBB, NHL, and all soccer leagues (KXEPL, KXMLS, KXUCL, etc.)
   if (series === "KXNBASPREAD" || series === "KXNCAAMBSPREAD" || series === "KXNHLSPREAD" || series.endsWith("SPREAD")) {
-    // Ticker suffix: {TEAM_ABBR}{NUMBER} e.g., "LAL8" → "LAL wins by >8.5"
+    // Ticker suffix: {TEAM_ABBR}{NUMBER} e.g., "LAL8" -> "LAL wins by >8.5"
     const m = lastPart.match(/^([A-Z]+)(\d+)$/i);
     if (!m) return null;
     const lineNum = m[2]; // integer part; actual line = lineNum.5
@@ -1760,7 +1760,7 @@ function buildBinarySlugSuffix(
 
   // Totals: NBA, NHL, and all soccer leagues
   if (series === "KXNBATOTAL" || series === "KXNHLTOTAL" || series.endsWith("TOTAL")) {
-    // Ticker suffix: {NUMBER} e.g., "233" → PM "total-233pt5"
+    // Ticker suffix: {NUMBER} e.g., "233" -> PM "total-233pt5"
     if (!/^\d+$/.test(lastPart)) return null;
     return {
       suffix: `total-${lastPart}pt5`,
@@ -1770,7 +1770,7 @@ function buildBinarySlugSuffix(
   }
 
   if (series === "KXATPGAMETOTAL") {
-    // Ticker suffix: {NUMBER} e.g., "27" → PM "match-total-27pt5"
+    // Ticker suffix: {NUMBER} e.g., "27" -> PM "match-total-27pt5"
     // ATP games are integers: KAL "over 27" = PM ">27.5"
     if (!/^\d+$/.test(lastPart)) return null;
     return {
@@ -1781,11 +1781,11 @@ function buildBinarySlugSuffix(
   }
 
   if (series === "KXCS2TOTALMAPS" || series === "KXLOLTOTALMAPS") {
-    // Ticker suffix: {N} e.g., "3" → "over 2.5 maps" → PM "total-games-2pt5"
+    // Ticker suffix: {N} e.g., "3" -> "over 2.5 maps" -> PM "total-games-2pt5"
     // Suffix N = minimum count for YES, line = N - 0.5, PM integer part = N - 1
     const count = parseInt(lastPart, 10);
     if (isNaN(count) || count < 2) return null;
-    const pmLine = count - 1; // suffix 3 → 2.5 → "2pt5"
+    const pmLine = count - 1; // suffix 3 -> 2.5 -> "2pt5"
     return {
       suffix: `total-games-${pmLine}pt5`,
       type: "game_total",
@@ -1820,10 +1820,10 @@ async function fetchKalshiCandidates(kalBase: string): Promise<KalCandidate[]> {
       const category = pickString(ev.category ?? ev.event_category ?? ev.series_category ?? "").toLowerCase();
       if (category && !SPORTS_KEYWORDS.some(k => category.includes(k))) continue;
 
-      // ── Extract series prefix for non-moneyline branching ───────────────
+      // -- Extract series prefix for non-moneyline branching ---------------
       const evSeriesPrefix = eventTicker.split("-")[0]?.toUpperCase() ?? "";
 
-      // ── Non-moneyline binary series (spreads, totals, game totals) ──────
+      // -- Non-moneyline binary series (spreads, totals, game totals) ------
       // These events have MANY markets per event (one per line value).
       // Extract each market as an independent binary candidate.
       if (NON_MONEYLINE_BINARY_SERIES.has(evSeriesPrefix)) {
@@ -1851,7 +1851,7 @@ async function fetchKalshiCandidates(kalBase: string): Promise<KalCandidate[]> {
 
           // For spreads: determine if this ticker's team is home or away so we
           // match the CORRECT PM market (same team, same line).  Kalshi has
-          // separate tickers per team (DET1 = "Det >1.5", LAL1 = "LAL >1.5") —
+          // separate tickers per team (DET1 = "Det >1.5", LAL1 = "LAL >1.5") --
           // matching DET1 to PM "Lakers -1.5" would NOT be an arb because a
           // close game makes both positions lose.
           let finalSuffix = slugInfo.suffix;
@@ -1866,11 +1866,11 @@ async function fetchKalshiCandidates(kalBase: string): Promise<KalCandidate[]> {
             const spreadIdx = mTitle.indexOf("spread");
             const afterSpread = spreadIdx >= 0 ? mTitle.slice(spreadIdx) : mTitle;
             if (afterSpread.includes(homeLower)) {
-              // This ticker is about the HOME team → use spread-home only
+              // This ticker is about the HOME team -> use spread-home only
               finalSuffix = `spread-home-${slugInfo.lineNum}pt5`;
               finalSuffixAlt = undefined;
             } else if (afterSpread.includes(awayLower)) {
-              // This ticker is about the AWAY team → use spread-away only
+              // This ticker is about the AWAY team -> use spread-away only
               finalSuffix = `spread-away-${slugInfo.lineNum}pt5`;
               finalSuffixAlt = undefined;
             }
@@ -1895,10 +1895,10 @@ async function fetchKalshiCandidates(kalBase: string): Promise<KalCandidate[]> {
         continue;
       }
 
-      // ── Set winner series (KXATPSETWINNER): 2-market events, Set 1 only ─
+      // -- Set winner series (KXATPSETWINNER): 2-market events, Set 1 only -
       const isSetWinner = SET_WINNER_SERIES.has(evSeriesPrefix);
       if (isSetWinner) {
-        // PM only has "first-set-winner" — skip Set 2, 3, etc.
+        // PM only has "first-set-winner" -- skip Set 2, 3, etc.
         const titleLower = eventTitle.toLowerCase();
         if (!titleLower.includes("set 1") && !eventTicker.endsWith("-1")) continue;
         // Fall through to normal 2-market processing (but skip SKIP_MARKET_KEYWORDS)
@@ -1934,7 +1934,7 @@ async function fetchKalshiCandidates(kalBase: string): Promise<KalCandidate[]> {
       if (POLITICS_BLOCKLIST.some(kw => nameLower.includes(kw))) continue;
 
       const allTitles = [eventTitle, ...mlist.map(m => pickString(m.title ?? m.subtitle ?? ""))].join(" ").toLowerCase();
-      // Skip non-moneyline keywords — but NOT for set-winner events (their titles contain "set 1")
+      // Skip non-moneyline keywords -- but NOT for set-winner events (their titles contain "set 1")
       if (!isSetWinner && SKIP_MARKET_KEYWORDS.some(kw => allTitles.includes(kw))) continue;
 
       const detectedMap = detectMapType(allTitles);
@@ -2002,8 +2002,8 @@ async function fetchKalshiCandidates(kalBase: string): Promise<KalCandidate[]> {
 /** Phase 2a: Pre-fetch all active PM sports events by tag (bulk fetch, scan locally). */
 async function prefetchPmSportsMarkets(gammaBase: string): Promise<GammaMarket[]> {
   const markets: GammaMarket[] = [];
-  // Fetch multiple sport tags — Gamma API tag_slug works on /events endpoint
-  // Soccer is excluded — handled by separate soccer scanner command.
+  // Fetch multiple sport tags -- Gamma API tag_slug works on /events endpoint
+  // Soccer is excluded -- handled by separate soccer scanner command.
   const sportTags = [
     "esports", "nba", "basketball", "baseball", "mlb",
     "dota-2", "valorant", "call-of-duty",        // esports sub-tags (PM splits them)
@@ -2054,7 +2054,7 @@ async function discoverWatchlist(): Promise<{ watchlist: WatchEntry[]; noMatchPa
   const kalBase = process.env.KALSHI_BASE_URL ?? "https://api.elections.kalshi.com/trade-api/v2";
   const gammaBase = process.env.POLY_GAMMA_URL ?? "https://gamma-api.polymarket.com";
 
-  // ── Phase 1 + 2a: Run in PARALLEL (independent data sources) ─────────────
+  // -- Phase 1 + 2a: Run in PARALLEL (independent data sources) -------------
   const t0 = performance.now();
   const [candidates, pmEsportsMarkets] = await Promise.all([
     fetchKalshiCandidates(kalBase),
@@ -2062,7 +2062,7 @@ async function discoverWatchlist(): Promise<{ watchlist: WatchEntry[]; noMatchPa
   ]);
   console.log(`[DISCOVER] Kalshi: ${candidates.length} head-to-head pairs | PM prefetch: ${pmEsportsMarkets.length} markets (${((performance.now() - t0) / 1000).toFixed(1)}s parallel)`);
 
-  // Build event slug index for fast soccer 3-way lookups (Step E) — avoids re-fetching events from API
+  // Build event slug index for fast soccer 3-way lookups (Step E) -- avoids re-fetching events from API
   const pmEventIndex = new Map<string, GammaMarket[]>();
   for (const m of pmEsportsMarkets) {
     const evSlug = pickString(m._eventSlug ?? "");
@@ -2074,11 +2074,11 @@ async function discoverWatchlist(): Promise<{ watchlist: WatchEntry[]; noMatchPa
   }
   console.log(`[DISCOVER] PM event index: ${pmEventIndex.size} events cached`);
 
-  // ── Load slug cache from previous discovery (speeds up re-discovery) ───────
+  // -- Load slug cache from previous discovery (speeds up re-discovery) -------
   // Even with FORCE_DISCOVER, we can reuse known PM slug mappings from last run
   // to skip expensive slug-guessing API calls. The slug is validated against
   // the prefetch anyway, so stale entries are harmless (just won't match).
-  const slugCache = new Map<string, string>(); // namePairKey → pmSlug
+  const slugCache = new Map<string, string>(); // namePairKey -> pmSlug
   const noMatchCache = new Set<string>(); // namePairKey known to have no PM match
   try {
     const prevCache = loadDiscoveryCache();
@@ -2096,25 +2096,25 @@ async function discoverWatchlist(): Promise<{ watchlist: WatchEntry[]; noMatchPa
     }
   } catch { /* ignore */ }
 
-  // ── Phase 2: For each Kalshi pair, find matching Polymarket market ─────────
+  // -- Phase 2: For each Kalshi pair, find matching Polymarket market ---------
   const watchlist: WatchEntry[] = [];
-  // seenPairs: player pairs already processed (matched or not-found) — skip duplicates.
+  // seenPairs: player pairs already processed (matched or not-found) -- skip duplicates.
   // Key: sorted normalized names joined by "|" + ":" + marketType.
   const seenPairs = new Set<string>();
   const noMatchPairs: string[] = [];
-  // matchedSlugs: PM slugs already in the watchlist — prevents same PM token appearing
+  // matchedSlugs: PM slugs already in the watchlist -- prevents same PM token appearing
   // multiple times when several Kalshi market types (KXLOLMAP, KXLOLGAME) all point
   // to the same PM market, which would create fake arbs.
   const matchedSlugs = new Set<string>();
   // Cache moneyline PM base slugs by player pair, so map_N candidates can derive
   // their PM slug as {baseSlug}-gameN without re-doing the full matching.
-  const moneylineBaseSlugs = new Map<string, string>(); // pairKey → PM base slug
+  const moneylineBaseSlugs = new Map<string, string>(); // pairKey -> PM base slug
 
   function esportsSlugToken(name: string): string {
     return name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
   }
 
-  // These series have PM slugs that can't be guessed from team names — rely on
+  // These series have PM slugs that can't be guessed from team names -- rely on
   // prefetch name-matching (Step C) instead of slug guessing (Step A).
   const OPAQUE_SLUG_SERIES = new Set([
     "KXUCLGAME", "KXUELGAME",                         // UCL/UEL use codes like cfc1, psg1
@@ -2123,11 +2123,11 @@ async function discoverWatchlist(): Promise<{ watchlist: WatchEntry[]; noMatchPa
     "KXINTLFRIENDLYGAME", "KXFIFAGAME",                // international matches
     "KXFACUPGAME", "KXEFLCUPGAME",                     // domestic cups
     "KXEWSLGAME",                                       // women's
-    // International basketball — PM slug patterns unknown, rely on name matching
+    // International basketball -- PM slug patterns unknown, rely on name matching
     "KXNBLGAME", "KXCBAGAME", "KXKBLGAME", "KXACBGAME",
     "KXBBLGAME", "KXBSLGAME", "KXVTBGAME", "KXABAGAME",
     "KXEUROLEAGUEGAME", "KXARGLNBGAME", "KXBBSERIEAGAME",
-    // College basketball — PM slug abbreviations are custom, rely on name matching
+    // College basketball -- PM slug abbreviations are custom, rely on name matching
     "KXNCAAMBGAME", "KXNCAAWBGAME",
   ]);
 
@@ -2143,12 +2143,12 @@ async function discoverWatchlist(): Promise<{ watchlist: WatchEntry[]; noMatchPa
       "KXWTACHALLENGERMATCH",     // WTA Challenger / WTA 125
       // Esports
       "KXCS2GAME", "KXCS2MAP", "KXLOLGAME", "KXLOLMAP",
-      "KXDOTA2GAME", "KXDOTA2MAP",  // Dota 2 (BO3/BO5 = binary, BO2 = 3-way with TIE → auto-skipped)
+      "KXDOTA2GAME", "KXDOTA2MAP",  // Dota 2 (BO3/BO5 = binary, BO2 = 3-way with TIE -> auto-skipped)
       "KXVALORANTGAME", "KXVALORANTMAP",
       "KXCODGAME", "KXCODMAP",
-      // Hockey — NHL
+      // Hockey -- NHL
       "KXNHLGAME",
-      // Basketball — NBA + international leagues
+      // Basketball -- NBA + international leagues
       "KXNBAGAME",
       "KXNBLGAME",          // NBL (Australia)
       "KXCBAGAME",          // CBA (China)
@@ -2177,7 +2177,7 @@ async function discoverWatchlist(): Promise<{ watchlist: WatchEntry[]; noMatchPa
       "KXATPGAMETOTAL",     // ATP Match Totals (single-ticker binary)
       "KXCS2TOTALMAPS",     // CS2 Total Maps (single-ticker binary)
       "KXLOLTOTALMAPS",     // LoL Total Maps (single-ticker binary)
-      // Soccer spreads & totals (no moneyline — user only wants non-ML)
+      // Soccer spreads & totals (no moneyline -- user only wants non-ML)
       "KXEPLSPREAD", "KXEPLTOTAL",
       "KXMLSSPREAD", "KXMLSTOTAL",
       "KXUCLSPREAD", "KXUCLTOTAL",
@@ -2200,7 +2200,7 @@ async function discoverWatchlist(): Promise<{ watchlist: WatchEntry[]; noMatchPa
 
     let pmMarket: GammaMarket | null = null, pmSlug = "";
 
-    // Step C (FIRST — free, no API calls): scan pre-fetched sports markets by name matching
+    // Step C (FIRST -- free, no API calls): scan pre-fetched sports markets by name matching
     if (pmEsportsMarkets.length > 0) {
       for (const m of pmEsportsMarkets) {
         const mSlug = pickString(m.slug ?? m._eventSlug ?? "");
@@ -2220,7 +2220,7 @@ async function discoverWatchlist(): Promise<{ watchlist: WatchEntry[]; noMatchPa
         const matchByOutcomes = e1Matches.length > 0 && e2Matches.length > 0 &&
             !(e1Matches.length === 1 && e2Matches.length === 1 && e1Matches[0] === e2Matches[0]);
         const matchByTitle = mTitle.includes(normalizeName(e1.name)) && mTitle.includes(normalizeName(e2.name));
-        // CBB alias expansion for title matching (e.g., "UConn" → "connecticut" ⊂ title)
+        // CBB alias expansion for title matching (e.g., "UConn" -> "connecticut" ⊂ title)
         const matchByTitleCBB = isCBB && !matchByTitle &&
             mTitle.includes(cbbExpandName(e1.name)) && mTitle.includes(cbbExpandName(e2.name));
         if (matchByOutcomes || matchByTitle || matchByTitleCBB) {
@@ -2282,10 +2282,10 @@ async function discoverWatchlist(): Promise<{ watchlist: WatchEntry[]; noMatchPa
       continue;
     }
 
-    // ── Outcome verification helper ───────────────────────────────────────────
+    // -- Outcome verification helper -------------------------------------------
     // After slug/event lookup (Steps A/B/D), verify that at least one PM outcome
     // matches at least one Kalshi entity name.  Without this, a slug guess that
-    // happens to return a valid but WRONG market is silently accepted — causing
+    // happens to return a valid but WRONG market is silently accepted -- causing
     // cross-match trades (e.g. CS2 pair matched to a LoL market with NaVi).
     function outcomesSanityCheck(market: GammaMarket | null): boolean {
       if (!market) return false;
@@ -2296,7 +2296,7 @@ async function discoverWatchlist(): Promise<{ watchlist: WatchEntry[]; noMatchPa
       return any1 && any2;  // BOTH players must match an outcome (prevents cross-match trades)
     }
 
-    // Step A: slug guessing (API calls — only if prefetch + cache didn't match)
+    // Step A: slug guessing (API calls -- only if prefetch + cache didn't match)
     if (!pmMarket && pmPrefix && cand.date && !OPAQUE_SLUG_SERIES.has(seriesPrefix)) {
       const isTennis = TENNIS_SERIES.has(seriesPrefix);
       let slugVariants: string[];
@@ -2372,7 +2372,7 @@ async function discoverWatchlist(): Promise<{ watchlist: WatchEntry[]; noMatchPa
             }
           }
         } catch { /* skip */ }
-        // Also try as event slug — esports often have event-level slugs
+        // Also try as event slug -- esports often have event-level slugs
         if (!pmMarket) {
           try {
             const raw = await polyFetch<unknown>(`${gammaBase}/events?slug=${encodeURIComponent(slug)}`);
@@ -2401,7 +2401,7 @@ async function discoverWatchlist(): Promise<{ watchlist: WatchEntry[]; noMatchPa
     // Step B: generic slug guessing for unknown series (esports, UFC, darts, etc.)
     // Polymarket esports slugs typically follow "{team1}-vs-{team2}" at the EVENT level.
     // We try both /markets?slug= and /events?slug= since Polymarket has both hierarchies.
-    // IMPORTANT: Skip Step B when pmPrefix is known — Step A already tried sport-prefixed
+    // IMPORTANT: Skip Step B when pmPrefix is known -- Step A already tried sport-prefixed
     // slug variants.  Generic (unprefixed) slugs risk cross-sport false matches because
     // the same org can compete in multiple games (e.g. TNC in CS2 and MLBB).
     if (!pmMarket && !pmPrefix) {
@@ -2448,7 +2448,7 @@ async function discoverWatchlist(): Promise<{ watchlist: WatchEntry[]; noMatchPa
       }
     }
 
-    // Step D: search API fallback (last resort — mostly broken)
+    // Step D: search API fallback (last resort -- mostly broken)
     // Skip for known series (they should be caught by prefetch or slug guess).
     // Only use for completely unknown series as a last-ditch effort.
     if (!pmMarket && !pmPrefix && !OPAQUE_SLUG_SERIES.has(seriesPrefix)) {
@@ -2462,16 +2462,16 @@ async function discoverWatchlist(): Promise<{ watchlist: WatchEntry[]; noMatchPa
       }
     }
 
-    // ── Type-aware PM resolution ──────────────────────────────────────────────
+    // -- Type-aware PM resolution ----------------------------------------------
     // Steps A-D above find the MONEYLINE PM market (they filter isNonMoneyline).
     // For non-moneyline Kalshi candidates, we derive the PM slug from the cached
     // moneyline base slug or the just-found market's event slug.
 
     if (cand.isBinary) {
-      // ── Binary (spreads, totals, game totals): derive PM slug from base slug + suffix ──
+      // -- Binary (spreads, totals, game totals): derive PM slug from base slug + suffix --
       let baseSlug = moneylineBaseSlugs.get(namePairKey) ?? "";
       // NHL spread/total names ("Toronto") differ from moneyline names ("TOR Maple Leafs")
-      // — try abbreviation-based alias key
+      // -- try abbreviation-based alias key
       if (!baseSlug && seriesPrefix.includes("NHL")) {
         const a1 = nhlNameToAbbr(e1.name), a2 = nhlNameToAbbr(e2.name);
         if (a1 && a2) {
@@ -2483,7 +2483,7 @@ async function discoverWatchlist(): Promise<{ watchlist: WatchEntry[]; noMatchPa
         baseSlug = pickString(pmMarket._eventSlug ?? pmSlug);
       }
       if (!baseSlug) {
-        // Binary needs moneyline base slug — skip if not available
+        // Binary needs moneyline base slug -- skip if not available
         console.log(`[DISCOVER] SKIP (no base slug for binary ${marketType}): ${e1.name} vs ${e2.name}`);
         seenPairs.add(pairKey); noMatchPairs.push(pairKey); continue;
       }
@@ -2497,7 +2497,7 @@ async function discoverWatchlist(): Promise<{ watchlist: WatchEntry[]; noMatchPa
           const ml = parseGammaMarkets(raw);
           if (ml.length && !ml[0].closed && ml[0].clobTokenIds) {
             pmMarket = ml[0]; pmSlug = slug; found = true;
-            console.log(`[DISCOVER] Resolved binary ${marketType} → PM slug: ${slug}`);
+            console.log(`[DISCOVER] Resolved binary ${marketType} -> PM slug: ${slug}`);
             break;
           }
         } catch { /* skip */ }
@@ -2508,7 +2508,7 @@ async function discoverWatchlist(): Promise<{ watchlist: WatchEntry[]; noMatchPa
       }
 
     } else if (marketType === "set_winner") {
-      // ── Set winner: derive PM slug from base slug + first-set-winner-{P1}-vs-{P2} ──
+      // -- Set winner: derive PM slug from base slug + first-set-winner-{P1}-vs-{P2} --
       let baseSlug = moneylineBaseSlugs.get(namePairKey) ?? "";
       if (!baseSlug && pmMarket) {
         baseSlug = pickString(pmMarket._eventSlug ?? pmSlug);
@@ -2538,7 +2538,7 @@ async function discoverWatchlist(): Promise<{ watchlist: WatchEntry[]; noMatchPa
           const ml = parseGammaMarkets(raw);
           if (ml.length && !ml[0].closed && ml[0].clobTokenIds) {
             pmMarket = ml[0]; pmSlug = slug; found = true;
-            console.log(`[DISCOVER] Resolved set_winner → PM slug: ${slug}`);
+            console.log(`[DISCOVER] Resolved set_winner -> PM slug: ${slug}`);
             break;
           }
         } catch { /* skip */ }
@@ -2549,7 +2549,7 @@ async function discoverWatchlist(): Promise<{ watchlist: WatchEntry[]; noMatchPa
       }
 
     } else if (marketType !== "moneyline") {
-      // ── Map N: derive PM slug from moneyline base slug ──
+      // -- Map N: derive PM slug from moneyline base slug --
       const mapNum = marketType.replace("map_", ""); // "1", "2", etc.
       let baseSlug = moneylineBaseSlugs.get(namePairKey) ?? "";
 
@@ -2568,7 +2568,7 @@ async function discoverWatchlist(): Promise<{ watchlist: WatchEntry[]; noMatchPa
         const ml = parseGammaMarkets(raw);
         if (ml.length && !ml[0].closed && ml[0].clobTokenIds) {
           pmMarket = ml[0]; pmSlug = mapSlug;
-          console.log(`[DISCOVER] Resolved ${marketType} → PM slug: ${mapSlug}`);
+          console.log(`[DISCOVER] Resolved ${marketType} -> PM slug: ${mapSlug}`);
         } else {
           console.log(`[DISCOVER] NOT FOUND (PM ${mapSlug} doesn't exist): ${e1.name} vs ${e2.name}`);
           seenPairs.add(pairKey); noMatchPairs.push(pairKey); continue;
@@ -2578,7 +2578,7 @@ async function discoverWatchlist(): Promise<{ watchlist: WatchEntry[]; noMatchPa
         seenPairs.add(pairKey); noMatchPairs.push(pairKey); continue;
       }
     } else {
-      // ── Moneyline: validate PM market is actually moneyline ──
+      // -- Moneyline: validate PM market is actually moneyline --
       if (!pmMarket || !pmSlug) {
         console.log(`[DISCOVER] NOT FOUND on PM: ${e1.name} vs ${e2.name}`);
         seenPairs.add(pairKey); noMatchPairs.push(pairKey); continue;
@@ -2607,8 +2607,8 @@ async function discoverWatchlist(): Promise<{ watchlist: WatchEntry[]; noMatchPa
     }
 
     // Bug 3 fix: if this PM slug is already in the watchlist (another Kalshi market type
-    // matched to the same PM market), skip — prevents same PM token from being traded
-    // from multiple Kalshi angles (e.g. KXLOLMAP + KXLOLGAME both → same handicap slug).
+    // matched to the same PM market), skip -- prevents same PM token from being traded
+    // from multiple Kalshi angles (e.g. KXLOLMAP + KXLOLGAME both -> same handicap slug).
     if (matchedSlugs.has(pmSlug)) {
       console.log(`[DISCOVER] SKIP (dup PM slug ${pmSlug}): ${e1.name} vs ${e2.name}`);
       seenPairs.add(pairKey);
@@ -2616,7 +2616,7 @@ async function discoverWatchlist(): Promise<{ watchlist: WatchEntry[]; noMatchPa
       continue;
     }
 
-    // ── Binary (non-moneyline) WatchEntry creation ─────────────────────────
+    // -- Binary (non-moneyline) WatchEntry creation -------------------------
     // For binary candidates (spreads, totals, game totals): kal1=kal2=same ticker,
     // pm1=first outcome token, pm2=second outcome token.
     // Only dirs A (KAL YES + PM2) and C (KAL NO + PM1) produce valid arbs.
@@ -2654,7 +2654,7 @@ async function discoverWatchlist(): Promise<{ watchlist: WatchEntry[]; noMatchPa
         }
       }
       const kalEntity = cand.e1; // same ticker as e2 (cloned)
-      // e1.name/e2.name were overridden to teamNames — use them for display surnames
+      // e1.name/e2.name were overridden to teamNames -- use them for display surnames
       // so match shows "Detroit vs Los Angeles L" instead of duplicate team names
       const surname1 = cand.e1.name;
       const surname2 = cand.e2.name;
@@ -2667,15 +2667,15 @@ async function discoverWatchlist(): Promise<{ watchlist: WatchEntry[]; noMatchPa
         pm1: { outcome: outcomes[0], tokenId: tokenIds[0], tickSize, minSize, negRisk },
         pm2: { outcome: outcomes[1], tokenId: tokenIds[1], tickSize, minSize, negRisk },
       });
-      console.log(`[DISCOVER] MATCHED BINARY [${seriesPrefix}] ${marketType}: ${surname1} vs ${surname2} → ${pmSlug} (${outcomes[0]}/${outcomes[1]})`);
+      console.log(`[DISCOVER] MATCHED BINARY [${seriesPrefix}] ${marketType}: ${surname1} vs ${surname2} -> ${pmSlug} (${outcomes[0]}/${outcomes[1]})`);
       continue;
     }
 
-    // ── Step E: Soccer 3-way discovery ──────────────────────────────────────
+    // -- Step E: Soccer 3-way discovery --------------------------------------
     // For 3-way candidates, we need to find 3 separate PM binary markets
     // inside the PM event (home-win, draw, away-win).
     if (cand.is3Way && cand.e3) {
-      // Get PM event sub-markets — try prefetch cache first (free), then API fallback
+      // Get PM event sub-markets -- try prefetch cache first (free), then API fallback
       const eventSlug = (pmMarket as any)?._eventSlug ?? pmSlug;
       let pmEventMarkets: GammaMarket[] = pmEventIndex.get(eventSlug) ?? [];
       // Prefetch only stores 2-outcome markets; for 3-way we need all sub-markets from the event
@@ -2694,7 +2694,7 @@ async function discoverWatchlist(): Promise<{ watchlist: WatchEntry[]; noMatchPa
       }
 
       // Match each PM sub-market to: Home team, Away team, Draw
-      // Use slug SUFFIX (last segment after date) to avoid false matches — the event base
+      // Use slug SUFFIX (last segment after date) to avoid false matches -- the event base
       // slug contains both team abbreviations (e.g. epl-tot-not-2026-03-22), so .includes()
       // would match both teams on every sub-market.
       let pmHome: GammaMarket | null = null, pmAway: GammaMarket | null = null, pmDraw: GammaMarket | null = null;
@@ -2756,7 +2756,7 @@ async function discoverWatchlist(): Promise<{ watchlist: WatchEntry[]; noMatchPa
         pm2: { outcome: pm2Token.outcome, tokenId: pm2Token.tokenId, noTokenId: pm2Token.noTokenId, tickSize: pm2Token.tickSize, minSize: pm2Token.minSize, negRisk: pm2Token.negRisk },
         pm3: { outcome: pm3Token.outcome, tokenId: pm3Token.tokenId, noTokenId: pm3Token.noTokenId, tickSize: pm3Token.tickSize, minSize: pm3Token.minSize, negRisk: pm3Token.negRisk },
       });
-      console.log(`[DISCOVER] MATCHED 3-WAY [${seriesPrefix}]: ${e1.name} vs ${e2.name} (draw) → ${pmSlug}`);
+      console.log(`[DISCOVER] MATCHED 3-WAY [${seriesPrefix}]: ${e1.name} vs ${e2.name} (draw) -> ${pmSlug}`);
       continue;
     }
 
@@ -2829,10 +2829,10 @@ async function discoverWatchlist(): Promise<{ watchlist: WatchEntry[]; noMatchPa
       continue;
     }
 
-    // ── Cross-validate PM tokenId mapping by fetching actual CLOB prices ──────
+    // -- Cross-validate PM tokenId mapping by fetching actual CLOB prices ------
     // IMPORTANT: Only apply price-based swap when BOTH name matches are ambiguous
     // (e.g. abbreviation-only matches). When findToken() made confident name matches,
-    // trust the names — price divergence between platforms is expected (that's the arb).
+    // trust the names -- price divergence between platforms is expected (that's the arb).
     const pm1NameConfident = namesMatch(e1.name, pm1Info.outcome);
     const pm2NameConfident = namesMatch(e2.name, pm2Info.outcome);
     const bothNamesConfident = pm1NameConfident && pm2NameConfident;
@@ -2848,22 +2848,22 @@ async function discoverWatchlist(): Promise<{ watchlist: WatchEntry[]; noMatchPa
         const diff_swapped = Math.abs(e1.yesAsk - ask2) + Math.abs(e2.yesAsk - ask1);
         if (diff_swapped < diff_correct - 0.10) {
           if (bothNamesConfident) {
-            // Names matched confidently — price divergence is the arb opportunity, not a mapping error.
+            // Names matched confidently -- price divergence is the arb opportunity, not a mapping error.
             // Log but do NOT swap.
             console.log(
               `[DISCOVER] Price divergence (expected for arb): ${e1.name}/${e2.name}` +
               ` KAL=[${fmtPct(e1.yesAsk)},${fmtPct(e2.yesAsk)}]` +
               ` PM=[${fmtPct(ask1)},${fmtPct(ask2)}]` +
               ` diff_correct=${diff_correct.toFixed(2)} diff_swapped=${diff_swapped.toFixed(2)}` +
-              ` — names confident, NOT swapping`
+              ` -- names confident, NOT swapping`
             );
           } else {
             console.warn(
-              `[DISCOVER] ⚠ TOKEN SWAP DETECTED: ${e1.name}/${e2.name}` +
+              `[DISCOVER] [!] TOKEN SWAP DETECTED: ${e1.name}/${e2.name}` +
               ` KAL=[${fmtPct(e1.yesAsk)},${fmtPct(e2.yesAsk)}]` +
               ` PM=[${fmtPct(ask1)},${fmtPct(ask2)}]` +
               ` diff_correct=${diff_correct.toFixed(2)} diff_swapped=${diff_swapped.toFixed(2)}` +
-              ` — swapping pm1↔pm2`
+              ` -- swapping pm1↔pm2`
             );
             [pm1Info, pm2Info] = [pm2Info, pm1Info];
           }
@@ -2882,14 +2882,14 @@ async function discoverWatchlist(): Promise<{ watchlist: WatchEntry[]; noMatchPa
       pm1: { outcome: pm1Info.outcome, tokenId: pm1Info.tokenId, tickSize, minSize, negRisk },
       pm2: { outcome: pm2Info.outcome, tokenId: pm2Info.tokenId, tickSize, minSize, negRisk },
     });
-    console.log(`[DISCOVER] MATCHED [${seriesPrefix || cand.eventTicker}] ${marketType}: ${e1.name} vs ${e2.name} → ${pmSlug} (tick=${tickSize} negRisk=${negRisk})`);
+    console.log(`[DISCOVER] MATCHED [${seriesPrefix || cand.eventTicker}] ${marketType}: ${e1.name} vs ${e2.name} -> ${pmSlug} (tick=${tickSize} negRisk=${negRisk})`);
   }
 
   console.log(`[DISCOVER] Watchlist: ${watchlist.length} matched cross-platform pairs`);
   return { watchlist, noMatchPairs };
 }
 
-// ─── Price polling ────────────────────────────────────────────────────────────
+// --- Price polling ------------------------------------------------------------
 
 async function refreshKalshiPrices(watchlist: WatchEntry[]): Promise<void> {
   const kalBase = process.env.KALSHI_BASE_URL ?? "https://api.elections.kalshi.com/trade-api/v2";
@@ -2951,7 +2951,7 @@ async function fetchPmAsk(tokenId: string, clobBase: string): Promise<number | n
   }
 }
 
-/** Direct PM book fetch — bypasses polyQueue for use in parallel batch loops. */
+/** Direct PM book fetch -- bypasses polyQueue for use in parallel batch loops. */
 async function fetchPmAskDirect(tokenId: string, clobBase: string): Promise<number | null> {
   try {
     const book = await fetchJsonWithRetry<{ asks?: unknown }>(
@@ -3032,13 +3032,13 @@ async function fetchKalshiSingleMarket(ticker: string): Promise<{ ask: number | 
   }
 }
 
-// ─── PM client factory ────────────────────────────────────────────────────────
+// --- PM client factory --------------------------------------------------------
 
-// Cached PM ClobClient — avoids recreating Wallet + ClobClient + creds on every call.
+// Cached PM ClobClient -- avoids recreating Wallet + ClobClient + creds on every call.
 // resolvePolyApiCreds already has its own module-level cache, but we also avoid
 // the ~10ms overhead of new Wallet() + new ClobClient() constructor per call.
 let _pmClientCache: { client: ClobClient; createdAt: number } | null = null;
-const PM_CLIENT_TTL = 30 * 60_000; // 30 minutes — re-derive if creds might have rotated
+const PM_CLIENT_TTL = 30 * 60_000; // 30 minutes -- re-derive if creds might have rotated
 
 async function createPmClient() {
   if (_pmClientCache && Date.now() - _pmClientCache.createdAt < PM_CLIENT_TTL) {
@@ -3056,7 +3056,7 @@ async function createPmClient() {
   return _pmClientCache;
 }
 
-// PM CLOB requires makerAmount (= price * size in USDC) to have ≤2 decimal places.
+// PM CLOB requires makerAmount (= price * size in USDC) to have <=2 decimal places.
 // When tick=0.001, certain (price, shares) combos produce 3+ dp costs (e.g. 0.929*16=14.864).
 // Fix: floor the total cost to 2dp and derive an adjusted price that the CLOB will accept.
 function pmSafePrice(price: number, shares: number): number {
@@ -3134,9 +3134,9 @@ async function getPmOrderFills(orderId: string): Promise<{ filledShares: number;
   return { filledShares, status };
 }
 
-// ─── Kalshi IOC order builder ─────────────────────────────────────────────────
+// --- Kalshi IOC order builder -------------------------------------------------
 // Builds an Immediate-Or-Cancel Kalshi YES order. IOC fills whatever resting volume
-// is available and cancels the rest — no exposure if the book is thin.
+// is available and cancels the rest -- no exposure if the book is thin.
 
 type KalshiOrderRequest = {
   ticker: string;
@@ -3154,7 +3154,7 @@ type KalshiOrderRequest = {
 
 function buildKalshiIOCOrder(ticker: string, limitPriceDec: number, count: number, side: "yes" | "no" = "yes"): KalshiOrderRequest {
   // Kalshi limit price: to sweep the book up to our profitability boundary, use the
-  // market best ask (snapshot). IOC will fill at any price ≤ this limit.
+  // market best ask (snapshot). IOC will fill at any price <= this limit.
   const cents = Math.max(1, Math.min(99, Math.round(limitPriceDec * 100)));
   const maxCost = Math.round(count * cents); // in cents
   return {
@@ -3173,7 +3173,7 @@ function buildKalshiIOCOrder(ticker: string, limitPriceDec: number, count: numbe
 
 // Derive YES ask levels from the NO bid side of the Kalshi orderbook.
 // Kalshi orderbook: `yes` = YES bids, `no` = NO bids.
-// A NO bid at X¢ is equivalent to a YES ask at (100-X)¢.
+// A NO bid at Xc is equivalent to a YES ask at (100-X)c.
 // Returns [[yesAskCents, size], ...] sorted ascending (cheapest YES ask first).
 function deriveYesAsks(noBids: [number, number][]): [number, number][] {
   return noBids
@@ -3183,7 +3183,7 @@ function deriveYesAsks(noBids: [number, number][]): [number, number][] {
 }
 
 // Derive NO ask levels from the YES bid side of the Kalshi orderbook.
-// A YES bid at X¢ is equivalent to a NO ask at (100-X)¢.
+// A YES bid at Xc is equivalent to a NO ask at (100-X)c.
 // Returns [[noAskCents, size], ...] sorted ascending (cheapest NO ask first).
 function deriveNoAsks(yesBids: [number, number][]): [number, number][] {
   return yesBids
@@ -3217,7 +3217,7 @@ function sweepKalshiDepth(
   return { totalQty, worstPrice, avgPrice: totalCost / totalQty };
 }
 
-// ─── Polymarket execution (token-based) ───────────────────────────────────────
+// --- Polymarket execution (token-based) ---------------------------------------
 
 async function placePmOrder(
   tokenId: string,
@@ -3239,7 +3239,7 @@ async function placePmOrder(
   );
 }
 
-// ─── PM pre-sign / post (two-step order for parallel execution) ───────────────
+// --- PM pre-sign / post (two-step order for parallel execution) ---------------
 // Pre-sign the PM order while Kalshi IOC is in flight, then post immediately
 // after Kalshi fills. Saves ~100-200ms of EIP-712 signing overhead.
 
@@ -3266,7 +3266,7 @@ async function postPreSignedPmOrder(signedOrder: unknown): Promise<unknown> {
   return (client as any).postOrder(signedOrder, PM_ORDER_TYPE);
 }
 
-// Dedicated FOK order for hedge IOC sweeps — always uses FOK regardless of PM_ORDER_TYPE config.
+// Dedicated FOK order for hedge IOC sweeps -- always uses FOK regardless of PM_ORDER_TYPE config.
 // This prevents a GTC config from accidentally placing resting orders during aggressive sweeps.
 async function placePmFOK(
   tokenId: string,
@@ -3288,7 +3288,7 @@ async function placePmFOK(
   );
 }
 
-// FOK SELL — aggressive sell into bids. Used by cancellation monitor for emergency exits.
+// FOK SELL -- aggressive sell into bids. Used by cancellation monitor for emergency exits.
 async function placePmFOKSell(
   tokenId: string,
   price: number,
@@ -3309,7 +3309,7 @@ async function placePmFOKSell(
   );
 }
 
-// ─── PM order status polling ──────────────────────────────────────────────────
+// --- PM order status polling --------------------------------------------------
 // When Polymarket returns status=delayed the order is on-chain but not yet confirmed.
 // This can take 1–30 seconds. We poll until it resolves before deciding to hedge.
 
@@ -3317,10 +3317,10 @@ async function waitForPmOrderFill(
   orderId: string,
   timeoutMs = 12_000,
   tokenId?: string,
-  preBalance = 0 // on-chain balance BEFORE order was placed — detect increments, not totals
+  preBalance = 0 // on-chain balance BEFORE order was placed -- detect increments, not totals
 ): Promise<"matched" | "cancelled" | "timeout"> {
   const deadline = Date.now() + timeoutMs;
-  const pollInterval = 500; // fixed 500ms — no backoff, detect fills ASAP
+  const pollInterval = 500; // fixed 500ms -- no backoff, detect fills ASAP
 
   while (Date.now() < deadline) {
     await sleep(pollInterval);
@@ -3333,8 +3333,8 @@ async function waitForPmOrderFill(
           console.log(`  [PM FILL] On-chain balance confirms fill: ${bal} shares (was ${preBalance} before order)`);
           return "matched";
         }
-        // bal <= preBalance → not yet settled on-chain, continue polling
-        // bal === -1 → RPC error, fall through to CLOB API check
+        // bal <= preBalance -> not yet settled on-chain, continue polling
+        // bal === -1 -> RPC error, fall through to CLOB API check
       } catch { /* fall through to CLOB API */ }
     }
 
@@ -3353,7 +3353,7 @@ async function waitForPmOrderFill(
   return "timeout";
 }
 
-// ─── Hedge state persistence ──────────────────────────────────────────────────
+// --- Hedge state persistence --------------------------------------------------
 
 const HEDGE_STATE_PATH = "hedge_state.json";
 
@@ -3395,12 +3395,12 @@ function saveHedgeStates(states: HedgeState[]): void {
   }
 }
 
-// ─── Arb P&L persistence ──────────────────────────────────────────────────────
+// --- Arb P&L persistence ------------------------------------------------------
 
 const ARB_LOG_PATH = path.join("data", "arb_trades.json");
 const PENDING_FILLS_PATH = path.join("data", "pending_fills.json");
 
-// ─── Pending fill log (crash recovery) ──────────────────────────────────────
+// --- Pending fill log (crash recovery) --------------------------------------
 // Write intent BEFORE placing an order so that if the bot crashes between fill
 // and logArbTrade(), reconcile can recover the orphaned position on restart.
 
@@ -3451,7 +3451,7 @@ function getIncompletePendingFills(): PendingFill[] {
   return loadPendingFills().filter(f => !f.completed);
 }
 
-// ─── Ghost fill detection (WSS callback) ─────────────────────────────────────
+// --- Ghost fill detection (WSS callback) -------------------------------------
 // When a PM fill arrives on-chain via WSS, check if it matches an incomplete
 // pending fill from a previous "pm-delayed-zero" abort. If found, look for
 // a hedging trade on the same market and resolve it, or trigger reconciliation.
@@ -3461,19 +3461,19 @@ async function handleGhostFill(tokenId: string, shares: number, txHash: string):
   const ghostPf = pendingFills.find(pf =>
     !pf.completed && pf.exchange === "pm" && pf.pmTokenId === tokenId
   );
-  if (!ghostPf) return; // Not a ghost fill — normal fill, ignore
+  if (!ghostPf) return; // Not a ghost fill -- normal fill, ignore
 
   // Guard: if this pending fill belongs to the CURRENTLY RUNNING execution, skip.
-  // The WSS on-chain event fires 2-4s before the PM API poll confirms — during that
+  // The WSS on-chain event fires 2-4s before the PM API poll confirms -- during that
   // window the pending fill is still incomplete but the execution is actively waiting
   // for it. Let the execution path handle it; don't create a duplicate ghost trade.
   if (_activePendingFillId === ghostPf.id) {
-    console.log(`[GHOST] Skipping — pending fill ${ghostPf.id} belongs to active execution (WSS arrived before PM API confirm). Execution will handle it.`);
+    console.log(`[GHOST] Skipping -- pending fill ${ghostPf.id} belongs to active execution (WSS arrived before PM API confirm). Execution will handle it.`);
     return;
   }
 
   console.warn(
-    `\n[GHOST] Detected ghost fill: ${shares}× token=...${tokenId.slice(-12)} (tx=${txHash.slice(0, 18)}...)` +
+    `\n[GHOST] Detected ghost fill: ${shares}x token=...${tokenId.slice(-12)} (tx=${txHash.slice(0, 18)}...)` +
     `\n[GHOST] Matches pending fill ${ghostPf.id}: ${ghostPf.match} ${ghostPf.pmOutcome} @$${ghostPf.price}` +
     `\n[GHOST] This was a delayed PM order that appeared to fail but settled on-chain.`
   );
@@ -3488,7 +3488,7 @@ async function handleGhostFill(tokenId: string, shares: number, txHash: string):
   );
 
   if (hedgingTrade) {
-    // The hedge trade was waiting for PM shares — they just arrived as a ghost fill!
+    // The hedge trade was waiting for PM shares -- they just arrived as a ghost fill!
     // Use the actual fill price from the CLOB API if possible, fall back to pending fill price
     const actualPrice = ghostPf.price;
     const pmCost = Math.round(hedgingTrade.shares * actualPrice * 100) / 100;
@@ -3496,7 +3496,7 @@ async function handleGhostFill(tokenId: string, shares: number, txHash: string):
     const costPerShare = totalCost / Math.max(hedgingTrade.shares, 1);
 
     if (costPerShare < 1) {
-      // Profitable — resolve the trade
+      // Profitable -- resolve the trade
       hedgingTrade.status = "resolved";
       hedgingTrade.resolutionMethod = "hedge-complete";
       hedgingTrade.resolvedTs = new Date().toISOString();
@@ -3506,16 +3506,16 @@ async function handleGhostFill(tokenId: string, shares: number, txHash: string):
       hedgingTrade.realizedPnl = Math.round((hedgingTrade.shares - totalCost) * 100) / 100;
       saveArbTrades(trades);
       console.warn(
-        `[GHOST] Resolved trade ${hedgingTrade.id}: ${hedgingTrade.match} — ghost PM fill @${(actualPrice * 100).toFixed(0)}¢ ` +
-        `combined $${costPerShare.toFixed(2)}/sh → P&L=$${hedgingTrade.realizedPnl!.toFixed(2)}`
+        `[GHOST] Resolved trade ${hedgingTrade.id}: ${hedgingTrade.match} -- ghost PM fill @${(actualPrice * 100).toFixed(0)}c ` +
+        `combined $${costPerShare.toFixed(2)}/sh -> P&L=$${hedgingTrade.realizedPnl!.toFixed(2)}`
       );
     } else {
-      // Cost >= $1 — linking them would be a guaranteed loss.
+      // Cost >= $1 -- linking them would be a guaranteed loss.
       // Treat as 2 independent unhedged positions, each hedging at breakeven via normal hedge loop.
-      // Don't link ghost PM to the KAL trade — create a separate trade for the ghost PM position.
+      // Don't link ghost PM to the KAL trade -- create a separate trade for the ghost PM position.
       console.warn(
         `[GHOST] Combined cost $${costPerShare.toFixed(2)}/sh >= $1.00 for ${hedgingTrade.match}. ` +
-        `Treating as 2 independent positions — each will hedge at breakeven.`
+        `Treating as 2 independent positions -- each will hedge at breakeven.`
       );
       const ghostTrade: ArbTradeRecord = {
         id: `arb-ghost-${Date.now()}-pm`,
@@ -3540,13 +3540,13 @@ async function handleGhostFill(tokenId: string, shares: number, txHash: string):
       trades.push(ghostTrade);
       saveArbTrades(trades);
       console.warn(
-        `[GHOST] Created ghost trade ${ghostTrade.id}: ${ghostTrade.shares}×${ghostPf.pmOutcome} @${(actualPrice * 100).toFixed(0)}¢ — ` +
-        `will hedge at max ${((1 - actualPrice) * 100).toFixed(0)}¢ on KAL. ` +
-        `Original KAL trade ${hedgingTrade.id} stays in hedge mode — will hedge at max ${((1 - hedgingTrade.kalCost / Math.max(hedgingTrade.shares, 1)) * 100).toFixed(0)}¢ on PM.`
+        `[GHOST] Created ghost trade ${ghostTrade.id}: ${ghostTrade.shares}x${ghostPf.pmOutcome} @${(actualPrice * 100).toFixed(0)}c -- ` +
+        `will hedge at max ${((1 - actualPrice) * 100).toFixed(0)}c on KAL. ` +
+        `Original KAL trade ${hedgingTrade.id} stays in hedge mode -- will hedge at max ${((1 - hedgingTrade.kalCost / Math.max(hedgingTrade.shares, 1)) * 100).toFixed(0)}c on PM.`
       );
     }
   } else {
-    // No matching hedging trade — create a new hedge trade for the ghost PM position.
+    // No matching hedging trade -- create a new hedge trade for the ghost PM position.
     const ghostTrade: ArbTradeRecord = {
       id: `arb-ghost-${Date.now()}-pm`,
       ts: new Date().toISOString(),
@@ -3573,15 +3573,15 @@ async function handleGhostFill(tokenId: string, shares: number, txHash: string):
     // Signal the main loop to pick up this new hedging trade immediately
     _reconcileRecoveredTrades = true;
     console.warn(
-      `[GHOST] Created orphan ghost trade ${ghostTrade.id}: ${shares}×${ghostPf.pmOutcome} @${(ghostPf.price * 100).toFixed(0)}¢ — ` +
-      `entering hedge mode (max KAL hedge = ${((1 - ghostPf.price) * 100).toFixed(0)}¢).`
+      `[GHOST] Created orphan ghost trade ${ghostTrade.id}: ${shares}x${ghostPf.pmOutcome} @${(ghostPf.price * 100).toFixed(0)}c -- ` +
+      `entering hedge mode (max KAL hedge = ${((1 - ghostPf.price) * 100).toFixed(0)}c).`
     );
   }
 }
 
-// ─── Kalshi orderbook pre-cache ──────────────────────────────────────────────
+// --- Kalshi orderbook pre-cache ----------------------------------------------
 const kalBookCache = new Map<string, { book: { yes: [number, number][]; no: [number, number][] }; ts: number }>();
-const BOOK_CACHE_TTL = 3000; // 3s — stale books fall through to live fetch
+const BOOK_CACHE_TTL = 3000; // 3s -- stale books fall through to live fetch
 
 function loadArbTrades(): ArbTradeRecord[] {
   try {
@@ -3594,7 +3594,7 @@ function saveArbTrades(trades: ArbTradeRecord[]): void {
   atomicWriteFileSync(ARB_LOG_PATH, JSON.stringify(trades, null, 2));
 }
 
-// Active pending fill ID for current execution — set before order placement,
+// Active pending fill ID for current execution -- set before order placement,
 // auto-completed when logArbTrade succeeds. Cleared on abort (no exposure).
 let _activePendingFillId: string | null = null;
 
@@ -3604,7 +3604,7 @@ function logArbTrade(record: ArbTradeRecord): void {
   trades.push(record);
   saveArbTrades(trades);
   console.log(`[P&L] Logged arb: ${record.match} dir=${record.dir} status=${record.status} cost=$${record.totalCost.toFixed(2)}`);
-  // Auto-complete pending fill — this trade is now safely persisted
+  // Auto-complete pending fill -- this trade is now safely persisted
   if (_activePendingFillId) {
     completePendingFill(_activePendingFillId);
     console.log(`[PENDING] Completed pending fill ${_activePendingFillId}`);
@@ -3614,7 +3614,7 @@ function logArbTrade(record: ArbTradeRecord): void {
   pushTradeData(trades, loadMetrics()).catch(() => {});
 }
 
-// ─── Execution metrics persistence ──────────────────────────────────────────
+// --- Execution metrics persistence ------------------------------------------
 
 const METRICS_PATH = path.join("data", "execution_metrics.json");
 
@@ -3629,7 +3629,7 @@ function appendMetric(m: ExecMetric): void {
   atomicWriteFileSync(METRICS_PATH, JSON.stringify(metrics, null, 2));
 }
 
-// ─── Depth opportunity logger ────────────────────────────────────────────────
+// --- Depth opportunity logger ------------------------------------------------
 // Logs the FULL profitable depth available on both sides whenever an arb is found,
 // regardless of our budget limit. Helps assess whether more capital would help.
 
@@ -3657,8 +3657,8 @@ interface DepthOpportunity {
   pmAvgPrice: number;
   // Combined
   maxProfitableShares: number; // min(kalTotal, pmTotal)
-  maxInvestableUsd: number;    // shares × (kalAvg + pmAvg)
-  projectedPnlUsd: number;    // shares × edge (approx)
+  maxInvestableUsd: number;    // shares x (kalAvg + pmAvg)
+  projectedPnlUsd: number;    // shares x edge (approx)
   budgetShares: number;        // what we actually trade with our budget
 }
 
@@ -3676,7 +3676,7 @@ function appendDepthOpportunity(opp: DepthOpportunity): void {
   atomicWriteFileSync(DEPTH_OPP_PATH, JSON.stringify(all, null, 2));
 }
 
-// Sweep ALL profitable depth (no qty limit) — returns every level and totals
+// Sweep ALL profitable depth (no qty limit) -- returns every level and totals
 function sweepFullProfitableDepth(
   askLevels: [number, number][],
   maxPrice: number,
@@ -3694,16 +3694,16 @@ function sweepFullProfitableDepth(
   return { levels, totalQty, totalCost, avgPrice: totalQty > 0 ? totalCost / totalQty : 0 };
 }
 
-// ─── Continuous book snapshot tracker ─────────────────────────────────────────
+// --- Continuous book snapshot tracker -----------------------------------------
 // On arb discovery, samples both orderbooks every 500ms for 20s and saves to disk.
 // Lets you audit exactly what the books looked like around execution time.
 
 interface BookSample {
   t: number;          // ms offset from tracker start
-  kalYesBids: [number, number][];  // [priceCents, size][] — YES bids (resting buy YES)
+  kalYesBids: [number, number][];  // [priceCents, size][] -- YES bids (resting buy YES)
   kalNoBids: [number, number][];   // NO bids (resting buy NO)
-  kalYesAsks: [number, number][];  // derived YES asks (100 - noBidPrice) — cost to BUY YES
-  kalNoAsks: [number, number][];   // derived NO asks (100 - yesBidPrice) — cost to BUY NO
+  kalYesAsks: [number, number][];  // derived YES asks (100 - noBidPrice) -- cost to BUY YES
+  kalNoAsks: [number, number][];   // derived NO asks (100 - yesBidPrice) -- cost to BUY NO
   pmAsks: [number, number][];  // [priceDecimal, size][]
   pmBids: [number, number][];  // [priceDecimal, size][]
   source: "ws" | "rest" | "mixed";
@@ -3766,7 +3766,7 @@ function startBookTracker(
     const t = Date.now() - startMs;
     let source: BookSample["source"] = "ws";
 
-    // Kalshi: WS first — capture full book (both bids and derived asks)
+    // Kalshi: WS first -- capture full book (both bids and derived asks)
     const kalWs = getWsKalBook(kalTicker);
     let kalYesBids: [number, number][] = [];
     let kalNoBids: [number, number][] = [];
@@ -3781,7 +3781,7 @@ function startBookTracker(
       kalNoAsks = kalYesBids.map(([p, s]) => [100 - p, s] as [number, number]).sort((a, b) => a[0] - b[0]);
     } else {
       source = "rest";
-      // Fire-and-forget REST fetch — will appear in next sample
+      // Fire-and-forget REST fetch -- will appear in next sample
       fetchKalshiOrderbook(kalTicker).then(book => {
         if (book) {
           const wsBook: WsLiveBook = {
@@ -3794,7 +3794,7 @@ function startBookTracker(
       }).catch(() => {});
     }
 
-    // PM: WS first — capture top 20 levels
+    // PM: WS first -- capture top 20 levels
     const pmWsAsks = getWsPmAsks(pmTokenId);
     const pmWsBids = getWsPmBids(pmTokenId);
     const pmAsks: [number, number][] = pmWsAsks ? pmWsAsks.slice(0, 20) : [];
@@ -3824,7 +3824,7 @@ function getWsPmBids(tokenId: string): [number, number][] | null {
   if (!book || Date.now() - book.ts > PM_WS_STALE_MS) return null;
   const arr: [number, number][] = [];
   for (const [price, size] of book.bids) {
-    if (size > 0) arr.push([price / 100, size]); // convert cents → decimal
+    if (size > 0) arr.push([price / 100, size]); // convert cents -> decimal
   }
   return arr.sort((a, b) => b[0] - a[0]); // highest bid first
 }
@@ -3849,7 +3849,7 @@ function resolveArbTrade(kalTicker: string, updates: Partial<ArbTradeRecord>, tr
   console.log(`[P&L] Resolved: ${trades[idx].match} method=${updates.resolutionMethod}${rpnl}`);
 }
 
-// ─── Post-Resolution Fill Audit (Option D) ──────────────────────────────────
+// --- Post-Resolution Fill Audit (Option D) ----------------------------------
 // After resolving a hedge-complete trade, checks Kalshi fills for untracked buys
 // (e.g., race condition where GTC fills after cancel). Corrects costs and P&L.
 async function postResolutionFillAudit(kalTicker: string, tradeId: string): Promise<void> {
@@ -3888,15 +3888,15 @@ async function postResolutionFillAudit(kalTicker: string, tradeId: string): Prom
     // Check if another trade shares this ticker (shared ticker = don't audit)
     const sharedCount = trades.filter(t => t.kalTicker === kalTicker).length;
     if (sharedCount > 1) {
-      console.log(`[AUDIT] Ticker ${kalTicker} shared by ${sharedCount} trades — skipping fill audit`);
+      console.log(`[AUDIT] Ticker ${kalTicker} shared by ${sharedCount} trades -- skipping fill audit`);
       return;
     }
 
     console.warn(
-      `\n[AUDIT] ⚠ Fill discrepancy for ${kalTicker} (trade ${tradeId}):\n` +
+      `\n[AUDIT] [!] Fill discrepancy for ${kalTicker} (trade ${tradeId}):\n` +
       `  Exchange: ${actualBuyCount} buys, cost=$${actualBuyCost.toFixed(2)}, fees=$${actualFees.toFixed(2)}, total=$${totalExchangeCost.toFixed(2)}\n` +
       `  Tracked:  kalCost=$${trackedKalCost.toFixed(2)}, kalFees=$${trackedKalFees.toFixed(2)}, total=$${totalTrackedCost.toFixed(2)}\n` +
-      `  Δ = $${discrepancy.toFixed(2)} — correcting trade record`
+      `  Δ = $${discrepancy.toFixed(2)} -- correcting trade record`
     );
 
     // Correct the trade: update kalCost to include ALL exchange buys
@@ -3920,26 +3920,26 @@ async function postResolutionFillAudit(kalTicker: string, tradeId: string): Prom
   }
 }
 
-// ─── Position Reconciliation ─────────────────────────────────────────────────
+// --- Position Reconciliation -------------------------------------------------
 // Fetches ground truth from both exchanges and corrects arb_trades.json.
 // Runs on startup + every hour to keep P&L log accurate.
 
 let _reconcileSnapshot = new Map<string, Record<string, unknown>>();
 let _reconcileTrigger = "startup";
 
-// ── Reconcile sub-steps (extracted for readability) ──────────────────────────
+// -- Reconcile sub-steps (extracted for readability) --------------------------
 
 /** (c2) Repair PM costs using CLOB getTrades() API + on-chain fallback. Mutates trades in place. */
 async function repairPmCostsFromClob(trades: ArbTradeRecord[]): Promise<{ repaired: number; changed: boolean }> {
   let repaired = 0;
   let changed = false;
-  // Include resolved trades with pmCost=0 — section (a) may have resolved via settlement
+  // Include resolved trades with pmCost=0 -- section (a) may have resolved via settlement
   // before CLOB repair ran, leaving pmCost=0 on trades that actually had PM fills.
   const needRepair = trades.filter(t => t.pmTokenId && t.pmCost === 0 && t.pmFillPrice === 0);
   if (needRepair.length === 0) return { repaired, changed };
 
   // Retry CLOB getTrades() up to 5 times with exponential backoff.
-  // No estimated fallback — we only use actual exchange data.
+  // No estimated fallback -- we only use actual exchange data.
   const MAX_CLOB_RETRIES = 5;
   type ClobFill = { asset_id: string; size: string; price: string; fee_rate_bps: string; side: string; status: string; match_time: string };
   let clobTrades: ClobFill[] | null = null;
@@ -3985,7 +3985,7 @@ async function repairPmCostsFromClob(trades: ArbTradeRecord[]): Promise<{ repair
         const dist = Math.abs(fillSec - tradeSec);
         if (dist < bestDist) { bestDist = dist; bestIdx = i; }
       }
-      // Hedge trades may have PM fills minutes/hours after KAL fill — allow wider window
+      // Hedge trades may have PM fills minutes/hours after KAL fill -- allow wider window
       const maxDistSec = (trade.status === "resolved" || trade.initialExchange === "kal") ? 7200 : 60;
       if (bestIdx < 0 || bestDist > maxDistSec) continue;
       used.add(bestIdx);
@@ -4004,9 +4004,9 @@ async function repairPmCostsFromClob(trades: ArbTradeRecord[]): Promise<{ repair
         const payout = trade.shares; // arb guarantees $1/share when both legs exist
         const oldPnl = trade.realizedPnl;
         trade.realizedPnl = Math.round((payout - trade.kalCost - trade.pmCost - hedgeCost) * 100) / 100;
-        console.log(`[RECONCILE]   PM CLOB P&L fix: ${trade.match} → P&L $${oldPnl.toFixed(2)}→$${trade.realizedPnl.toFixed(2)} (pmCost was missing)`);
+        console.log(`[RECONCILE]   PM CLOB P&L fix: ${trade.match} -> P&L $${oldPnl.toFixed(2)}->$${trade.realizedPnl.toFixed(2)} (pmCost was missing)`);
       }
-      console.log(`[RECONCILE]   PM CLOB repair: ${trade.match} → pmFP=${avgPrice} pmCost=$${trade.pmCost.toFixed(2)} (ts-matched)`);
+      console.log(`[RECONCILE]   PM CLOB repair: ${trade.match} -> pmFP=${avgPrice} pmCost=$${trade.pmCost.toFixed(2)} (ts-matched)`);
       repaired++;
       changed = true;
     }
@@ -4033,7 +4033,7 @@ async function verifyAndFixPnl(
     if (trade.resolutionMethod === "hedge-complete") {
       const payout = trade.shares;
       // New-style trades (initialExchange set): the hedge loop already merged hedge costs into
-      // kalCost+pmCost (e.g., PM-initial → pmCost = initialCost + hedgeFillCostPm). Don't double-count.
+      // kalCost+pmCost (e.g., PM-initial -> pmCost = initialCost + hedgeFillCostPm). Don't double-count.
       // EXCEPTION: partial-fill trades have 3 independent cost components (kalCost + pmCost + hedgeCost)
       // when both KAL partially filled AND PM hedge covered remaining. Detect by checking if
       // both kalCost > 0 AND pmCost > 0 AND hedgeCost > 0 AND hedgeCost ≠ kalCost/pmCost.
@@ -4052,7 +4052,7 @@ async function verifyAndFixPnl(
         // New-style standard: hedgeCost is a duplicate of one leg
         hc = 0;
       }
-      // kalCost already includes kalFees (baked in at resolve time) — do NOT add kalFees again
+      // kalCost already includes kalFees (baked in at resolve time) -- do NOT add kalFees again
       trade.totalCost = Math.round((trade.kalCost + hc + trade.pmCost) * 100) / 100;
       correctPnl = payout - trade.totalCost;
     } else {
@@ -4074,10 +4074,10 @@ async function verifyAndFixPnl(
       {
         // Same logic: new-style trades have hedge costs merged into kalCost/pmCost by the hedge loop.
         const hcS = !trade.initialExchange && ((trade.pmCost === 0 || trade.kalCost === 0) && (trade.hedgeCost ?? 0) > 0) ? (trade.hedgeCost ?? 0) : 0;
-        // If hedge exists (opposite side bought on either exchange), both sides covered → payout = shares
+        // If hedge exists (opposite side bought on either exchange), both sides covered -> payout = shares
         const kalPayout = hcS > 0 ? trade.shares : ((hasKal && kalSideWon) ? trade.shares : 0);
         const pmPayout = hcS > 0 ? 0 : ((hasPm && !kalSideWon) ? trade.shares : 0);
-        // kalCost already includes kalFees — do NOT subtract kalFees separately
+        // kalCost already includes kalFees -- do NOT subtract kalFees separately
         correctPnl = kalPayout + pmPayout - trade.kalCost - hcS - trade.pmCost;
       }
       const hcS2 = !trade.initialExchange && ((trade.pmCost === 0 || trade.kalCost === 0) && (trade.hedgeCost ?? 0) > 0) ? (trade.hedgeCost ?? 0) : 0;
@@ -4201,7 +4201,7 @@ async function reconcilePositions(trigger: string = "startup"): Promise<void> {
 
   // Also keep aggregate fillsByTicker for settlement fee proportioning (step a)
   const fillsByTicker = new Map<string, { totalShares: number; totalCostCents: number; totalFeeDollars: number; side: string; avgPriceCents: number }>();
-  // Per-side fills: key = "ticker:yes" or "ticker:no" → detect hedge fills on opposite side
+  // Per-side fills: key = "ticker:yes" or "ticker:no" -> detect hedge fills on opposite side
   const fillsByTickerSide = new Map<string, { totalShares: number; totalCostDollars: number; totalFeeDollars: number }>();
   for (const f of kalFills) {
     if (f.action !== "buy" || !f.ticker) continue;
@@ -4250,7 +4250,7 @@ async function reconcilePositions(trigger: string = "startup"): Promise<void> {
   let costsCorrected = 0;
   let changed = false;
 
-  // ── (pre) Ghost/duplicate consolidation: merge multiple records per ticker into one ──
+  // -- (pre) Ghost/duplicate consolidation: merge multiple records per ticker into one --
   // When ghost/recovered/excess trades share a kalTicker with a normal trade, consolidate
   // into a single record using actual exchange data as source of truth.
   {
@@ -4291,7 +4291,7 @@ async function reconcilePositions(trigger: string = "startup"): Promise<void> {
         ?? group.sort((a, b) => new Date(a.ts).getTime() - new Date(b.ts).getTime())[0];
       const mergedIds = group.filter(g => g !== primary).map(g => g.id);
 
-      // Aggregate PM costs — use the FIRST trade's pmCost per share, don't double-count
+      // Aggregate PM costs -- use the FIRST trade's pmCost per share, don't double-count
       const pmCostPerShare = primary.pmCost > 0 && primary.shares > 0
         ? primary.pmCost / primary.shares
         : group.find(g => g.pmCost > 0 && g.shares > 0)
@@ -4313,7 +4313,7 @@ async function reconcilePositions(trigger: string = "startup"): Promise<void> {
         : 0;
       const excessCost = Math.round((actualKalCost - cappedKalCost + actualPmShares * pmCostPerShare - cappedPmCost) * 100) / 100;
 
-      console.log(`[RECONCILE]   CONSOLIDATE: ${ticker} — merging ${group.length} records → 1. Removing: ${mergedIds.join(", ")}`);
+      console.log(`[RECONCILE]   CONSOLIDATE: ${ticker} -- merging ${group.length} records -> 1. Removing: ${mergedIds.join(", ")}`);
       console.log(`[RECONCILE]     Arb: ${arbShares} shares | KAL: $${cappedKalCost} | PM: $${cappedPmCost}${excessCost > 0.01 ? ` | Excess: $${excessCost}` : ""}`);
 
       primary.shares = arbShares;
@@ -4360,17 +4360,17 @@ async function reconcilePositions(trigger: string = "startup"): Promise<void> {
   }
 
   for (const trade of trades) {
-    // Skip scalar-settled trades — their P&L is manually corrected based on actual settlement
+    // Skip scalar-settled trades -- their P&L is manually corrected based on actual settlement
     // values and should never be recalculated using the binary formula.
     if (trade.scalarSettlement) continue;
 
-    // (a) Fix stale "hedging" → check if market settled
+    // (a) Fix stale "hedging" -> check if market settled
     if (trade.status === "hedging") {
       const settlement = settlementByTicker.get(trade.kalTicker);
       if (settlement) {
         const kalFee = settlement.feeCost;
 
-        // Try to find PM cost from positions — only if this trade's hedge actually went to PM.
+        // Try to find PM cost from positions -- only if this trade's hedge actually went to PM.
         // Don't assign PM cost from positions that belong to other trades on the same slug.
         let pmCost = trade.pmCost;
         if (pmCost === 0 || trade.pmFillPrice === 0) {
@@ -4385,10 +4385,10 @@ async function reconcilePositions(trigger: string = "startup"): Promise<void> {
               const size = Number(p.size ?? p.amount ?? 0);
               const availableShares = size - otherPmClaimed;
               if (avgPrice > 0 && availableShares >= trade.shares) {
-                // Sanity check: if combined cost/share >= $1, PM avgPrice is likely market price, not fill price — skip
+                // Sanity check: if combined cost/share >= $1, PM avgPrice is likely market price, not fill price -- skip
                 const estCombined = (trade.kalCost + trade.shares * avgPrice) / Math.max(trade.shares, 1);
                 if (estCombined >= 1) {
-                  console.warn(`[RECONCILE]   PM avgPrice ${(avgPrice * 100).toFixed(0)}¢ for ${trade.match} gives combined $${estCombined.toFixed(2)}/sh >= $1.00 — skipping PM cost backfill`);
+                  console.warn(`[RECONCILE]   PM avgPrice ${(avgPrice * 100).toFixed(0)}c for ${trade.match} gives combined $${estCombined.toFixed(2)}/sh >= $1.00 -- skipping PM cost backfill`);
                 } else {
                   pmCost = trade.shares * avgPrice;
                   trade.pmFillPrice = avgPrice;
@@ -4400,18 +4400,18 @@ async function reconcilePositions(trigger: string = "startup"): Promise<void> {
           }
         }
 
-        // Per-trade P&L — don't use aggregate settlement kalCostExact/kalRevenue
+        // Per-trade P&L -- don't use aggregate settlement kalCostExact/kalRevenue
         // as it sums ALL fills for the ticker, double-counting when multiple trades share it.
         const kalSide = kalSideForDir(trade.dir);
         const kalOppSide = kalSide === "yes" ? "no" : "yes";
         const kalSideWon = (kalSide === "yes" && settlement.marketResult === "yes") || (kalSide === "no" && settlement.marketResult === "no");
         const hasPmLeg = pmCost > 0 || trade.pmFillPrice > 0;
 
-        // ── Check for hedge fills on OPPOSITE Kalshi side ──
+        // -- Check for hedge fills on OPPOSITE Kalshi side --
         // If the bot hedged by buying the opposite side on Kalshi (e.g., bought YES initially,
-        // then bought NO as hedge), both sides are covered → payout = shares × $1 regardless.
+        // then bought NO as hedge), both sides are covered -> payout = shares x $1 regardless.
         // IMPORTANT: Only count opposite-side fills as hedges if no OTHER trade on this ticker
-        // already accounts for them — otherwise we'd fabricate hedge data from unrelated trades.
+        // already accounts for them -- otherwise we'd fabricate hedge data from unrelated trades.
         const oppSideFills = fillsByTickerSide.get(`${trade.kalTicker}:${kalOppSide}`);
         let hedgeCostKal = trade.hedgeCost ?? 0;
         let kalHedgeShares = 0;
@@ -4426,7 +4426,7 @@ async function reconcilePositions(trigger: string = "startup"): Promise<void> {
           if (unclaimedOppShares > 0) {
             kalHedgeShares = Math.min(unclaimedOppShares, trade.shares);
             hedgeCostKal = Math.round((oppSideFills.totalCostDollars + oppSideFills.totalFeeDollars) * (kalHedgeShares / oppSideFills.totalShares) * 100) / 100;
-            console.log(`[RECONCILE]   Found KAL hedge fills: ${kalHedgeShares}×${kalOppSide.toUpperCase()} cost=$${hedgeCostKal.toFixed(2)} on ${trade.kalTicker} (${unclaimedOppShares} unclaimed of ${oppSideFills.totalShares} total)`);
+            console.log(`[RECONCILE]   Found KAL hedge fills: ${kalHedgeShares}x${kalOppSide.toUpperCase()} cost=$${hedgeCostKal.toFixed(2)} on ${trade.kalTicker} (${unclaimedOppShares} unclaimed of ${oppSideFills.totalShares} total)`);
           }
         }
 
@@ -4439,7 +4439,7 @@ async function reconcilePositions(trigger: string = "startup"): Promise<void> {
         // Keep per-trade kalCost (set by makeUnhedged). Add proportional fee if missing.
         if (trade.kalCost > 0 && trade.kalFillPrice > 0) {
           const rawCost = trade.shares * trade.kalFillPrice;
-          // If kalCost ≈ shares × fillPrice, fee isn't included yet — add proportional fee
+          // If kalCost ≈ shares x fillPrice, fee isn't included yet -- add proportional fee
           if (Math.abs(trade.kalCost - rawCost) < 0.05 && kalFee > 0) {
             const fillData = fillsByTicker.get(trade.kalTicker);
             const totalShares = fillData?.totalShares ?? trade.shares;
@@ -4447,13 +4447,13 @@ async function reconcilePositions(trigger: string = "startup"): Promise<void> {
             trade.kalCost = Math.round((rawCost + perTradeFee) * 100) / 100;
           }
         } else if (trade.kalCost === 0 && fillsByTicker.has(trade.kalTicker)) {
-          // kalCost lost — backfill from proportional fill data
+          // kalCost lost -- backfill from proportional fill data
           const fillData = fillsByTicker.get(trade.kalTicker)!;
           const proportion = fillData.totalShares > 0 ? trade.shares / fillData.totalShares : 1;
           const backfilledKalCost = Math.round((fillData.totalCostCents / 100 + fillData.totalFeeDollars) * proportion * 100) / 100;
           const combinedPerShare = (backfilledKalCost + pmCost) / Math.max(trade.shares, 1);
           if (combinedPerShare >= 1) {
-            console.log(`[RECONCILE]   WARNING: backfill for ${trade.match} gives combined cost $${combinedPerShare.toFixed(2)}/share >= $1.00 — bad recovery, money already spent`);
+            console.log(`[RECONCILE]   WARNING: backfill for ${trade.match} gives combined cost $${combinedPerShare.toFixed(2)}/share >= $1.00 -- bad recovery, money already spent`);
           }
           trade.kalCost = backfilledKalCost;
           trade.kalFillPrice = fillData.avgPriceCents / 100;
@@ -4502,15 +4502,15 @@ async function reconcilePositions(trigger: string = "startup"): Promise<void> {
             namesMatch(pf.pmOutcome, trade.pmOutcome) && pf.price > 0
           );
           const avgPrice = pfMatch ? pfMatch.price : posAvgPrice;
-          // Validate combined cost: if cost/share >= $1, the avgPrice is unreliable — don't resolve, let hedge loop handle it.
+          // Validate combined cost: if cost/share >= $1, the avgPrice is unreliable -- don't resolve, let hedge loop handle it.
           const pmCost = Math.round(trade.shares * avgPrice * 100) / 100;
           const totalCost = Math.round((trade.kalCost + pmCost) * 100) / 100;
           const costPerShare = totalCost / Math.max(trade.shares, 1);
           if (costPerShare >= 1) {
             console.warn(
-              `[RECONCILE]   PM wallet hedge found but avgPrice unreliable: ${trade.match} — ` +
-              `${size}×${outcome} @${(avgPrice * 100).toFixed(0)}¢ on PM → combined $${costPerShare.toFixed(2)}/sh >= $1.00. ` +
-              `Leaving in hedge mode (max hedge price = ${((1 - trade.kalCost / Math.max(trade.shares, 1)) * 100).toFixed(0)}¢).`
+              `[RECONCILE]   PM wallet hedge found but avgPrice unreliable: ${trade.match} -- ` +
+              `${size}x${outcome} @${(avgPrice * 100).toFixed(0)}c on PM -> combined $${costPerShare.toFixed(2)}/sh >= $1.00. ` +
+              `Leaving in hedge mode (max hedge price = ${((1 - trade.kalCost / Math.max(trade.shares, 1)) * 100).toFixed(0)}c).`
             );
             break;
           }
@@ -4524,8 +4524,8 @@ async function reconcilePositions(trigger: string = "startup"): Promise<void> {
           trade.totalCost = totalCost;
           trade.realizedPnl = realizedPnl;
           console.log(
-            `[RECONCILE]   PM wallet hedge found: ${trade.match} — ` +
-            `${size}×${outcome} @${(avgPrice * 100).toFixed(0)}¢ on PM. ` +
+            `[RECONCILE]   PM wallet hedge found: ${trade.match} -- ` +
+            `${size}x${outcome} @${(avgPrice * 100).toFixed(0)}c on PM. ` +
             `Resolved: P&L=$${realizedPnl.toFixed(2)}`
           );
           staleResolved++;
@@ -4536,18 +4536,18 @@ async function reconcilePositions(trigger: string = "startup"): Promise<void> {
       if (trade.status !== "hedging") continue;
     }
 
-    // (b) Fix "filled" instant-arbs → mark resolved if both legs have prices
+    // (b) Fix "filled" instant-arbs -> mark resolved if both legs have prices
     if (trade.status === "filled" && trade.kalFillPrice > 0 && trade.pmFillPrice > 0 && trade.realizedPnl != null) {
       trade.status = "resolved";
       trade.resolutionMethod = "both-legs";
       trade.resolvedTs = trade.resolvedTs ?? trade.ts;
-      console.log(`[RECONCILE]   Fixed status: ${trade.match} (filled→resolved)`);
+      console.log(`[RECONCILE]   Fixed status: ${trade.match} (filled->resolved)`);
       filledToResolved++;
       changed = true;
     }
 
     // (b2) Fix "hedging" trades that already have both legs filled but never got resolved.
-    //      This happens when hedge_state.json is lost (crash/restart) — the hedge cycle
+    //      This happens when hedge_state.json is lost (crash/restart) -- the hedge cycle
     //      can't find the trade, so it stays stuck in "hedging" forever.
     if (trade.status === "hedging" && trade.kalCost > 0 && trade.pmCost > 0) {
       trade.status = "resolved";
@@ -4556,14 +4556,14 @@ async function reconcilePositions(trigger: string = "startup"): Promise<void> {
       trade.hedgeCost = trade.initialExchange === "pm" ? trade.kalCost : trade.pmCost;
       trade.totalCost = totalCostForTrade(trade);
       trade.realizedPnl = Math.round((trade.shares - trade.totalCost) * 100) / 100;
-      console.log(`[RECONCILE]   Fixed status: ${trade.match} (hedging→resolved, both legs filled: KAL=$${trade.kalCost.toFixed(2)} PM=$${trade.pmCost.toFixed(2)} P&L=$${trade.realizedPnl.toFixed(2)})`);
+      console.log(`[RECONCILE]   Fixed status: ${trade.match} (hedging->resolved, both legs filled: KAL=$${trade.kalCost.toFixed(2)} PM=$${trade.pmCost.toFixed(2)} P&L=$${trade.realizedPnl.toFixed(2)})`);
       filledToResolved++;
       changed = true;
     }
 
     // (c) Backfill missing kalCost or fix cost discrepancies using timestamp-matched fills.
     //     Skip hedge-complete trades UNLESS kalCost=0 (ghost/recovered trades resolved before backfill).
-    //     Skip resolved trades UNLESS kalCost=0 (same reason — settlement resolved before cost was known).
+    //     Skip resolved trades UNLESS kalCost=0 (same reason -- settlement resolved before cost was known).
     const kalNeedsBackfill = trade.kalCost === 0;
     if (trade.kalTicker && (kalNeedsBackfill || (trade.resolutionMethod !== "hedge-complete" && trade.status !== "resolved"))) {
       const kalSide = kalSideForDir(trade.dir);
@@ -4584,9 +4584,9 @@ async function reconcilePositions(trigger: string = "startup"): Promise<void> {
             const payout = trade.shares;
             const oldPnl = trade.realizedPnl;
             trade.realizedPnl = Math.round((payout - trade.kalCost - trade.pmCost - hedgeCost) * 100) / 100;
-            console.log(`[RECONCILE]   Backfilled kalCost + P&L fix: ${trade.match} dir=${trade.dir} → kalCost=$${kalCostWithFees.toFixed(2)} P&L ${oldPnl.toFixed(2)}→${trade.realizedPnl.toFixed(2)}`);
+            console.log(`[RECONCILE]   Backfilled kalCost + P&L fix: ${trade.match} dir=${trade.dir} -> kalCost=$${kalCostWithFees.toFixed(2)} P&L ${oldPnl.toFixed(2)}->${trade.realizedPnl.toFixed(2)}`);
           } else {
-            console.log(`[RECONCILE]   Backfilled kalCost: ${trade.match} dir=${trade.dir} → $${kalCostWithFees.toFixed(2)} (ts-matched, fee=$${matched.fees.toFixed(2)})`);
+            console.log(`[RECONCILE]   Backfilled kalCost: ${trade.match} dir=${trade.dir} -> $${kalCostWithFees.toFixed(2)} (ts-matched, fee=$${matched.fees.toFixed(2)})`);
           }
           costsCorrected++;
           changed = true;
@@ -4595,7 +4595,7 @@ async function reconcilePositions(trigger: string = "startup"): Promise<void> {
           trade.kalCost = kalCostWithFees;
           trade.kalFillPrice = avgPrice;
           trade.totalCost = totalCostForTrade(trade);
-          console.log(`[RECONCILE]   Fixed kalCost: ${trade.match} $${oldCost.toFixed(2)}→$${kalCostWithFees.toFixed(2)} (ts-matched, fee=$${matched.fees.toFixed(2)})`);
+          console.log(`[RECONCILE]   Fixed kalCost: ${trade.match} $${oldCost.toFixed(2)}->$${kalCostWithFees.toFixed(2)} (ts-matched, fee=$${matched.fees.toFixed(2)})`);
           costsCorrected++;
           changed = true;
         }
@@ -4611,7 +4611,7 @@ async function reconcilePositions(trigger: string = "startup"): Promise<void> {
   // (d0) Fix corrupted kalCost from old settlement-based reconciler.
   //      The old reconciler used aggregate settlement data which double-counted when
   //      multiple trades shared a Kalshi ticker. Detect and fix: if kalCost is >50%
-  //      above kalFillPrice × shares, it was inflated by settlement aggregation.
+  //      above kalFillPrice x shares, it was inflated by settlement aggregation.
   let kalCostFixed = 0;
   for (const trade of trades) {
     const fp = trade.kalFillPrice ?? 0;
@@ -4621,7 +4621,7 @@ async function reconcilePositions(trigger: string = "startup"): Promise<void> {
       const expected = fp * sh;
       if (cost > expected * 1.5) {
         const corrected = Math.round(expected * 100) / 100;
-        console.log(`[RECONCILE]   Fix kalCost: ${trade.match} — was $${cost.toFixed(2)}, corrected to $${corrected.toFixed(2)} (${sh}×${fp})`);
+        console.log(`[RECONCILE]   Fix kalCost: ${trade.match} -- was $${cost.toFixed(2)}, corrected to $${corrected.toFixed(2)} (${sh}x${fp})`);
         trade.kalCost = corrected;
         trade.totalCost = totalCostForTrade(trade);
         kalCostFixed++;
@@ -4632,8 +4632,8 @@ async function reconcilePositions(trigger: string = "startup"): Promise<void> {
 
   // (d0b) Backfill missing fill prices and fix costs for hedge-complete trades.
   //       Determines which side was the initial entry vs the hedge using a heuristic:
-  //       if kalFillPrice × shares ≈ hedgeCost, then kalFillPrice was backfilled → PM-initial.
-  //       Otherwise kalFillPrice is the real entry price → KAL-initial.
+  //       if kalFillPrice x shares ≈ hedgeCost, then kalFillPrice was backfilled -> PM-initial.
+  //       Otherwise kalFillPrice is the real entry price -> KAL-initial.
   //       Uses hedgeCost (per-trade fill cost from resolveArbTrade) as ground truth for hedge side.
   //       NOTE: The hedge can go to EITHER exchange (KAL or PM opposite token).
   //       New trades have per-exchange cost tracking, so this heuristic is mainly for legacy data.
@@ -4646,7 +4646,7 @@ async function reconcilePositions(trigger: string = "startup"): Promise<void> {
     // Skip if costs are already set and consistent with totalCost.
     // New trades (initialExchange set) have per-exchange cost tracking from resolveArbTrade.
     // One side can be legitimately 0 when the hedge went entirely to PM opposite token,
-    // so don't require both > 0 — only require totalCost consistency.
+    // so don't require both > 0 -- only require totalCost consistency.
     // Partial-fill trades can have 3 cost components: kalCost + pmCost + hedgeCost
     // (e.g., partial KAL fill + PM initial + PM opposite hedge). In that case,
     // totalCost = kalCost + pmCost + hedgeCost, and costSum < totalCost is expected.
@@ -4673,7 +4673,7 @@ async function reconcilePositions(trigger: string = "startup"): Promise<void> {
         || (kalFP > 0 && Math.abs(kalFP * sh - hc) < 0.10);
 
     if (isPmInitial) {
-      // PM-initial → hedge could be KAL or PM-opposite.
+      // PM-initial -> hedge could be KAL or PM-opposite.
       // Without per-exchange breakdown, assume hedge went to KAL (legacy behavior).
       if (kalFP === 0) {
         trade.kalFillPrice = Math.round((hc / sh) * 100) / 100;
@@ -4691,7 +4691,7 @@ async function reconcilePositions(trigger: string = "startup"): Promise<void> {
         changed = true;
       }
     } else {
-      // KAL-initial → hedge could be PM or KAL-opposite (soccer 3-way dirs G-I).
+      // KAL-initial -> hedge could be PM or KAL-opposite (soccer 3-way dirs G-I).
       const kalFees = trade.kalFees ?? 0;
       const correctKalCost = Math.round((kalFP * sh + kalFees) * 100) / 100;
       if (Math.abs(trade.kalCost - correctKalCost) > 0.01) {
@@ -4704,7 +4704,7 @@ async function reconcilePositions(trigger: string = "startup"): Promise<void> {
       // Soccer 3-way KAL-hedged trades have hedgeCost on the KAL side, not PM.
       const kalHedged = hc > 0 && Math.abs(trade.totalCost - (trade.kalCost + hc)) < 0.10;
       if (!kalHedged) {
-        // Hedge went to PM — backfill pmFillPrice + pmCost from hedgeCost
+        // Hedge went to PM -- backfill pmFillPrice + pmCost from hedgeCost
         if (pmFP === 0) {
           trade.pmFillPrice = Math.round((hc / sh) * 100) / 100;
           changed = true;
@@ -4742,13 +4742,13 @@ async function reconcilePositions(trigger: string = "startup"): Promise<void> {
     const hedgeShares = Math.min(oppFills.totalShares, trade.shares);
     const hedgeProportion = hedgeShares / oppFills.totalShares;
     const hedgeCost = Math.round((oppFills.totalCostDollars + oppFills.totalFeeDollars) * hedgeProportion * 100) / 100;
-    const payout = trade.shares; // both sides covered → $1 per share
+    const payout = trade.shares; // both sides covered -> $1 per share
     const totalCost = Math.round((trade.kalCost + hedgeCost) * 100) / 100;
     const pnl = Math.round((payout - totalCost) * 100) / 100;
 
     console.log(
-      `[RECONCILE]   REPAIR: ${trade.match} — found lost KAL hedge: ${hedgeShares}×${kalOppSide.toUpperCase()} cost=$${hedgeCost.toFixed(2)}. ` +
-      `P&L corrected: $${(trade.realizedPnl ?? 0).toFixed(2)} → $${pnl.toFixed(2)}`
+      `[RECONCILE]   REPAIR: ${trade.match} -- found lost KAL hedge: ${hedgeShares}x${kalOppSide.toUpperCase()} cost=$${hedgeCost.toFixed(2)}. ` +
+      `P&L corrected: $${(trade.realizedPnl ?? 0).toFixed(2)} -> $${pnl.toFixed(2)}`
     );
     trade.resolutionMethod = "hedge-complete";
     trade.hedgeCost = hedgeCost;
@@ -4768,7 +4768,7 @@ async function reconcilePositions(trigger: string = "startup"): Promise<void> {
   let recoveredFromPending = 0;
   const pendingFills = getIncompletePendingFills();
   if (pendingFills.length > 0) {
-    console.log(`[RECONCILE] Found ${pendingFills.length} incomplete pending fill(s) — checking for orphaned positions...`);
+    console.log(`[RECONCILE] Found ${pendingFills.length} incomplete pending fill(s) -- checking for orphaned positions...`);
 
     // Group by kalTicker+pmSlug so crash-loop fills become one recovery trade
     const pfGroups = new Map<string, typeof pendingFills>();
@@ -4807,7 +4807,7 @@ async function reconcilePositions(trigger: string = "startup"): Promise<void> {
           // Cap at actual exchange position to avoid over-counting
           const exchangeShares = Math.max(kalPos.yesCount, kalPos.noCount);
           if (actualShares > exchangeShares) {
-            console.log(`[RECONCILE]   NOTE: ${group.length} pending fills sum to ${actualShares} shares but exchange shows ${exchangeShares} — using exchange count`);
+            console.log(`[RECONCILE]   NOTE: ${group.length} pending fills sum to ${actualShares} shares but exchange shows ${exchangeShares} -- using exchange count`);
             actualShares = exchangeShares;
           }
         }
@@ -4819,7 +4819,7 @@ async function reconcilePositions(trigger: string = "startup"): Promise<void> {
           hasPosition = true;
           const exchangeShares = Math.round(Number(pmPos.size ?? pmPos.amount ?? 0));
           if (actualShares > exchangeShares) {
-            console.log(`[RECONCILE]   NOTE: ${group.length} pending fills sum to ${actualShares} shares but PM shows ${exchangeShares} — using PM count`);
+            console.log(`[RECONCILE]   NOTE: ${group.length} pending fills sum to ${actualShares} shares but PM shows ${exchangeShares} -- using PM count`);
             actualShares = exchangeShares;
           }
         }
@@ -4828,12 +4828,12 @@ async function reconcilePositions(trigger: string = "startup"): Promise<void> {
       if (hasPosition) {
         const rawKalCost = pf.exchange === "kal" ? Math.round(actualShares * avgPrice * 100) / 100 : 0;
         const pmCost = pf.exchange === "pm" ? Math.round(actualShares * avgPrice * 100) / 100 : 0;
-        // Calculate Kalshi fees: KALSHI_FEE_RATE × P × (1-P) per contract
+        // Calculate Kalshi fees: KALSHI_FEE_RATE x P x (1-P) per contract
         const kalFees = pf.exchange === "kal"
           ? Math.round(actualShares * KALSHI_FEE_RATE * avgPrice * (1 - avgPrice) * 100) / 100
           : 0;
         const kalCost = rawKalCost + kalFees; // kalCost includes fees (matches normal trade behavior)
-        console.log(`[RECONCILE]   RECOVERED: ${pf.match} — ${actualShares} shares on ${pf.exchange} @ ${avgPrice} (${group.length} pending fill(s), fees=$${kalFees.toFixed(2)})`);
+        console.log(`[RECONCILE]   RECOVERED: ${pf.match} -- ${actualShares} shares on ${pf.exchange} @ ${avgPrice} (${group.length} pending fill(s), fees=$${kalFees.toFixed(2)})`);
         trades.push({
           id: `arb-recovered-${Date.now()}`,
           ts: pf.ts,
@@ -4883,12 +4883,12 @@ async function reconcilePositions(trigger: string = "startup"): Promise<void> {
     const excessShares = posCount - allTrackedShares;
     if (excessShares <= 0) continue;
 
-    // Skip if there's an active hedge on this ticker — the hedge loop is still buying
+    // Skip if there's an active hedge on this ticker -- the hedge loop is still buying
     // contracts, so the current position count is mid-flight and will change.
     // Auto-recovering now would create duplicate hedging trades.
     const hasActiveHedge = trades.some(t => t.kalTicker === ticker && t.status === "hedging");
     if (hasActiveHedge) {
-      console.log(`[RECONCILE]   Skipping KAL auto-recover for ${ticker} — active hedge in progress (excess=${excessShares}, hedging trade exists)`);
+      console.log(`[RECONCILE]   Skipping KAL auto-recover for ${ticker} -- active hedge in progress (excess=${excessShares}, hedging trade exists)`);
       continue;
     }
 
@@ -4900,7 +4900,7 @@ async function reconcilePositions(trigger: string = "startup"): Promise<void> {
       const kalFees = Math.round(excessShares * KALSHI_FEE_RATE * avgPrice * (1 - avgPrice) * 100) / 100;
       const kalCost = Math.round((excessShares * avgPrice + kalFees) * 100) / 100;
 
-      console.log(`[RECONCILE]   AUTO-RECOVER: ${resolvedRef.match} — ${excessShares}× ${posSide.toUpperCase()} on ${ticker} (exchange=${posCount}, tracked=${allTrackedShares}, avg ${(avgPrice * 100).toFixed(0)}¢, fees=$${kalFees.toFixed(2)})`);
+      console.log(`[RECONCILE]   AUTO-RECOVER: ${resolvedRef.match} -- ${excessShares}x ${posSide.toUpperCase()} on ${ticker} (exchange=${posCount}, tracked=${allTrackedShares}, avg ${(avgPrice * 100).toFixed(0)}c, fees=$${kalFees.toFixed(2)})`);
       trades.push({
         id: `arb-recovered-${Date.now()}-${ticker.slice(-6)}`,
         ts: new Date().toISOString(),
@@ -4925,7 +4925,7 @@ async function reconcilePositions(trigger: string = "startup"): Promise<void> {
       changed = true;
       autoRecoveredPositions++;
     } else {
-      console.log(`[RECONCILE]   Untracked Kalshi position: ${ticker} ${posCount}× ${posSide.toUpperCase()} (no matching resolved trade — cannot auto-recover)`);
+      console.log(`[RECONCILE]   Untracked Kalshi position: ${ticker} ${posCount}x ${posSide.toUpperCase()} (no matching resolved trade -- cannot auto-recover)`);
       untrackedKal++;
     }
   }
@@ -4943,15 +4943,15 @@ async function reconcilePositions(trigger: string = "startup"): Promise<void> {
     if (!tracked) {
       // Check if there's excess PM shares beyond what resolved trades account for
       const pmShares = Math.round(size);
-      // Only auto-recover PM positions for RECENT matches (≤3 days old).
-      // Older positions are likely unredeemed winning tokens — don't hedge them.
+      // Only auto-recover PM positions for RECENT matches (<=3 days old).
+      // Older positions are likely unredeemed winning tokens -- don't hedge them.
       const slugDate = slug.match(/\d{4}-\d{2}-\d{2}/)?.[0];
       const daysSinceMatch = slugDate
         ? (Date.now() - new Date(slugDate).getTime()) / 86_400_000
         : 999;
       if (daysSinceMatch > 3) {
-        // Old match — just log, don't create hedging trade
-        console.log(`[RECONCILE]   Stale PM position: ${outcome} ${pmShares}× on ${slug} (match ${slugDate ?? "?"}, ${Math.round(daysSinceMatch)}d ago — skipping auto-recover)`);
+        // Old match -- just log, don't create hedging trade
+        console.log(`[RECONCILE]   Stale PM position: ${outcome} ${pmShares}x on ${slug} (match ${slugDate ?? "?"}, ${Math.round(daysSinceMatch)}d ago -- skipping auto-recover)`);
         continue;
       }
       // Resolved trades' PM positions are still held until settlement, so
@@ -4961,14 +4961,14 @@ async function reconcilePositions(trigger: string = "startup"): Promise<void> {
         .reduce((s, t) => s + t.shares, 0);
       if (pmShares > allTrackedPmShares) {
         const excess = pmShares - allTrackedPmShares;
-        // Skip if there's an active hedge on this slug — the hedge loop is still buying
+        // Skip if there's an active hedge on this slug -- the hedge loop is still buying
         // contracts on the opposite exchange, so position counts are mid-flight.
         const hasActiveHedgePm = trades.some(t => t.pmSlug === slug && t.status === "hedging");
         if (hasActiveHedgePm) {
-          console.log(`[RECONCILE]   Skipping PM auto-recover for ${slug} — active hedge in progress (excess=${excess}, hedging trade exists)`);
+          console.log(`[RECONCILE]   Skipping PM auto-recover for ${slug} -- active hedge in progress (excess=${excess}, hedging trade exists)`);
           continue;
         }
-        // Skip recovery for markets that already settled — resolved trades still hold PM tokens
+        // Skip recovery for markets that already settled -- resolved trades still hold PM tokens
         // until redeemed, so excess is expected and doesn't need hedging.
         const isMarketSettled = trades.some(t =>
           t.pmSlug === slug &&
@@ -4976,7 +4976,7 @@ async function reconcilePositions(trigger: string = "startup"): Promise<void> {
           (t.resolutionMethod === "settlement" || t.resolutionMethod === "market-settled" || t.resolutionMethod === "both-legs")
         );
         if (isMarketSettled) {
-          console.log(`[RECONCILE]   Skipping PM auto-recover for ${slug} — market already settled (excess=${excess} PM shares)`);
+          console.log(`[RECONCILE]   Skipping PM auto-recover for ${slug} -- market already settled (excess=${excess} PM shares)`);
           continue;
         }
         const resolvedRef = trades.find(t => t.pmSlug === slug);
@@ -5014,7 +5014,7 @@ async function reconcilePositions(trigger: string = "startup"): Promise<void> {
           changed = true;
           autoRecoveredPositions++;
         } else {
-          console.log(`[RECONCILE]   Untracked PM position: ${outcome} ${excess}× excess on ${slug} (no trade ref — cannot auto-recover)`);
+          console.log(`[RECONCILE]   Untracked PM position: ${outcome} ${excess}x excess on ${slug} (no trade ref -- cannot auto-recover)`);
           untrackedPm++;
         }
       }
@@ -5027,7 +5027,7 @@ async function reconcilePositions(trigger: string = "startup"): Promise<void> {
     if (trade.status !== "resolved") continue;
     const expected = totalCostForTrade(trade);
     if (Math.abs(trade.totalCost - expected) > 0.01) {
-      console.log(`[RECONCILE]   Invariant fix: ${trade.match} totalCost $${trade.totalCost.toFixed(2)}→$${expected.toFixed(2)} (kalCost+hedgeCost+pmCost)`);
+      console.log(`[RECONCILE]   Invariant fix: ${trade.match} totalCost $${trade.totalCost.toFixed(2)}->$${expected.toFixed(2)} (kalCost+hedgeCost+pmCost)`);
       trade.totalCost = expected;
       changed = true;
     }
@@ -5035,7 +5035,7 @@ async function reconcilePositions(trigger: string = "startup"): Promise<void> {
     if (trade.realizedPnl != null) {
       const correctPnl = Math.round((trade.shares - expected) * 100) / 100;
       if (Math.abs(trade.realizedPnl - correctPnl) > 0.01) {
-        console.log(`[RECONCILE]   P&L fix: ${trade.match} realizedPnl $${trade.realizedPnl.toFixed(2)}→$${correctPnl.toFixed(2)}`);
+        console.log(`[RECONCILE]   P&L fix: ${trade.match} realizedPnl $${trade.realizedPnl.toFixed(2)}->$${correctPnl.toFixed(2)}`);
         trade.realizedPnl = correctPnl;
         changed = true;
       }
@@ -5051,7 +5051,7 @@ async function reconcilePositions(trigger: string = "startup"): Promise<void> {
     _reconcileRecoveredTrades = true;
   }
   console.log(
-    `[RECONCILE] Done: ${staleResolved} stale resolved, ${filledToResolved} filled→resolved, ` +
+    `[RECONCILE] Done: ${staleResolved} stale resolved, ${filledToResolved} filled->resolved, ` +
     `${kalCostFixed} kalCost fixed, ${costsCorrected} costs corrected, ${pnlFixed} P&L fixed, ` +
     `${pmClobRepaired} PM cost repaired, ${untrackedKal} untracked KAL, ` +
     `${untrackedPm} untracked PM, ${recoveredFromPending} recovered from pending, ` +
@@ -5059,7 +5059,7 @@ async function reconcilePositions(trigger: string = "startup"): Promise<void> {
   );
 }
 
-// ─── Hedge state persistence ─────────────────────────────────────────────────
+// --- Hedge state persistence -------------------------------------------------
 
 function loadHedgeStates(): HedgeState[] {
   try {
@@ -5072,13 +5072,13 @@ function loadHedgeStates(): HedgeState[] {
     const result: HedgeState[] = [];
     for (const entry of entries) {
       if (!entry.position || entry.position.sharesHeld <= 0) continue;
-      // Backwards compat: old hedge states won't have tradeId — match from arb_trades.json
+      // Backwards compat: old hedge states won't have tradeId -- match from arb_trades.json
       if (!entry.position.tradeId) {
         const trades = loadArbTrades();
         const match = trades.find(t => t.kalTicker === entry.position.kalLeg?.ticker && t.status === "hedging");
         entry.position.tradeId = match?.id ?? `arb-recovered-${Date.now()}`;
       }
-      // Backwards compat: old hedge states won't have kalSide — default to "yes"
+      // Backwards compat: old hedge states won't have kalSide -- default to "yes"
       if (!entry.position.kalSide) entry.position.kalSide = "yes";
       // Backwards compat: old hedge states won't have P&L tracking fields
       if (entry.position.initialShares == null) entry.position.initialShares = entry.position.sharesHeld;
@@ -5102,7 +5102,7 @@ function loadHedgeStates(): HedgeState[] {
   }
 }
 
-// ─── PM position helpers (module-level, shared by executeArb + monitorLoop) ──
+// --- PM position helpers (module-level, shared by executeArb + monitorLoop) --
 
 let _pmPosCache: { data: PmPosition[]; ts: number } | null = null;
 let _cachedFunder: string | null = null;
@@ -5132,12 +5132,12 @@ function sumPmHeld(pmPositions: PmPosition[], tokenId: string): number {
   }, 0));
 }
 
-// ─── Execution ────────────────────────────────────────────────────────────────
+// --- Execution ----------------------------------------------------------------
 
 function extractPmMeta(v: unknown) {
   if (!v || typeof v !== "object") return {};
   const obj = v as PmOrderResponse;
-  // Check nested .order field — some SDK versions wrap the response
+  // Check nested .order field -- some SDK versions wrap the response
   const inner = obj.order ?? obj;
   const txHashes = inner.transactionsHashes ?? obj.transactionsHashes;
   const txHash = Array.isArray(txHashes) ? txHashes[0] : inner.transactionHash ?? obj.transactionHash ?? obj.txHash;
@@ -5199,7 +5199,7 @@ async function executeArb(
     ].filter(Boolean).join("  ");
     console.log(`  [TIMING] Total=${total.toFixed(0)}ms  ${parts}`);
   };
-  // ── Execution metric (recorded at every return) ──────────────────────────
+  // -- Execution metric (recorded at every return) --------------------------
   const metric: ExecMetric = {
     id: `exec-${Date.now()}`,
     ts: new Date().toISOString(),
@@ -5229,12 +5229,12 @@ async function executeArb(
     metric.depthCheckMs = Math.round(tDepthCheck);
     metric.postVerifyMs = Math.round(tPmVerify);
     appendMetric(metric);
-    // Clear pending fill on abort — no exposure was taken.
+    // Clear pending fill on abort -- no exposure was taken.
     // EXCEPTION: "pm-delayed-zero" means the PM order timed out but may still settle on-chain later.
     // Keep the pending fill incomplete so the WSS ghost fill detector can catch it.
     if (outcome.startsWith("abort") && _activePendingFillId) {
       if (failReason === "pm-delayed-zero") {
-        console.log(`[PENDING] Keeping pending fill ${_activePendingFillId} open — order may still settle on-chain (ghost fill watch active).`);
+        console.log(`[PENDING] Keeping pending fill ${_activePendingFillId} open -- order may still settle on-chain (ghost fill watch active).`);
       } else {
         completePendingFill(_activePendingFillId);
       }
@@ -5264,7 +5264,7 @@ async function executeArb(
   } else if (dir === "I") {
     kalSide = "no"; kalLeg = entry.kal2; pmLeg = entry.pm2;
   } else if (dir === "J") {
-    // KAL Home YES + PM Home NO — swap pmLeg tokenId to the NO token
+    // KAL Home YES + PM Home NO -- swap pmLeg tokenId to the NO token
     kalSide = "yes"; kalLeg = entry.kal1;
     pmLeg = { ...entry.pm1, tokenId: entry.pm1.noTokenId!, outcome: `${entry.pm1.outcome} [NO]` };
   } else if (dir === "K") {
@@ -5274,8 +5274,8 @@ async function executeArb(
     kalSide = "yes"; kalLeg = entry.kal2;
     pmLeg = { ...entry.pm2, tokenId: entry.pm2.noTokenId!, outcome: `${entry.pm2.outcome} [NO]` };
   } else {
-    // ── SAFETY: binary markets only allow dirs A and C ──────────────────────
-    // Dirs B/D on binary are same-outcome bets (not arbs) — never execute them.
+    // -- SAFETY: binary markets only allow dirs A and C ----------------------
+    // Dirs B/D on binary are same-outcome bets (not arbs) -- never execute them.
     if (entry.isBinary && (dir === "B" || dir === "D")) {
       console.error(`\n[SAFETY ABORT] Binary market cannot execute dir ${dir} (only A/C are valid arbs)\n`);
       saveExecMetric("abort-safety", "binary-invalid-dir");
@@ -5286,15 +5286,15 @@ async function executeArb(
     pmLeg   = (dir === "A" || dir === "D") ? entry.pm2  : entry.pm1;
   }
 
-  // ── SAFETY: abort if token mapping looks wrong ───────────────────────────────
+  // -- SAFETY: abort if token mapping looks wrong -------------------------------
   // Dirs A/B: KAL and PM should be DIFFERENT players (opposite outcomes)
   // Dirs C/D: KAL and PM should be the SAME player (KAL NO + PM YES)
-  // Soccer G-L: KAL and PM are same outcome on same market — skip name check entirely
-  // Binary (isBinary): KAL and PM outcomes don't use player names (Over/Under, Yes/No) — skip
+  // Soccer G-L: KAL and PM are same outcome on same market -- skip name check entirely
+  // Binary (isBinary): KAL and PM outcomes don't use player names (Over/Under, Yes/No) -- skip
   const isSoccer2Leg = dir === "G" || dir === "H" || dir === "I" || dir === "J" || dir === "K" || dir === "L";
   const skipNameCheck = isSoccer2Leg || !!entry.isBinary;
   const execSeriesPrefix = (entry.kal1.ticker.split("-")[0] ?? "").toUpperCase();
-  // For NBA/MLB: namesMatch("Washington","Wizards") fails — use abbreviation fallback
+  // For NBA/MLB: namesMatch("Washington","Wizards") fails -- use abbreviation fallback
   const nbaNameMatch = NBA_SERIES.has(execSeriesPrefix) &&
     nbaNameToAbbr(kalLeg.surname) !== "" &&
     nbaNameToAbbr(kalLeg.surname) === nbaNameToAbbr(pmLeg.outcome);
@@ -5304,7 +5304,7 @@ async function executeArb(
   const cbbNameMatch = CBB_SERIES.has(execSeriesPrefix) && cbbNamesMatch(kalLeg.surname, pmLeg.outcome);
   const sameName = skipNameCheck ? true : (namesMatch(kalLeg.surname, pmLeg.outcome) || nbaNameMatch || mlbNameMatch || cbbNameMatch);
   // For A/B: expect different names. For C/D: expect same names.
-  // For soccer G-L and binary: sameName is forced true — expectSame must also be true to pass.
+  // For soccer G-L and binary: sameName is forced true -- expectSame must also be true to pass.
   const expectSame = skipNameCheck ? true : (kalSide === "no");
   if (sameName !== expectSame) {
     console.error(
@@ -5318,23 +5318,23 @@ async function executeArb(
     return { sessionSkip: true, unhedged: null };
   }
 
-  // ── SAFETY: abort if edge is unrealistically large (> 45%) ─────────────────
+  // -- SAFETY: abort if edge is unrealistically large (> 45%) -----------------
   // Esports/tennis markets can have 20-35% legitimate cross-platform disagreements
   // due to thin liquidity and different user bases. Only block truly absurd edges.
   if (edge > 0.45) {
     console.error(
-      `\n[SAFETY ABORT] Edge ${fmtPct(edge, 2)} exceeds 45% — likely token price mapping error.` +
+      `\n[SAFETY ABORT] Edge ${fmtPct(edge, 2)} exceeds 45% -- likely token price mapping error.` +
       ` KAL=${kalLeg.surname}@${fmtPct(kalAsk)} PM=${pmLeg.outcome}@${fmtPct(pmAsk)}\n`
     );
     saveExecMetric("abort-safety", "edge-too-large");
     return { sessionSkip: true, unhedged: null };
   }
 
-  // ── SAFETY: abort if Kalshi market is cancelled/scalar-settled ──────────────
+  // -- SAFETY: abort if Kalshi market is cancelled/scalar-settled --------------
   // Before spending money, verify the Kalshi market is actually open and tradeable.
   // A market that settled as "scalar" (cancelled/voided) breaks the $1 arb guarantee.
-  // Also block sibling markets (same date + series) — Kalshi re-lists cancelled matches
-  // with new tickers (e.g. FNMKOI → FNKOIA) which will likely cancel again.
+  // Also block sibling markets (same date + series) -- Kalshi re-lists cancelled matches
+  // with new tickers (e.g. FNMKOI -> FNKOIA) which will likely cancel again.
   if (_cancelledTickers.has(kalLeg.ticker)) {
     console.warn(`[SAFETY ABORT] ${kalLeg.ticker} already flagged as cancelled/scalar. Skipping.`);
     saveExecMetric("abort-safety", "market-cancelled");
@@ -5370,7 +5370,7 @@ async function executeArb(
       }
     } catch {
       tPreflight = performance.now() - _tPre0;
-      // If we can't verify, proceed cautiously — the order will fail anyway if market is closed
+      // If we can't verify, proceed cautiously -- the order will fail anyway if market is closed
     }
   }
 
@@ -5399,9 +5399,9 @@ async function executeArb(
 
   let totalCost = shares * costPerShare;
   let projectedProfit = shares * edge;
-  // ── Momentum-based leg ordering ────────────────────────────────────────────
+  // -- Momentum-based leg ordering --------------------------------------------
   // Determine which side's ask is rising (getting more expensive / escaping from us).
-  // Buy the "hotter" side first — if its ask is spiking, grab it before it's worse.
+  // Buy the "hotter" side first -- if its ask is spiking, grab it before it's worse.
   // The other side is stable or getting cheaper and will likely still be there.
   // PM-first is safer (failed fill = zero exposure) but subject to 3s sports delay.
   // KAL-first is faster (instant fill) but commits capital before PM confirms.
@@ -5412,16 +5412,16 @@ async function executeArb(
   // Positive momentum = price rising = getting more expensive for us
   // Buy the side that is rising faster first. Default to PM-first when equal
   // (PM has thinner books and 3s sports delay means failed fill costs nothing).
-  const pmFirst = pmMom >= kalMom; // PM rising more (or both equal) → PM first
+  const pmFirst = pmMom >= kalMom; // PM rising more (or both equal) -> PM first
   metric.shares = shares;
   metric.firstLeg = pmFirst ? "pm" : "kal";
 
   const tag = DRY_RUN ? "[DRY]" : "[LIVE]";
-  const momTag = `kalMom=${kalMom >= 0 ? "+" : ""}${(kalMom * 100).toFixed(1)}¢ pmMom=${pmMom >= 0 ? "+" : ""}${(pmMom * 100).toFixed(1)}¢`;
+  const momTag = `kalMom=${kalMom >= 0 ? "+" : ""}${(kalMom * 100).toFixed(1)}c pmMom=${pmMom >= 0 ? "+" : ""}${(pmMom * 100).toFixed(1)}c`;
   console.log(
     `\n${ts()} ${tag} ARB EXECUTE  dir=${dir}  edge=${fmtPct(edge, 2)}` +
     `  shares=${shares}  cost~=$${totalCost.toFixed(2)}  profit~=$${projectedProfit.toFixed(2)}` +
-    `  order=${pmFirst ? "PM→KAL" : "KAL→PM"}  ${momTag}`
+    `  order=${pmFirst ? "PM->KAL" : "KAL->PM"}  ${momTag}`
   );
   console.log(`  KAL: ${kalLeg.ticker} ${kalSide.toUpperCase()} @${fmtPct(kalAsk)}`);
   console.log(`  PM:  ${entry.pmSlug} outcome=${pmLeg.outcome} @${fmtPct(pmAsk)}`);
@@ -5429,7 +5429,7 @@ async function executeArb(
   const kalLimitCents = Math.max(1, Math.min(99, Math.floor((1 - pmAsk - MIN_EDGE) * 100)));
   const kalLimitPrice = kalLimitCents / 100;
 
-  // ── PRE-FLIGHT DEPTH CHECK + FULL DEPTH OPPORTUNITY LOG ─────────────────────
+  // -- PRE-FLIGHT DEPTH CHECK + FULL DEPTH OPPORTUNITY LOG ---------------------
   // Verify BOTH exchanges have sufficient liquidity before placing any orders.
   // Also log the FULL profitable depth available (beyond our budget) to assess
   // whether more capital would capture larger opportunities.
@@ -5454,7 +5454,7 @@ async function executeArb(
     if (wsHadKal || wsHadPm) console.log(`  [DEPTH] WS data: KAL=${wsHadKal ? "yes" : "no"} PM=${wsHadPm ? "yes" : "no"}`);
 
     // Compute max profitable prices for full depth sweep
-    // KAL max: kalLimitCents (already = floor((1 - pmAsk - MIN_EDGE) × 100))
+    // KAL max: kalLimitCents (already = floor((1 - pmAsk - MIN_EDGE) x 100))
     // PM max: 1 - kalAsk - MIN_EDGE (what PM price still leaves MIN_EDGE profit)
     const pmBreakevenPrice = 1 - kalAsk - MIN_EDGE;
 
@@ -5478,7 +5478,7 @@ async function executeArb(
         if (listingAskSize > 0 && listingAskPrice > 0 && listingAskPrice < 1) {
           const priceCents = Math.round(listingAskPrice * 100);
           kalAskLevelsForCheck = [[priceCents, listingAskSize]];
-          console.log(`  [DEPTH FIX] Orderbook empty but market lists ${kalSide} ask: ${listingAskSize} contracts @ ${priceCents}c — using listing data`);
+          console.log(`  [DEPTH FIX] Orderbook empty but market lists ${kalSide} ask: ${listingAskSize} contracts @ ${priceCents}c -- using listing data`);
         }
       }
 
@@ -5488,7 +5488,7 @@ async function executeArb(
       pmFull = sweepFullProfitableDepth(pmAskLevels, pmBreakevenPrice, false);
     }
 
-    // Log helper — called on both abort and proceed
+    // Log helper -- called on both abort and proceed
     const matchName = `${entry.kal1.surname} vs ${entry.kal2.surname}`;
     const logDepthOpp = (outcome: "executed" | "aborted", failReason?: string) => {
       const maxShares = Math.min(kalFull.totalQty, pmFull.totalQty);
@@ -5542,7 +5542,7 @@ async function executeArb(
       }
     };
 
-    // Kalshi depth — sweep available liquidity
+    // Kalshi depth -- sweep available liquidity
     let kalAvail = 0;
     {
       if (kalAskLevelsForCheck.length > 0) {
@@ -5562,7 +5562,7 @@ async function executeArb(
       }
     }
 
-    // PM depth — sweep available liquidity
+    // PM depth -- sweep available liquidity
     let pmAvail = 0;
     if (pmAskLevels.length > 0) {
       pmAvail = pmFull.totalQty;
@@ -5576,10 +5576,10 @@ async function executeArb(
 
     if (maxByDepth < shares) {
       if (maxByDepth < effectivePmMin) {
-        // Not enough depth even for minimum PM order — abort
+        // Not enough depth even for minimum PM order -- abort
         const limitingSide = kalAvail < pmAvail ? "kal" : "pm";
         const limitingAvail = Math.min(kalAvail, pmAvail);
-        console.log(`  [DEPTH CHECK] Insufficient depth: ${limitingSide}=${limitingAvail} → max ${maxByDepth} shares (need ≥${effectivePmMin} for PM min). Skipping.`);
+        console.log(`  [DEPTH CHECK] Insufficient depth: ${limitingSide}=${limitingAvail} -> max ${maxByDepth} shares (need >=${effectivePmMin} for PM min). Skipping.`);
         logDepthOpp("aborted", `${limitingSide}-depth-insufficient`);
         saveExecMetric("abort-pre-first", `${limitingSide}-depth-insufficient`);
         return { sessionSkip: false, unhedged: null, abortReason: "soft" };
@@ -5589,23 +5589,23 @@ async function executeArb(
       metric.shares = shares;
       totalCost = shares * costPerShare;
       projectedProfit = shares * edge;
-      console.log(`  [DEPTH] Adjusted shares: ${originalShares} → ${shares} (KAL depth=${kalAvail}, PM depth=${pmAvail}, mult=${MIN_DEPTH_MULT}×)`);
+      console.log(`  [DEPTH] Adjusted shares: ${originalShares} -> ${shares} (KAL depth=${kalAvail}, PM depth=${pmAvail}, mult=${MIN_DEPTH_MULT}x)`);
       console.log(`  [DEPTH] New cost=$${totalCost.toFixed(2)}  profit=$${projectedProfit.toFixed(2)}`);
     } else {
-      console.log(`  [DEPTH CHECK] OK: KAL=${kalAvail} PM=${pmAvail} (need ${requiredDepth} for ${shares} shares × ${MIN_DEPTH_MULT})`);
+      console.log(`  [DEPTH CHECK] OK: KAL=${kalAvail} PM=${pmAvail} (need ${requiredDepth} for ${shares} shares x ${MIN_DEPTH_MULT})`);
     }
 
     if (pmAskLevels.length === 0) {
-      console.log(`  [DEPTH CHECK] PM book unavailable — skipping depth check for PM side.`);
+      console.log(`  [DEPTH CHECK] PM book unavailable -- skipping depth check for PM side.`);
     }
 
-    // Both sides passed — log as executed opportunity
+    // Both sides passed -- log as executed opportunity
     logDepthOpp("executed");
   }
 
   // Helper: build a UnhedgedPosition when one leg is held and the other is missing.
   // pmOppLeg: when holding a PM token, the opposite PM outcome can also complete the arb
-  //   Dir A: pmLeg=pm2 (held), pmOppLeg=pm1 (can buy pm1 to own both → guaranteed $1)
+  //   Dir A: pmLeg=pm2 (held), pmOppLeg=pm1 (can buy pm1 to own both -> guaranteed $1)
   //   Dir B: pmLeg=pm1 (held), pmOppLeg=pm2
   const makeUnhedged = (held: "pm" | "kal", sharesHeld: number): UnhedgedPosition => {
     // Use actual Kalshi fill cost if available
@@ -5671,7 +5671,7 @@ async function executeArb(
   let pmOrderIdForVerify = ""; // set inside PM-first or KAL-first, used in post-fill verification
   let pmOrderPrice = pmAsk; // actual PM order price (may be capped at breakeven in KAL-first path)
 
-  // Write pending fill intent BEFORE any order — crash recovery breadcrumb
+  // Write pending fill intent BEFORE any order -- crash recovery breadcrumb
   if (!DRY_RUN) {
     const pfId = `pf-${Date.now()}`;
     _activePendingFillId = pfId;
@@ -5693,7 +5693,7 @@ async function executeArb(
   }
 
   // Snapshot on-chain PM balance BEFORE placing any orders.
-  // Used to detect incremental fills (not total balance) — prevents false positives
+  // Used to detect incremental fills (not total balance) -- prevents false positives
   // when a prior arb on the same token left shares on-chain.
   let pmPreBalance = 0;
   if (!DRY_RUN) {
@@ -5702,7 +5702,7 @@ async function executeArb(
     if (pmPreBalance > 0) console.log(`  [PRE-BAL] Existing PM on-chain balance: ${pmPreBalance} shares`);
   }
 
-  // ── Start execution-time book tracker (20s from NOW, captures depth during actual trade) ──
+  // -- Start execution-time book tracker (20s from NOW, captures depth during actual trade) --
   startBookTracker(kalLeg.ticker, pmLeg.tokenId, {
     match: `${entry.kal1.surname} vs ${entry.kal2.surname}`,
     dir, pmOutcome: pmLeg.outcome,
@@ -5711,7 +5711,7 @@ async function executeArb(
   }, "execution");
 
   if (pmFirst) {
-    // ── PM first (PM is the favourite / more expensive) ─────────────────────
+    // -- PM first (PM is the favourite / more expensive) ---------------------
 
     let pmResult: unknown;
     let pmFailed = false;
@@ -5733,19 +5733,19 @@ async function executeArb(
     const pmMeta = extractPmMeta(pmResult);
     if (isPm425(pmResult)) {
       markPmDown();
-      console.log(`  [PM LEG] Service not ready (425). Aborting — no exposure.`);
+      console.log(`  [PM LEG] Service not ready (425). Aborting -- no exposure.`);
       saveExecMetric("abort-pre-first", "pm-425");
       return { sessionSkip: false, unhedged: null };
     }
     if (typeof pmMeta.status === "number") {
-      console.log(`  [PM LEG] Rejected (HTTP ${pmMeta.status}). Aborting — no exposure.`);
+      console.log(`  [PM LEG] Rejected (HTTP ${pmMeta.status}). Aborting -- no exposure.`);
       saveExecMetric("abort-pre-first", "pm-rejected");
       return { sessionSkip: false, unhedged: null };
     }
     markPmUp();
     if (!DRY_RUN && pmMeta.status !== "matched") {
       if (pmMeta.status === "delayed" && pmMeta.orderId) {
-        // Order is on-chain but not yet confirmed — poll until it resolves
+        // Order is on-chain but not yet confirmed -- poll until it resolves
         console.log(`  [PM LEG] On-chain pending (status=delayed), polling for confirmation...`);
         const _tPoll0 = performance.now();
         const finalStatus = await waitForPmOrderFill(String(pmMeta.orderId), 20_000, pmLeg.tokenId, pmPreBalance);
@@ -5753,17 +5753,17 @@ async function executeArb(
         if (finalStatus === "matched") {
           console.log(`  [PM LEG] Confirmed filled after delay (${tPmPoll.toFixed(0)}ms).`);
         } else if (finalStatus === "cancelled") {
-          console.log(`  [PM LEG] Cancelled on-chain. Aborting — no exposure.`);
+          console.log(`  [PM LEG] Cancelled on-chain. Aborting -- no exposure.`);
           printTimings();
           saveExecMetric("abort-pre-first", "pm-cancelled");
           return { sessionSkip: false, unhedged: null };
         } else {
-          // timeout: order status unknown — check on-chain balance, fallback to data-api
-          console.warn(`  [PM LEG] Confirmation timeout — verifying on-chain...`);
+          // timeout: order status unknown -- check on-chain balance, fallback to data-api
+          console.warn(`  [PM LEG] Confirmation timeout -- verifying on-chain...`);
           try {
             let actualHeld = await getOnChainBalance(pmLeg.tokenId);
             if (actualHeld < 0) {
-              // RPC failed → fallback to data-api
+              // RPC failed -> fallback to data-api
               console.warn(`  [PM LEG] On-chain check failed, falling back to data-api...`);
               const verifyPos = await fetchPmPositionsCached(0);
               actualHeld = sumPmHeld(verifyPos, pmLeg.tokenId);
@@ -5781,13 +5781,13 @@ async function executeArb(
               // On-chain shows 0 new shares, but the PM order WAS submitted on-chain
               // (just not confirmed in time). It may still settle later as a ghost fill.
               // MUST skip this match to prevent double-execution on the same market.
-              console.warn(`  [PM LEG] On-chain has 0 new shares (total=${actualHeld}, pre=${pmPreBalance}) — order likely failed but may ghost-fill. Skipping match.`);
+              console.warn(`  [PM LEG] On-chain has 0 new shares (total=${actualHeld}, pre=${pmPreBalance}) -- order likely failed but may ghost-fill. Skipping match.`);
               printTimings();
               saveExecMetric("abort-pre-first", "pm-delayed-zero");
               return { sessionSkip: true, unhedged: null };
             }
           } catch (verifyErr) {
-            console.warn(`  [PM LEG] Wallet check failed: ${(verifyErr as Error).message} — assuming filled for safety.`);
+            console.warn(`  [PM LEG] Wallet check failed: ${(verifyErr as Error).message} -- assuming filled for safety.`);
             printTimings();
             metric.firstLegFilled = shares;
             saveExecMetric("hedge-entry", "pm-wallet-check-failed");
@@ -5797,7 +5797,7 @@ async function executeArb(
       } else {
         // Unexpected status (e.g. "live" if PM_ORDER_TYPE=GTC partially filled).
         // Cancel the PM order to prevent orphaned positions, then abort cleanly.
-        console.warn(`  [PM LEG] Unexpected status=${pmMeta.status ?? "n/a"} — cancelling PM order and aborting.`);
+        console.warn(`  [PM LEG] Unexpected status=${pmMeta.status ?? "n/a"} -- cancelling PM order and aborting.`);
         if (pmMeta.orderId) {
           try { await cancelPmOrder(String(pmMeta.orderId), DRY_RUN); }
           catch (e) { console.error(`  [PM LEG] Cancel failed: ${(e as Error).message}`); }
@@ -5812,7 +5812,7 @@ async function executeArb(
     pmOrderIdForVerify = pmMeta.orderId ? String(pmMeta.orderId) : "";
     console.log(`  [PM LEG] OK orderId=${pmMeta.orderId ?? "n/a"} filled=${pmFilled}`);
 
-    // Complete pending fill NOW — PM is confirmed on-chain, this is not a ghost.
+    // Complete pending fill NOW -- PM is confirmed on-chain, this is not a ghost.
     // Prevents the async chain watcher from creating a duplicate ghost trade
     // during the KAL GTC polling window (which can take 20+ seconds).
     if (_activePendingFillId) {
@@ -5821,7 +5821,7 @@ async function executeArb(
       _activePendingFillId = null;
     }
 
-    // ── Helper: immediate PM hedge when KAL leg fails ─────────────────────────
+    // -- Helper: immediate PM hedge when KAL leg fails -------------------------
     // PM tennis has 0% fees, so hedging on PM is strictly better than KAL.
     // Tries FOK buy of the opposite PM outcome token at breakeven. Returns
     // number of shares successfully hedged (0 if PM unavailable or no fill).
@@ -5835,17 +5835,17 @@ async function executeArb(
       try {
         const oppAsk = await fetchPmAsk(pmOppLeg.tokenId, clobBase);
         if (oppAsk === null || oppAsk > maxOppPrice || unhedgedShares * oppAsk < PM_MARKETABLE_MIN_VALUE) return 0;
-        console.log(`  [IMMEDIATE PM HEDGE] Buying ${unhedgedShares}×${pmOppLeg.outcome} @${fmtPct(oppAsk)} (breakeven=${fmtPct(maxOppPrice)})`);
+        console.log(`  [IMMEDIATE PM HEDGE] Buying ${unhedgedShares}x${pmOppLeg.outcome} @${fmtPct(oppAsk)} (breakeven=${fmtPct(maxOppPrice)})`);
         const res = await placePmFOK(pmOppLeg.tokenId, oppAsk, unhedgedShares, pmOppLeg.tickSize, pmOppLeg.negRisk, DRY_RUN);
         const meta = extractPmMeta(res);
         if (meta.status === "matched") {
-          console.log(`  [IMMEDIATE PM HEDGE] Filled ${unhedgedShares}×${pmOppLeg.outcome} @${fmtPct(oppAsk)} — hedge complete on PM.`);
+          console.log(`  [IMMEDIATE PM HEDGE] Filled ${unhedgedShares}x${pmOppLeg.outcome} @${fmtPct(oppAsk)} -- hedge complete on PM.`);
           return unhedgedShares;
         }
         if (meta.status === "delayed" && meta.orderId) {
           const finalStatus = await waitForPmOrderFill(String(meta.orderId), 20_000, pmOppLeg.tokenId);
           if (finalStatus === "matched") {
-            console.log(`  [IMMEDIATE PM HEDGE] Filled (delayed) ${unhedgedShares}×${pmOppLeg.outcome} @${fmtPct(oppAsk)} — hedge complete.`);
+            console.log(`  [IMMEDIATE PM HEDGE] Filled (delayed) ${unhedgedShares}x${pmOppLeg.outcome} @${fmtPct(oppAsk)} -- hedge complete.`);
             return unhedgedShares;
           }
         }
@@ -5855,13 +5855,13 @@ async function executeArb(
       return 0;
     };
 
-    // ── Kalshi GTC (second leg — PM already filled) ──────────────────────────
+    // -- Kalshi GTC (second leg -- PM already filled) --------------------------
     // Place a GTC limit order at the ask price. If resting liquidity exists, it
     // fills instantly (same as IOC). If the book is empty, the order rests and
     // we poll for up to 6 seconds. On timeout we cancel and enter hedge mode
     // with a breakeven GTC.
     const kalGTCOrder = buildKalshiGTCOrder(kalLeg.ticker, "buy", kalSide, kalLimitCents, pmFilled);
-    console.log(`  [KAL LEG] Placing GTC: ticker=${kalLeg.ticker} side=${kalSide} limit=${kalLimitCents}¢ qty=${pmFilled}`);
+    console.log(`  [KAL LEG] Placing GTC: ticker=${kalLeg.ticker} side=${kalSide} limit=${kalLimitCents}c qty=${pmFilled}`);
     let kalResult: unknown;
     let kalFailed = false;
     const _tKalOrd0 = performance.now();
@@ -5876,7 +5876,7 @@ async function executeArb(
       // Try immediate PM hedge (0% fees) before entering slow hedge loop
       const hedged = await immediatePmHedge(pmFilled);
       if (hedged >= pmFilled) {
-        // Fully hedged on PM — record as complete trade if we have actual hedge price
+        // Fully hedged on PM -- record as complete trade if we have actual hedge price
         const oppAskNow = await fetchPmAsk(pmOppLeg!.tokenId, process.env.POLY_CLOB_URL ?? "https://clob.polymarket.com").catch(() => null);
         if (oppAskNow !== null) {
           const hedgeCostPm = hedged * oppAskNow;
@@ -5898,10 +5898,10 @@ async function executeArb(
           saveExecMetric("hedge-entry", "kal-gtc-failed-pm-hedged");
           return { sessionSkip: true, unhedged: null };
         }
-        // oppAsk fetch failed — can't record actual cost. Fall through to hedge loop for proper tracking.
+        // oppAsk fetch failed -- can't record actual cost. Fall through to hedge loop for proper tracking.
         console.warn(`  [IMMEDIATE PM HEDGE] Hedged ${hedged} shares but oppAsk fetch failed. Entering hedge loop for cost tracking.`);
       }
-      console.warn(`  [HEDGE MODE] Holding PM ${pmFilled}×${pmLeg.outcome} @${fmtPct(pmAsk)} — entering hedge loop.`);
+      console.warn(`  [HEDGE MODE] Holding PM ${pmFilled}x${pmLeg.outcome} @${fmtPct(pmAsk)} -- entering hedge loop.`);
       printTimings();
       metric.firstLegFilled = pmFilled;
       saveExecMetric("hedge-entry", "kal-gtc-failed");
@@ -5946,12 +5946,12 @@ async function executeArb(
     if (!DRY_RUN && kalFilled >= pmFilled) {
       console.log(`  [KAL LEG] GTC fully filled: ${kalFilled} contracts`);
     } else if (!DRY_RUN && kalFilled > 0 && kalFilled < pmFilled) {
-      // Partial fill — cancel remaining GTC, then re-check actual fill count.
+      // Partial fill -- cancel remaining GTC, then re-check actual fill count.
       // The GTC may have filled MORE shares between the last poll and now (race condition).
       console.warn(`  [KAL LEG] GTC partial: ${kalFilled}/${pmFilled}. Cancelling remainder.`);
       try { await cancelKalshiOrder(kalOrderId, DRY_RUN); } catch { /* best effort */ }
 
-      // ── Post-cancel reconciliation: re-check actual fills ──────────────────
+      // -- Post-cancel reconciliation: re-check actual fills ------------------
       // Race condition: GTC can fill between last poll and cancel request.
       // Wait briefly, then get the definitive fill count from Kalshi.
       await sleep(500);
@@ -5978,11 +5978,11 @@ async function executeArb(
           kalFilled = postCancelFilled;
         }
       } catch (e) {
-        console.warn(`  [KAL LEG] Post-cancel order check failed: ${(e as Error).message} — using polled fill count.`);
+        console.warn(`  [KAL LEG] Post-cancel order check failed: ${(e as Error).message} -- using polled fill count.`);
       }
 
       if (kalFilled >= pmFilled) {
-        // GTC fully filled after all — treat as complete
+        // GTC fully filled after all -- treat as complete
         console.log(`  [KAL LEG] GTC fully filled after post-cancel check: ${kalFilled} contracts`);
         // Fall through to normal "both legs filled" handling below
       } else {
@@ -5990,7 +5990,7 @@ async function executeArb(
         const hedged = await immediatePmHedge(unhedgedCount);
         const remaining = unhedgedCount - hedged;
 
-        // ── Compute actual KAL cost for the partial fill ──────────────────────
+        // -- Compute actual KAL cost for the partial fill ----------------------
         const kalRawCostPartial = kalFillCostCents > 0 ? kalFillCostCents / 100 : kalFilled * kalAsk;
         const kalCostPartial = Math.round((kalRawCostPartial + kalFeesTotal) * 100) / 100;
         const actualKalPricePartial = kalFillCostCents > 0 && kalFilled > 0
@@ -5998,7 +5998,7 @@ async function executeArb(
           : kalAsk;
 
         if (remaining <= 0) {
-          // All unhedged shares covered by PM opposite — log complete resolved trade
+          // All unhedged shares covered by PM opposite -- log complete resolved trade
           const clobBase = process.env.POLY_CLOB_URL ?? "https://clob.polymarket.com";
           const oppAskNow = pmOppLeg ? await fetchPmAsk(pmOppLeg.tokenId, clobBase).catch(() => null) : null;
           const hedgeCostPm = Math.round(unhedgedCount * (oppAskNow ?? (1 - pmAsk)) * 100) / 100;
@@ -6046,7 +6046,7 @@ async function executeArb(
             });
             console.log(`  [PARTIAL FILL] Logged ${kalFilled} matched shares (KAL+PM). ${remaining} still unhedged.`);
           }
-          console.warn(`  [HEDGE MODE] ${remaining} PM shares still unhedged — entering hedge loop.`);
+          console.warn(`  [HEDGE MODE] ${remaining} PM shares still unhedged -- entering hedge loop.`);
           printTimings();
           metric.firstLegFilled = pmFilled;
           metric.secondLegFilled = kalFilled;
@@ -6055,11 +6055,11 @@ async function executeArb(
         }
       }
     } else if (!DRY_RUN && kalFilled === 0) {
-      // Not filled after 5s — cancel the arb-price GTC, try immediate PM hedge
+      // Not filled after 5s -- cancel the arb-price GTC, try immediate PM hedge
       console.warn(`  [KAL LEG] GTC unfilled after ${tKalVerify}ms. Cancelling arb-price order.`);
       try { await cancelKalshiOrder(kalOrderId, DRY_RUN); } catch { /* best effort */ }
 
-      // ── Post-cancel reconciliation: check if KAL filled before cancel arrived ──
+      // -- Post-cancel reconciliation: check if KAL filled before cancel arrived --
       // Race condition: order can fill between last poll and cancel request.
       // Wait 500ms to let Kalshi settle the cancel/fill race, then re-check.
       await sleep(500);
@@ -6109,12 +6109,12 @@ async function executeArb(
           return { sessionSkip: true, unhedged: null };
         }
       } catch (e) {
-        console.warn(`  [KAL LEG] Post-cancel order check failed: ${(e as Error).message} — proceeding with hedge.`);
+        console.warn(`  [KAL LEG] Post-cancel order check failed: ${(e as Error).message} -- proceeding with hedge.`);
       }
 
       const hedged = await immediatePmHedge(pmFilled);
       if (hedged >= pmFilled) {
-        // ── CRITICAL: Final KAL re-check after PM hedge ──────────────────────
+        // -- CRITICAL: Final KAL re-check after PM hedge ----------------------
         // The KAL GTC may have filled DURING the PM hedge (cancel/fill race).
         // If KAL filled, we're double-hedged. Sell the PM hedge back to recover.
         let kalLateFilledCount = 0;
@@ -6129,11 +6129,11 @@ async function executeArb(
             try {
               const oppBid = await fetchPmBestBid(pmOppLeg!.tokenId, clobBase);
               if (oppBid !== null && oppBid > 0) {
-                console.log(`  [RACE RECOVERY] Selling ${hedged}×${pmOppLeg!.outcome} @ ${fmtPct(oppBid)} to undo PM hedge.`);
+                console.log(`  [RACE RECOVERY] Selling ${hedged}x${pmOppLeg!.outcome} @ ${fmtPct(oppBid)} to undo PM hedge.`);
                 await placePmGTCAsk(pmOppLeg!.tokenId, oppBid, hedged, pmOppLeg!.tickSize, pmOppLeg!.negRisk, DRY_RUN);
                 console.log(`  [RACE RECOVERY] PM hedge sell order placed. KAL arb is the real second leg.`);
               } else {
-                console.warn(`  [RACE RECOVERY] No PM bid available — PM hedge stuck. KAL still filled though.`);
+                console.warn(`  [RACE RECOVERY] No PM bid available -- PM hedge stuck. KAL still filled though.`);
               }
             } catch (sellErr) {
               console.error(`  [RACE RECOVERY] PM sell failed: ${(sellErr as Error).message}`);
@@ -6166,7 +6166,7 @@ async function executeArb(
             return { sessionSkip: true, unhedged: null };
           }
         } catch (e) {
-          console.warn(`  [RACE CHECK] Final KAL order check failed: ${(e as Error).message} — proceeding with hedge-complete.`);
+          console.warn(`  [RACE CHECK] Final KAL order check failed: ${(e as Error).message} -- proceeding with hedge-complete.`);
         }
 
         const oppAskNow = await fetchPmAsk(pmOppLeg!.tokenId, process.env.POLY_CLOB_URL ?? "https://clob.polymarket.com").catch(() => null);
@@ -6190,11 +6190,11 @@ async function executeArb(
           saveExecMetric("hedge-entry", "kal-gtc-timeout-pm-hedged");
           return { sessionSkip: true, unhedged: null };
         }
-        // oppAsk fetch failed — fall through to hedge loop for proper cost tracking
+        // oppAsk fetch failed -- fall through to hedge loop for proper cost tracking
         console.warn(`  [IMMEDIATE PM HEDGE] Hedged ${hedged} shares but oppAsk fetch failed. Entering hedge loop for cost tracking.`);
       }
       const remaining = pmFilled - hedged;
-      console.warn(`  [HEDGE MODE] ${remaining} PM shares unhedged — entering hedge loop.`);
+      console.warn(`  [HEDGE MODE] ${remaining} PM shares unhedged -- entering hedge loop.`);
       printTimings();
       metric.firstLegFilled = pmFilled;
       saveExecMetric("hedge-entry", "kal-gtc-timeout");
@@ -6202,9 +6202,9 @@ async function executeArb(
     }
 
   } else {
-    // ── Kalshi IOC first (Kalshi is the favourite / more expensive) ──────────
+    // -- Kalshi IOC first (Kalshi is the favourite / more expensive) ----------
 
-    // Fetch live orderbook depth: WS first → cache → REST fallback
+    // Fetch live orderbook depth: WS first -> cache -> REST fallback
     let kalBook: { yes: [number, number][]; no: [number, number][] } | null = getWsKalBook(kalLeg.ticker);
     if (kalBook) {
       console.log(`  [KAL LEG] Using WS orderbook (live)`);
@@ -6228,33 +6228,33 @@ async function executeArb(
         : deriveNoAsks(kalBook.yes);
       if (askLevels.length === 0) {
         console.log(`  [KAL LEG] Orderbook empty. Raw: yesBids=${kalBook.yes.length} levels, noBids=${kalBook.no.length} levels.`);
-        if (kalBook.yes.length > 0) console.log(`  [KAL LEG]   YES bids (top 3): ${kalBook.yes.slice(0, 3).map(l => `${l[0]}¢×${l[1]}`).join(", ")}`);
-        if (kalBook.no.length > 0) console.log(`  [KAL LEG]   NO bids (top 3): ${kalBook.no.slice(0, 3).map(l => `${l[0]}¢×${l[1]}`).join(", ")}`);
+        if (kalBook.yes.length > 0) console.log(`  [KAL LEG]   YES bids (top 3): ${kalBook.yes.slice(0, 3).map(l => `${l[0]}cx${l[1]}`).join(", ")}`);
+        if (kalBook.no.length > 0) console.log(`  [KAL LEG]   NO bids (top 3): ${kalBook.no.slice(0, 3).map(l => `${l[0]}cx${l[1]}`).join(", ")}`);
         // DEPTH FIX: orderbook endpoint sometimes returns empty while market listing shows offers.
         // Fall back to listing data (same fix as depth-check phase).
         const listingPrice = kalSide === "yes" ? kalLeg.yesAsk : kalLeg.noAsk;
         const listingSize = (kalSide === "yes" ? kalLeg.yesAskSize : kalLeg.noAskSize) ?? 0;
         const listingCents = Math.round(listingPrice * 100);
         if (listingSize >= shares && listingCents <= kalLimitCents) {
-          console.log(`  [KAL LEG] [DEPTH FIX] Using listing data: ${listingSize} contracts @ ${listingCents}¢`);
+          console.log(`  [KAL LEG] [DEPTH FIX] Using listing data: ${listingSize} contracts @ ${listingCents}c`);
           askLevels.push([listingCents, listingSize]);
         } else {
-          console.log(`  [KAL LEG] Insufficient depth: 0/${shares} contracts (listing: ${listingSize}@${listingCents}¢ limit=${kalLimitCents}¢). Skipping.`);
+          console.log(`  [KAL LEG] Insufficient depth: 0/${shares} contracts (listing: ${listingSize}@${listingCents}c limit=${kalLimitCents}c). Skipping.`);
           saveExecMetric("abort-pre-first", "kal-depth-empty");
           return { sessionSkip: false, unhedged: null, abortReason: "soft" };
         }
       }
-      console.log(`  [KAL LEG] Derived ${kalSide.toUpperCase()} asks (top 5): ${askLevels.slice(0, 5).map(l => `${l[0]}¢×${l[1]}`).join(", ")}  limit=${kalLimitCents}¢`);
+      console.log(`  [KAL LEG] Derived ${kalSide.toUpperCase()} asks (top 5): ${askLevels.slice(0, 5).map(l => `${l[0]}cx${l[1]}`).join(", ")}  limit=${kalLimitCents}c`);
       const sweep = sweepKalshiDepth(askLevels, shares, kalLimitCents);
       kalSweepResult = sweep;
       if (!sweep || sweep.totalQty === 0) {
         const allAvail = askLevels.reduce((s, l) => s + l[1], 0);
-        console.log(`  [KAL LEG] No depth at ≤${kalLimitCents}¢. Total book: ${allAvail} contracts up to ${askLevels[askLevels.length - 1][0]}¢. Skipping.`);
+        console.log(`  [KAL LEG] No depth at <=${kalLimitCents}c. Total book: ${allAvail} contracts up to ${askLevels[askLevels.length - 1][0]}c. Skipping.`);
         saveExecMetric("abort-pre-first", "kal-no-depth-at-limit");
         return { sessionSkip: false, unhedged: null, abortReason: "soft" };
       }
       if (sweep.totalQty < shares) {
-        console.log(`  [KAL LEG] Partial depth: ${sweep.totalQty}/${shares} at ≤${kalLimitCents}¢. Will attempt partial fill.`);
+        console.log(`  [KAL LEG] Partial depth: ${sweep.totalQty}/${shares} at <=${kalLimitCents}c. Will attempt partial fill.`);
       }
       // Verify edge remains profitable at average fill price
       const avgEdge = 1 - (sweep.avgPrice / 100) - pmAsk - estimateFees(sweep.avgPrice / 100, pmAsk);
@@ -6263,13 +6263,13 @@ async function executeArb(
         saveExecMetric("abort-pre-first", "kal-edge-too-low");
         return { sessionSkip: false, unhedged: null, abortReason: "soft" };
       }
-      console.log(`  [KAL LEG] Depth OK: ${sweep.totalQty} contracts across ${askLevels.filter(l => l[0] <= kalLimitCents).length} levels. Worst=${sweep.worstPrice}¢ Avg=${sweep.avgPrice.toFixed(1)}¢`);
+      console.log(`  [KAL LEG] Depth OK: ${sweep.totalQty} contracts across ${askLevels.filter(l => l[0] <= kalLimitCents).length} levels. Worst=${sweep.worstPrice}c Avg=${sweep.avgPrice.toFixed(1)}c`);
     }
 
-    // ── Kalshi first leg + PM pre-sign (parallel) ──────────────────────────
+    // -- Kalshi first leg + PM pre-sign (parallel) --------------------------
     // Two modes:
-    //   KAL_MAKER_MODE=false (default): IOC at ask → taker fee (7%)
-    //   KAL_MAKER_MODE=true:  GTC bid at ask-1¢ → maker fee (1.75%), fallback to IOC after timeout
+    //   KAL_MAKER_MODE=false (default): IOC at ask -> taker fee (7%)
+    //   KAL_MAKER_MODE=true:  GTC bid at ask-1c -> maker fee (1.75%), fallback to IOC after timeout
     let kalIOCCount = (kalSweepResult && kalSweepResult.totalQty < shares) ? kalSweepResult.totalQty : shares;
 
     // Enforce Kalshi minimum = PM minimum so partial fills can never undersize PM orders
@@ -6291,8 +6291,8 @@ async function executeArb(
     const kalMakerBidCents = Math.max(1, kalAskCents - 1);
 
     if (KAL_MAKER_MODE && !DRY_RUN && kalMakerBidCents < kalLimitCents) {
-      // ── MAKER MODE: GTC bid at ask-1¢, poll for fill, fallback to IOC ──
-      console.log(`  [KAL LEG] MAKER MODE: GTC bid at ${kalMakerBidCents}¢ (ask=${kalAskCents}¢) ticker=${kalLeg.ticker} side=${kalSide} qty=${kalIOCCount}`);
+      // -- MAKER MODE: GTC bid at ask-1c, poll for fill, fallback to IOC --
+      console.log(`  [KAL LEG] MAKER MODE: GTC bid at ${kalMakerBidCents}c (ask=${kalAskCents}c) ticker=${kalLeg.ticker} side=${kalSide} qty=${kalIOCCount}`);
 
       // Place GTC + pre-sign PM in parallel
       const makerOrder = buildKalshiGTCOrder(kalLeg.ticker, "buy", kalSide, kalMakerBidCents, kalIOCCount);
@@ -6302,9 +6302,9 @@ async function executeArb(
       ]);
       if (pmSigned.status === "fulfilled") {
         pmPreSigned = pmSigned.value;
-        console.log(`  [PM PRE-SIGN] Order pre-signed at ${fmtPct(pmAsk)} × ${shares} shares`);
+        console.log(`  [PM PRE-SIGN] Order pre-signed at ${fmtPct(pmAsk)} x ${shares} shares`);
       } else {
-        console.warn(`  [PM PRE-SIGN] Failed: ${(pmSigned.reason as Error).message} — will use normal flow`);
+        console.warn(`  [PM PRE-SIGN] Failed: ${(pmSigned.reason as Error).message} -- will use normal flow`);
       }
 
       if (kalRes.status === "rejected") {
@@ -6317,7 +6317,7 @@ async function executeArb(
 
         // Check if GTC filled immediately (crossed resting ask)
         if (makerMeta.filled >= kalIOCCount) {
-          console.log(`  [KAL LEG] MAKER: Instant fill! ${makerMeta.filled}/${kalIOCCount} @ ${kalMakerBidCents}¢ (fees=$${makerMeta.fees.toFixed(2)})`);
+          console.log(`  [KAL LEG] MAKER: Instant fill! ${makerMeta.filled}/${kalIOCCount} @ ${kalMakerBidCents}c (fees=$${makerMeta.fees.toFixed(2)})`);
           kalFilledViaMaker = true;
         } else {
           // Poll for fill
@@ -6343,26 +6343,26 @@ async function executeArb(
               } catch { /* already filled or cancelled */ }
             }
           } else {
-            // No fills — cancel GTC and fall back to IOC
+            // No fills -- cancel GTC and fall back to IOC
             console.log(`  [KAL LEG] MAKER: 0 fills after ${KAL_MAKER_WAIT_MS}ms. Cancelling GTC, falling back to IOC.`);
             if (makerOrderId) {
               try { await cancelKalshiOrder(makerOrderId, false); } catch { /* ok */ }
             }
-            kalResult = undefined; // reset — will be set by IOC below
+            kalResult = undefined; // reset -- will be set by IOC below
           }
         }
 
         if (kalFilledViaMaker) {
-          // Maker fill succeeded — use the results
+          // Maker fill succeeded -- use the results
           kalFailed = false;
         }
       }
     }
 
-    // ── IOC path (default, or maker-mode fallback) ────────────────────────
+    // -- IOC path (default, or maker-mode fallback) ------------------------
     if (!kalFilledViaMaker) {
       const kalIOCOrder = buildKalshiIOCOrder(kalLeg.ticker, kalLimitCents / 100, kalIOCCount, kalSide);
-      console.log(`  [KAL LEG] Placing IOC: ticker=${kalLeg.ticker} side=${kalSide} limit=${kalLimitCents}¢ qty=${kalIOCCount}`);
+      console.log(`  [KAL LEG] Placing IOC: ticker=${kalLeg.ticker} side=${kalSide} limit=${kalLimitCents}c qty=${kalIOCCount}`);
 
       if (!DRY_RUN) {
         if (!pmPreSigned) {
@@ -6375,12 +6375,12 @@ async function executeArb(
           else { kalResult = kalRes.reason; kalFailed = true; }
           if (pmSigned.status === "fulfilled") {
             pmPreSigned = pmSigned.value;
-            console.log(`  [PM PRE-SIGN] Order pre-signed at ${fmtPct(pmAsk)} × ${shares} shares`);
+            console.log(`  [PM PRE-SIGN] Order pre-signed at ${fmtPct(pmAsk)} x ${shares} shares`);
           } else {
-            console.warn(`  [PM PRE-SIGN] Failed: ${(pmSigned.reason as Error).message} — will use normal flow`);
+            console.warn(`  [PM PRE-SIGN] Failed: ${(pmSigned.reason as Error).message} -- will use normal flow`);
           }
         } else {
-          // PM already pre-signed during maker attempt — just place IOC
+          // PM already pre-signed during maker attempt -- just place IOC
           try {
             kalResult = await placeKalshiOrder(kalIOCOrder, false);
           } catch (kalErr) { kalResult = kalErr; kalFailed = true; }
@@ -6410,7 +6410,7 @@ async function executeArb(
     const kalOrderId = kalMeta.orderId ? String(kalMeta.orderId) : "";
 
     if (!DRY_RUN && kalFilled === 0) {
-      console.log(`  [KAL LEG] 0 fills — book was empty or pulled. No exposure.`);
+      console.log(`  [KAL LEG] 0 fills -- book was empty or pulled. No exposure.`);
       printTimings();
       saveExecMetric("abort-pre-first", "kal-ioc-no-fill");
       return { sessionSkip: false, unhedged: null };
@@ -6430,7 +6430,7 @@ async function executeArb(
     // Effective PM minimum: per-market minSize (typically 5 shares) + PM $1 FOK floor
     const pmMinByFOKkf = pmAsk > 0 ? Math.ceil(PM_MARKETABLE_MIN_VALUE / pmAsk) : pmLeg.minSize;
     const effectivePmMinKF = Math.max(pmLeg.minSize, pmMinByFOKkf);
-    // If Kalshi partial-filled below PM minimum, go straight to hedge — don't oversize PM
+    // If Kalshi partial-filled below PM minimum, go straight to hedge -- don't oversize PM
     if (!DRY_RUN && kalFilled < effectivePmMinKF) {
       console.warn(`  [KAL LEG] Partial fill ${kalFilled} < PM minimum ${effectivePmMinKF}. Hedging instead of oversizing PM.`);
       printTimings();
@@ -6441,7 +6441,7 @@ async function executeArb(
     const pmShares = DRY_RUN ? shares : kalFilled;
 
     // Cap PM price at breakeven based on ACTUAL KAL fill cost (not scan-time estimate).
-    // Without this, slippage or fees on KAL side can push total cost > $1/share → guaranteed loss.
+    // Without this, slippage or fees on KAL side can push total cost > $1/share -> guaranteed loss.
     pmOrderPrice = pmAsk;
     let pmPriceWasCapped = false;
     if (!DRY_RUN && kalFillCostCents > 0 && kalFilled > 0) {
@@ -6452,11 +6452,11 @@ async function executeArb(
         pmOrderPrice = Math.floor(maxPmForBreakeven / pmTick) * pmTick;
         pmPriceWasCapped = true;
         console.log(
-          `  [PM LEG] Capping PM price: scan=${fmtPct(pmAsk)} → breakeven=${fmtPct(maxPmForBreakeven)} → order=${fmtPct(pmOrderPrice)}` +
+          `  [PM LEG] Capping PM price: scan=${fmtPct(pmAsk)} -> breakeven=${fmtPct(maxPmForBreakeven)} -> order=${fmtPct(pmOrderPrice)}` +
           ` (KAL actual=${fmtPct(actualKalPerShare)}/share incl fees)`
         );
         if (pmOrderPrice <= 0) {
-          console.warn(`  [PM LEG] Breakeven price ≤0 — KAL cost too high. Entering hedge mode.`);
+          console.warn(`  [PM LEG] Breakeven price <=0 -- KAL cost too high. Entering hedge mode.`);
           printTimings();
           metric.firstLegFilled = kalFilled;
           saveExecMetric("hedge-entry", "pm-breakeven-negative");
@@ -6465,7 +6465,7 @@ async function executeArb(
       }
     }
 
-    // ── PM FOK execution: single aggressive FOK at the ask ──────────────────
+    // -- PM FOK execution: single aggressive FOK at the ask ------------------
     // Sends a Fill-or-Kill at pmOrderPrice. Subject to PM's ~3-second sports
     // delay but simpler and avoids the stale-GTC problem where liquidity
     // disappears during the 5-second poll window.
@@ -6488,7 +6488,7 @@ async function executeArb(
       } catch (e) { fokResult = e; fokFailed = true; }
 
       if (fokFailed) {
-        console.error(`  [PM LEG] FOK failed: ${(fokResult as Error).message} — entering hedge.`);
+        console.error(`  [PM LEG] FOK failed: ${(fokResult as Error).message} -- entering hedge.`);
         printTimings();
         metric.firstLegFilled = kalFilled;
         saveExecMetric("hedge-entry", "pm-fok-failed");
@@ -6518,7 +6518,7 @@ async function executeArb(
         pmFilled = true;
         pmFinalOrderId = fokMeta.orderId ? String(fokMeta.orderId) : "";
       } else if (fokMeta.status === "delayed" && fokMeta.orderId) {
-        // FOK matched but on-chain confirmation pending — poll for it
+        // FOK matched but on-chain confirmation pending -- poll for it
         console.log(`  [PM LEG] FOK delayed (on-chain pending), polling for confirmation...`);
         const _tPoll0 = performance.now();
         const finalStatus = await waitForPmOrderFill(String(fokMeta.orderId), 20_000, pmLeg.tokenId, pmPreBalance);
@@ -6548,7 +6548,7 @@ async function executeArb(
       }
 
       if (!pmFilled) {
-        // FOK not filled — check on-chain one last time
+        // FOK not filled -- check on-chain one last time
         try {
           const bal = await getOnChainBalance(pmLeg.tokenId);
           if (bal >= pmPreBalance + pmShares) {
@@ -6574,7 +6574,7 @@ async function executeArb(
             if (unclaimedPm >= pmShares) {
               console.log(
                 `  [PM LEG] Ghost fill detected: PM wallet has ${totalPmBal} shares (${unclaimedPm} unclaimed) for ${pmLeg.outcome}.` +
-                ` Arb already covered — proceeding as filled.`
+                ` Arb already covered -- proceeding as filled.`
               );
               pmFilled = true;
               pmFinalOrderId = fokMeta.orderId ? String(fokMeta.orderId) : "";
@@ -6601,10 +6601,10 @@ async function executeArb(
     pmOrderIdForVerify = pmFinalOrderId;
     console.log(`  [PM LEG] OK orderId=${pmFinalOrderId || "n/a"} filled=${pmShares}`);
 
-    // Partial KAL fill: kalFilled < pmShares → hedge the gap
+    // Partial KAL fill: kalFilled < pmShares -> hedge the gap
     const unhedgedPmGap = pmShares - kalFilled;
     if (!DRY_RUN && unhedgedPmGap > 0) {
-      console.warn(`  [PARTIAL] KAL filled ${kalFilled}, PM bought ${pmShares}. ${unhedgedPmGap} PM shares unhedged — entering hedge.`);
+      console.warn(`  [PARTIAL] KAL filled ${kalFilled}, PM bought ${pmShares}. ${unhedgedPmGap} PM shares unhedged -- entering hedge.`);
       printTimings();
       const partialKalCost = Math.round((kalFilled * kalAsk + kalFeesTotal) * 100) / 100;
       const partialPmCost = Math.round(pmShares * pmAsk * 100) / 100;
@@ -6636,7 +6636,7 @@ async function executeArb(
     }
   }
 
-  // ── Post-trade verification: triple-check PM fill before declaring success ───
+  // -- Post-trade verification: triple-check PM fill before declaring success ---
   // Check 1: on-chain balanceOf (authoritative)
   // Check 2: CLOB API order status (orderId query)
   // Check 3: data-api positions (portfolio)
@@ -6645,12 +6645,12 @@ async function executeArb(
     const _tPmV0 = performance.now();
     let pmVerified = false;
 
-    // Check 1: On-chain balance (authoritative) — compare against pre-balance
+    // Check 1: On-chain balance (authoritative) -- compare against pre-balance
     try {
       const onChainBal = await getOnChainBalanceWithFallback(pmLeg.tokenId);
       const newShares = onChainBal - pmPreBalance;
       if (newShares > 0) {
-        console.log(`  [POST-FILL] ✓ On-chain verified: ${newShares} new shares (total=${onChainBal}, pre=${pmPreBalance}) PM ${pmLeg.outcome}`);
+        console.log(`  [POST-FILL] [OK] On-chain verified: ${newShares} new shares (total=${onChainBal}, pre=${pmPreBalance}) PM ${pmLeg.outcome}`);
         pmVerified = true;
       } else if (onChainBal >= 0) {
         console.warn(`  [POST-FILL] On-chain: 0 new shares (total=${onChainBal}, pre=${pmPreBalance}) for ${pmLeg.outcome}. Trying other checks...`);
@@ -6666,7 +6666,7 @@ async function executeArb(
       try {
         const orderCheck = await getPmOrderFills(pmOrderIdForVerify);
         if (orderCheck.status === "matched" || orderCheck.filledShares > 0) {
-          console.log(`  [POST-FILL] ✓ CLOB API verified: status=${orderCheck.status} filled=${orderCheck.filledShares}`);
+          console.log(`  [POST-FILL] [OK] CLOB API verified: status=${orderCheck.status} filled=${orderCheck.filledShares}`);
           pmVerified = true;
         } else {
           console.warn(`  [POST-FILL] CLOB API: status=${orderCheck.status} filled=${orderCheck.filledShares}`);
@@ -6682,7 +6682,7 @@ async function executeArb(
         const verifyPos = await fetchPmPositionsCached(0);
         const actualPm = sumPmHeld(verifyPos, pmLeg.tokenId);
         if (actualPm > 0) {
-          console.log(`  [POST-FILL] ✓ Data-api verified: ${actualPm}× PM ${pmLeg.outcome}`);
+          console.log(`  [POST-FILL] [OK] Data-api verified: ${actualPm}x PM ${pmLeg.outcome}`);
           pmVerified = true;
         } else {
           console.warn(`  [POST-FILL] Data-api: 0 shares for ${pmLeg.outcome}`);
@@ -6695,7 +6695,7 @@ async function executeArb(
     tPmVerify = performance.now() - _tPmV0;
 
     if (!pmVerified) {
-      console.warn(`  [POST-FILL] ⚠ ALL 3 checks failed to confirm PM fill. Entering hedge for ${shares} Kalshi contracts.`);
+      console.warn(`  [POST-FILL] [!] ALL 3 checks failed to confirm PM fill. Entering hedge for ${shares} Kalshi contracts.`);
       printTimings();
       metric.firstLegFilled = shares;
       saveExecMetric("hedge-entry", "post-verify-all-failed");
@@ -6717,10 +6717,10 @@ async function executeArb(
   const actualPmFillPrice = pmOrderPrice;
   const pmCostBothLegs = Math.round(shares * actualPmFillPrice * 100) / 100;
   if (kalFillCostCents > 0) {
-    console.log(`  [COST] KAL actual fill: ${kalFilled}×${(actualKalFillPrice * 100).toFixed(1)}¢ = $${kalRawCost.toFixed(2)} + $${kalFeesTotal.toFixed(2)} fee (snapshot was ${(kalAsk * 100).toFixed(0)}¢)`);
+    console.log(`  [COST] KAL actual fill: ${kalFilled}x${(actualKalFillPrice * 100).toFixed(1)}c = $${kalRawCost.toFixed(2)} + $${kalFeesTotal.toFixed(2)} fee (snapshot was ${(kalAsk * 100).toFixed(0)}c)`);
   }
   if (actualPmFillPrice !== pmAsk) {
-    console.log(`  [COST] PM price capped: scan=${fmtPct(pmAsk)} → order=${fmtPct(actualPmFillPrice)}`);
+    console.log(`  [COST] PM price capped: scan=${fmtPct(pmAsk)} -> order=${fmtPct(actualPmFillPrice)}`);
   }
   logArbTrade({
     id: `arb-${Date.now()}`,
@@ -6745,7 +6745,7 @@ async function executeArb(
     initialExchange: pmFirst ? "pm" : "kal",
     ...(kalFilledViaMaker ? { kalMakerFill: true } : {}),
   });
-  // Both legs filled — skip this match for the rest of the session to prevent
+  // Both legs filled -- skip this match for the rest of the session to prevent
   // re-arbing in the opposite direction (which would create contradictory positions).
   metric.firstLegFilled = shares;
   metric.secondLegFilled = shares;
@@ -6753,7 +6753,7 @@ async function executeArb(
   return { sessionSkip: true, unhedged: null };
 }
 
-// ─── 3-Leg execution (Soccer dirs A-F) ────────────────────────────────────────
+// --- 3-Leg execution (Soccer dirs A-F) ----------------------------------------
 // A: KAL Home YES + KAL Draw YES + PM Away YES   (2 KAL + 1 PM)
 // B: KAL Home YES + PM Draw YES  + KAL Away YES  (2 KAL + 1 PM)
 // C: PM Home YES  + KAL Draw YES + KAL Away YES  (2 KAL + 1 PM)
@@ -6777,7 +6777,7 @@ function map3LegDir(entry: WatchEntry, dir: ArbDir): Leg3[] | null {
   if (!entry.is3Way || !entry.kal3 || !entry.pm3) return null;
   // Map each dir to [leg1, leg2, leg3] where leg1 is the minority-exchange side
   switch (dir) {
-    case "A": return [ // 2 KAL + 1 PM → PM first
+    case "A": return [ // 2 KAL + 1 PM -> PM first
       { exchange: "pm",  kalLeg: entry.kal2, pmLeg: entry.pm2, side: "yes", price: 0 }, // PM Away
       { exchange: "kal", kalLeg: entry.kal1, pmLeg: entry.pm1, side: "yes", price: 0 }, // KAL Home
       { exchange: "kal", kalLeg: entry.kal3, pmLeg: entry.pm3, side: "yes", price: 0 }, // KAL Draw
@@ -6792,7 +6792,7 @@ function map3LegDir(entry: WatchEntry, dir: ArbDir): Leg3[] | null {
       { exchange: "kal", kalLeg: entry.kal3, pmLeg: entry.pm3, side: "yes", price: 0 }, // KAL Draw
       { exchange: "kal", kalLeg: entry.kal2, pmLeg: entry.pm2, side: "yes", price: 0 }, // KAL Away
     ];
-    case "D": return [ // 1 KAL + 2 PM → KAL first
+    case "D": return [ // 1 KAL + 2 PM -> KAL first
       { exchange: "kal", kalLeg: entry.kal1, pmLeg: entry.pm1, side: "yes", price: 0 }, // KAL Home
       { exchange: "pm",  kalLeg: entry.kal3, pmLeg: entry.pm3, side: "yes", price: 0 }, // PM Draw
       { exchange: "pm",  kalLeg: entry.kal2, pmLeg: entry.pm2, side: "yes", price: 0 }, // PM Away
@@ -6848,7 +6848,7 @@ async function executeArb3Leg(
     if (shares < effectiveMin) shares = effectiveMin;
   }
   if (shares * totalCostPerShare > TRADE_USD * 2) {
-    console.log(`  [3LEG] Cost too high: ${shares} × $${totalCostPerShare.toFixed(3)} = $${(shares * totalCostPerShare).toFixed(2)} > 2× budget. Skipping.`);
+    console.log(`  [3LEG] Cost too high: ${shares} x $${totalCostPerShare.toFixed(3)} = $${(shares * totalCostPerShare).toFixed(2)} > 2x budget. Skipping.`);
     return { sessionSkip: false, unhedged: null, abortReason: "soft" };
   }
 
@@ -6865,7 +6865,7 @@ async function executeArb3Leg(
     console.log(`  Leg${i + 1}: ${l.exchange.toUpperCase()} ${l.exchange === "kal" ? l.kalLeg.ticker : l.pmLeg.outcome} YES @${fmtPct(l.price)}`);
   }
 
-  // ── Start execution-time book tracker for the KAL leg ──────────────────────
+  // -- Start execution-time book tracker for the KAL leg ----------------------
   {
     const kalLeg3 = legs.find(l => l.exchange === "kal");
     const pmLeg3 = legs.find(l => l.exchange === "pm");
@@ -6878,7 +6878,7 @@ async function executeArb3Leg(
     }
   }
 
-  // ── Execute legs sequentially ──────────────────────────────────────────────
+  // -- Execute legs sequentially ----------------------------------------------
   const filled: { leg: Leg3; fillPrice: number; fillCost: number; kalFees?: number }[] = [];
 
   for (let i = 0; i < legs.length; i++) {
@@ -6887,7 +6887,7 @@ async function executeArb3Leg(
 
     if (leg.exchange === "pm") {
       // PM: FOK order
-      console.log(`  [${legLabel}] PM FOK ${shares}×${leg.pmLeg.outcome} @${fmtPct(leg.price)}`);
+      console.log(`  [${legLabel}] PM FOK ${shares}x${leg.pmLeg.outcome} @${fmtPct(leg.price)}`);
       try {
         const res = await placePmFOK(leg.pmLeg.tokenId, leg.price, shares, leg.pmLeg.tickSize, leg.pmLeg.negRisk, DRY_RUN);
         const meta = extractPmMeta(res);
@@ -6909,7 +6909,7 @@ async function executeArb3Leg(
             continue;
           }
         }
-        // PM failed — handle partial state
+        // PM failed -- handle partial state
         console.log(`  [${legLabel}] PM REJECTED: status=${meta.status}`);
       } catch (err) {
         console.error(`  [${legLabel}] PM ERROR: ${(err as Error).message}`);
@@ -6917,7 +6917,7 @@ async function executeArb3Leg(
     } else {
       // KAL: limit order at listing price
       const kalLimitCents = Math.max(1, Math.min(99, Math.round(leg.price * 100)));
-      console.log(`  [${legLabel}] KAL ${leg.kalLeg.ticker} YES @${kalLimitCents}¢ ×${shares}`);
+      console.log(`  [${legLabel}] KAL ${leg.kalLeg.ticker} YES @${kalLimitCents}c x${shares}`);
       try {
         const kalOrder = buildKalshiGTCOrder(leg.kalLeg.ticker, "buy", "yes", kalLimitCents, shares);
         const kalRes = await placeKalshiOrder(kalOrder, DRY_RUN);
@@ -6932,11 +6932,11 @@ async function executeArb3Leg(
         const kalFillCost = Number(kr?.order?.taker_fill_cost ?? kr?.taker_fill_cost ?? 0) / 100;
         if (kalFilledQty >= shares) {
           const actualPrice = kalFillCost > 0 ? kalFillCost / kalFilledQty : leg.price;
-          console.log(`  [${legLabel}] KAL filled ${kalFilledQty} @${(actualPrice * 100).toFixed(1)}¢ fees=$${kalFees.toFixed(3)}`);
+          console.log(`  [${legLabel}] KAL filled ${kalFilledQty} @${(actualPrice * 100).toFixed(1)}c fees=$${kalFees.toFixed(3)}`);
           filled.push({ leg, fillPrice: actualPrice, fillCost: kalFillCost + kalFees, kalFees });
           continue;
         }
-        // Partial or no fill — ALWAYS cancel the GTC order to prevent orphaned positions.
+        // Partial or no fill -- ALWAYS cancel the GTC order to prevent orphaned positions.
         // Without cancellation, the GTC order stays resting on Kalshi, fills later,
         // and creates untracked exposure with no arb_trades entry.
         const orderId = String(kr?.order?.order_id ?? kr?.order_id ?? "");
@@ -6944,7 +6944,7 @@ async function executeArb3Leg(
           try { await cancelKalshiOrder(orderId, DRY_RUN); } catch { /* order may already be gone */ }
         }
         if (kalFilledQty > 0) {
-          console.log(`  [${legLabel}] KAL PARTIAL: ${kalFilledQty}/${shares} — cancelled remaining, treating as failed`);
+          console.log(`  [${legLabel}] KAL PARTIAL: ${kalFilledQty}/${shares} -- cancelled remaining, treating as failed`);
         }
         console.log(`  [${legLabel}] KAL FAILED/PARTIAL`);
       } catch (err) {
@@ -6952,19 +6952,19 @@ async function executeArb3Leg(
       }
     }
 
-    // ── Leg failed — handle based on how many legs already filled ─────────
+    // -- Leg failed -- handle based on how many legs already filled ---------
     if (filled.length === 0) {
-      // First leg failed — clean exit, no exposure
+      // First leg failed -- clean exit, no exposure
       console.log(`  [3LEG] First leg failed. No exposure. Aborting.`);
       return { sessionSkip: false, unhedged: null, abortReason: "soft" };
     }
 
     if (filled.length === 1) {
-      // Only 1 of 3 filled — try to sell it back immediately
+      // Only 1 of 3 filled -- try to sell it back immediately
       const f = filled[0];
       console.log(`  [3LEG] Only 1 leg filled (${f.leg.exchange}). Attempting immediate exit...`);
       if (f.leg.exchange === "pm") {
-        // We hold a PM token — we can't easily sell back via FOK, enter hedge to exit
+        // We hold a PM token -- we can't easily sell back via FOK, enter hedge to exit
         // Create unhedged pointing at the PM leg as held, needing KAL to "complete"
         // But actually we just want to exit. The hedge system's "exit" path will sell it.
         const tid5453 = `arb-${Date.now()}`;
@@ -6997,7 +6997,7 @@ async function executeArb3Leg(
         });
         return { sessionSkip: true, unhedged };
       } else {
-        // We hold KAL YES — enter hedge to acquire PM or exit
+        // We hold KAL YES -- enter hedge to acquire PM or exit
         const tid5481 = `arb-${Date.now()}`;
         const unhedged: UnhedgedPosition = {
           tradeId: tid5481,
@@ -7032,12 +7032,12 @@ async function executeArb3Leg(
     }
 
     // filled.length === 2, missing leg i (the one that just failed)
-    // We hold 2 of 3 outcomes — need the 3rd to complete the $1 guarantee
+    // We hold 2 of 3 outcomes -- need the 3rd to complete the $1 guarantee
     const missingLeg = leg;
     console.log(`  [3LEG] 2 of 3 legs filled. Missing: ${missingLeg.exchange} ${missingLeg.exchange === "kal" ? missingLeg.kalLeg.ticker : missingLeg.pmLeg.outcome}. Entering hedge mode.`);
 
     // Build UnhedgedPosition for the missing leg
-    // heldExchange = opposite of missing leg's exchange → hedge tries the right exchange first
+    // heldExchange = opposite of missing leg's exchange -> hedge tries the right exchange first
     const heldEx = missingLeg.exchange === "kal" ? "pm" as const : "kal" as const;
     const totalFilledCost = filled.reduce((s, f) => s + f.fillCost, 0);
     const totalKalFees = filled.reduce((s, f) => s + (f.kalFees ?? 0), 0);
@@ -7064,7 +7064,7 @@ async function executeArb3Leg(
       initialKalFees: heldEx === "kal" ? totalKalFees : 0,
     };
 
-    // Log arb trade in hedging state — use the missing leg's KAL ticker as the primary
+    // Log arb trade in hedging state -- use the missing leg's KAL ticker as the primary
     logArbTrade({
       id: tid5522, ts: new Date().toISOString(),
       match: matchName, dir, status: "hedging", shares,
@@ -7084,7 +7084,7 @@ async function executeArb3Leg(
     return { sessionSkip: true, unhedged };
   }
 
-  // ── All 3 legs filled! ──────────────────────────────────────────────────────
+  // -- All 3 legs filled! ------------------------------------------------------
   const totalFilledCost = filled.reduce((s, f) => s + f.fillCost, 0);
   const totalKalFees = filled.reduce((s, f) => s + (f.kalFees ?? 0), 0);
   const realizedProfit = shares - totalFilledCost;
@@ -7093,7 +7093,7 @@ async function executeArb3Leg(
     `  shares=${shares}  cost=$${totalFilledCost.toFixed(2)}  profit=$${realizedProfit.toFixed(2)}  kalFees=$${totalKalFees.toFixed(3)}`
   );
 
-  // Record completed arb trade — use first KAL leg's ticker as primary
+  // Record completed arb trade -- use first KAL leg's ticker as primary
   const firstKal = filled.find(f => f.leg.exchange === "kal");
   const firstPm = filled.find(f => f.leg.exchange === "pm");
   logArbTrade({
@@ -7123,7 +7123,7 @@ async function executeArb3Leg(
   return { sessionSkip: true, unhedged: null };
 }
 
-// ─── Hedge mode ───────────────────────────────────────────────────────────────
+// --- Hedge mode ---------------------------------------------------------------
 // When one leg filled but the other failed, we stop scanning new arbs and instead:
 //   "complete" order: resting GTC buy on the missing leg at max profitable price
 //   "exit"     order: resting GTC sell on the held leg at the current best bid/ask
@@ -7153,7 +7153,7 @@ async function recheckAndCancelAll(
           const remaining = Number(order.remaining_count ?? ho.shares);
           const inferred = ho.shares - remaining;
           if (inferred > 0) {
-            console.warn(`[HEDGE] recheckCancel: fill count missing for ${rcSt} order — inferred ${inferred} fills`);
+            console.warn(`[HEDGE] recheckCancel: fill count missing for ${rcSt} order -- inferred ${inferred} fills`);
             latestFilled = inferred;
           }
         }
@@ -7168,7 +7168,7 @@ async function recheckAndCancelAll(
         }
         console.log(`[HEDGE] Late GTC fill detected: ${ho.exchange.toUpperCase()} ${ho.role} +${delta}. Remaining: ${pos.sharesHeld}`);
       }
-    } catch { /* order may already be gone — proceed to cancel */ }
+    } catch { /* order may already be gone -- proceed to cancel */ }
     // Cancel the order
     try {
       if (ho.exchange === "pm") await cancelPmOrder(oid, dryRun);
@@ -7179,31 +7179,31 @@ async function recheckAndCancelAll(
   activeOrders.clear();
 }
 
-// ── Hedge Mode Strategy ──────────────────────────────────────────────────────
+// -- Hedge Mode Strategy ------------------------------------------------------
 // When only one arb leg fills, we hold an unhedged position. The bot hedges by
 // racing orders on BOTH platforms simultaneously:
 //
 //   Holding PM token (e.g. P2):
-//     • Complete order on Kalshi: GTC bid for P1 YES  → completes the arb
-//     • Complete order on PM:     GTC bid for P1 token → completes the arb
-//     • Exit order on PM:         GTC ask selling held P2 token → exits position
+//     • Complete order on Kalshi: GTC bid for P1 YES  -> completes the arb
+//     • Complete order on PM:     GTC bid for P1 token -> completes the arb
+//     • Exit order on PM:         GTC ask selling held P2 token -> exits position
 //
 //   Holding Kalshi YES (e.g. P1):
-//     • Complete order on PM:     GTC bid for P2 token → completes the arb
-//     • Complete order on Kalshi:  GTC bid for P2 NO   → completes the arb
-//     • Exit order on Kalshi:     GTC ask selling held P1 YES → exits position
+//     • Complete order on PM:     GTC bid for P2 token -> completes the arb
+//     • Complete order on Kalshi:  GTC bid for P2 NO   -> completes the arb
+//     • Exit order on Kalshi:     GTC ask selling held P1 YES -> exits position
 //
-// Cross-platform exit (e.g. selling PM token on Kalshi) is NOT possible — you
+// Cross-platform exit (e.g. selling PM token on Kalshi) is NOT possible -- you
 // can only sell assets you hold on the platform where you hold them. Buying the
 // opposite contract on the other platform would create a NEW position, not close
 // the existing one. The dual complete orders already cover both fill paths.
 //
 // Each hedge cycle also attempts an aggressive FOK sweep on PM to fill instantly.
-// ─────────────────────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
 let _hedgeLastExitLog = "";  // deduplicate PM exit skip log
 let _hedgeLogCounter = 0;    // cycle counter for periodic status summary
 
-// ─── Cancellation Monitor ────────────────────────────────────────────────────
+// --- Cancellation Monitor ----------------------------------------------------
 // Polls Kalshi market status for ALL open positions (filled + hedging).
 // Detects scalar settlements (match cancelled/voided) and immediately sells
 // PM tokens before PM resolves 50/50, recovering maximum value.
@@ -7213,11 +7213,11 @@ let _hedgeLogCounter = 0;    // cycle counter for periodic status summary
 //   - settlement_value is NOT 0, 100, or empty (fractional payout)
 //
 // On detection: place GTC ASK on PM at max(bestBid, 0.50) to exit fast.
-// ─────────────────────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
 
 // Track which kalTickers we've already processed for cancellation (avoid re-selling)
 const _cancelledTickers = new Set<string>();
-// Track cancelled EVENTS (not just tickers) — e.g. "FNMKOI" and "FNKOIA" are both
+// Track cancelled EVENTS (not just tickers) -- e.g. "FNMKOI" and "FNKOIA" are both
 // from the same match. If one settles scalar, block all sibling markets.
 // Key = event keyword extracted from ticker (e.g. "26MAR09" + team combo).
 const _cancelledEventKeys = new Set<string>();
@@ -7226,7 +7226,7 @@ const CANC_MON_INTERVAL_MS = 10_000; // check every 10s
 
 /**
  * Extract a "match fingerprint" from a Kalshi ticker to detect sibling markets.
- * E.g. KXLOLGAME-26MAR09FNMKOI-MKOI → "KXLOLGAME-26MAR09" + sorted team codes.
+ * E.g. KXLOLGAME-26MAR09FNMKOI-MKOI -> "KXLOLGAME-26MAR09" + sorted team codes.
  * KXLOLGAME-26MAR09FNKOIA-KOIA would share the same date prefix.
  * We use the date portion + series as key since Kalshi uses different event codes
  * for rescheduled markets of the same match.
@@ -7258,7 +7258,7 @@ type OpenPosition = {
   status: "filled" | "hedging" | "resolved";
 };
 
-/** Collect all positions that need void monitoring — includes resolved trades
+/** Collect all positions that need void monitoring -- includes resolved trades
  *  from the last 48h that may not have settled on Kalshi yet. */
 function collectOpenPositions(watchlist: WatchEntry[]): OpenPosition[] {
   const trades = loadArbTrades();
@@ -7305,10 +7305,11 @@ function isScalarSettlement(mkt: KalshiMarket): boolean {
   const result = pickString(mkt.result ?? "").toLowerCase();
   if (result === "scalar") return true;
 
-  // Also check settlement_value for non-binary values
+  // Also check settlement_value for non-binary values.
+  // Kalshi sends settlement_value on a 0–1 dollar scale: 1.0 = YES, 0.0 = NO.
+  // Anything fractional (e.g. 0.14, 0.50) indicates scalar/cancelled settlement.
   const sv = Number(mkt.settlement_value ?? "");
-  if (Number.isFinite(sv) && sv > 0 && sv < 100 && sv !== 0 && sv !== 100) {
-    // Fractional settlement (not 0¢ or 100¢) = scalar/cancelled
+  if (Number.isFinite(sv) && sv > 0 && sv < 1) {
     return true;
   }
   return false;
@@ -7341,7 +7342,7 @@ async function fetchPmBestBid(tokenId: string, clobBase: string): Promise<number
  * Run the cancellation monitor for all open positions.
  * Called from the main loop every ~60s. For each open position:
  *   1. Fetch Kalshi market status
- *   2. If scalar settlement detected → emergency sell PM tokens
+ *   2. If scalar settlement detected -> emergency sell PM tokens
  *   3. Update arb_trades.json with cancellation resolution
  */
 async function runCancellationMonitor(watchlist: WatchEntry[], hedgeStates: HedgeState[], clobBase: string): Promise<void> {
@@ -7375,18 +7376,18 @@ async function runCancellationMonitor(watchlist: WatchEntry[], hedgeStates: Hedg
 
       // Check if this is a scalar (cancelled) settlement
       if (!isScalarSettlement(mkt)) {
-        // Normal binary settlement — mark as handled so we stop polling this ticker
+        // Normal binary settlement -- mark as handled so we stop polling this ticker
         _cancelledTickers.add(ticker);
         continue;
       }
 
       const sv = Number(mkt.settlement_value ?? 0);
       console.error(
-        `\n╔══════════════════════════════════════════════════════════════════╗\n` +
-        `║  ⚠ CANCELLATION DETECTED: ${ticker}\n` +
-        `║  Result: ${mkt.result}  Settlement: ${sv}¢  Status: ${mktStatus}\n` +
-        `║  Affected positions: ${posGroup.length} trade(s)\n` +
-        `╚══════════════════════════════════════════════════════════════════╝\n`
+        `\n+==================================================================+\n` +
+        `|  [!] CANCELLATION DETECTED: ${ticker}\n` +
+        `|  Result: ${mkt.result}  Settlement: ${sv}c  Status: ${mktStatus}\n` +
+        `|  Affected positions: ${posGroup.length} trade(s)\n` +
+        `+==================================================================+\n`
       );
 
       // Mark ticker + event as handled (blocks sibling markets too)
@@ -7398,7 +7399,7 @@ async function runCancellationMonitor(watchlist: WatchEntry[], hedgeStates: Hedg
         await handleCancelledPosition(pos, mkt, hedgeStates, clobBase);
       }
     } catch (err) {
-      // Transient fetch error — will retry next cycle
+      // Transient fetch error -- will retry next cycle
       console.warn(`[CANC-MON] Failed to check ${ticker}: ${(err as Error).message}`);
     }
   }
@@ -7409,17 +7410,17 @@ async function runCancellationMonitor(watchlist: WatchEntry[], hedgeStates: Hedg
  *
  * Three scenarios:
  *
- *   1. BOTH LEGS FILLED (status="filled") — We hold PM tokens + Kalshi already settled.
- *      → Sell PM tokens into bids (FOK at bestBid if >= 50¢, else GTC ask at 50¢).
+ *   1. BOTH LEGS FILLED (status="filled") -- We hold PM tokens + Kalshi already settled.
+ *      -> Sell PM tokens into bids (FOK at bestBid if >= 50c, else GTC ask at 50c).
  *        Kalshi side already paid out at settlement_value automatically.
  *
- *   2. ONLY PM SHARES HELD (status="hedging", heldExchange="pm") — We hold PM tokens,
+ *   2. ONLY PM SHARES HELD (status="hedging", heldExchange="pm") -- We hold PM tokens,
  *      Kalshi leg was being hedged.
- *      → Cancel ALL hedge orders on BOTH exchanges, then sell PM tokens same as #1.
+ *      -> Cancel ALL hedge orders on BOTH exchanges, then sell PM tokens same as #1.
  *
- *   3. ONLY KALSHI POSITION (status="hedging", heldExchange="kal") — We hold Kalshi
+ *   3. ONLY KALSHI POSITION (status="hedging", heldExchange="kal") -- We hold Kalshi
  *      contracts, PM leg was being hedged.
- *      → Cancel ALL hedge orders on BOTH exchanges. Kalshi settles automatically
+ *      -> Cancel ALL hedge orders on BOTH exchanges. Kalshi settles automatically
  *        at settlement_value (we know the exact payout). No PM tokens to sell.
  */
 async function handleCancelledPosition(
@@ -7437,7 +7438,7 @@ async function handleCancelledPosition(
     `kalSettlement=${svDecimal.toFixed(2)}, status=${pos.status}`
   );
 
-  // ── Step 1: Cancel ALL hedge orders on BOTH exchanges ──────────────────────
+  // -- Step 1: Cancel ALL hedge orders on BOTH exchanges ----------------------
   const matchingHs = hedgeStates.find(hs => hs.position.kalLeg.ticker === pos.kalTicker);
   if (matchingHs) {
     for (const [oid, ho] of matchingHs.activeOrders) {
@@ -7450,8 +7451,8 @@ async function handleCancelledPosition(
     matchingHs.activeOrders.clear();
   }
 
-  // ── Step 2: Determine if we hold PM tokens ─────────────────────────────────
-  // Scenario 3: Kalshi-only position — no PM tokens to sell.
+  // -- Step 2: Determine if we hold PM tokens ---------------------------------
+  // Scenario 3: Kalshi-only position -- no PM tokens to sell.
   const isKalshiOnly = pos.status === "hedging" && matchingHs?.position.heldExchange === "kal";
   if (isKalshiOnly) {
     console.log(
@@ -7470,7 +7471,7 @@ async function handleCancelledPosition(
       scalarSettlement: true,
       kalSettlementValue: svDecimal,
       pmSettlementValue: 0,
-      resolutionNote: `Kalshi scalar settlement (${(svDecimal * 100).toFixed(0)}¢). Kalshi-only position — no PM tokens.`,
+      resolutionNote: `Kalshi scalar settlement (${(svDecimal * 100).toFixed(0)}c). Kalshi-only position -- no PM tokens.`,
     }, pos.tradeId);
     console.log(
       `[CANC-MON] Trade resolved (Kalshi-only): ` +
@@ -7480,16 +7481,16 @@ async function handleCancelledPosition(
     return;
   }
 
-  // ── Scenario 4: Already-resolved trade (both-legs, hedge-complete, etc.) ──
+  // -- Scenario 4: Already-resolved trade (both-legs, hedge-complete, etc.) --
   //    Trade was resolved normally but Kalshi voided the market AFTER resolution.
   //    KAL settles automatically at settlement_value. We may still hold PM tokens
-  //    that should be sold if above 50¢ (void settles PM at 50/50).
+  //    that should be sold if above 50c (void settles PM at 50/50).
   if (pos.status === "resolved") {
     const kalPayout = pos.shares * svDecimal;
     const totalCostPaid = pos.kalCost + pos.pmCost + pos.hedgeCost;
     console.log(
       `[CANC-MON] Resolved trade voided: ${pos.pmOutcome} (${pos.tradeId})\n` +
-      `  KAL settles at ${fmtPct(svDecimal)} → payout $${kalPayout.toFixed(2)}\n` +
+      `  KAL settles at ${fmtPct(svDecimal)} -> payout $${kalPayout.toFixed(2)}\n` +
       `  Original costs: KAL=$${pos.kalCost.toFixed(2)} PM=$${pos.pmCost.toFixed(2)} hedge=$${pos.hedgeCost.toFixed(2)}`
     );
 
@@ -7502,7 +7503,7 @@ async function handleCancelledPosition(
       } catch { pmHeld = pos.shares; /* fallback to trade record */ }
     }
 
-    // Sell PM tokens if we hold any and can get > 50¢
+    // Sell PM tokens if we hold any and can get > 50c
     let pmRevenue = 0;
     if (pmHeld > 0) {
       const bestBid = await fetchPmBestBid(pos.pmTokenId, clobBase);
@@ -7520,7 +7521,7 @@ async function handleCancelledPosition(
           }
         }
       } else {
-        // Place GTC ask at 50¢ — PM void settles at 50/50 so this is the floor
+        // Place GTC ask at 50c -- PM void settles at 50/50 so this is the floor
         const gtcPrice = Math.round(MIN_SELL / tick) * tick;
         console.log(`[CANC-MON] PM GTC ASK: ${pmHeld}x ${pos.pmOutcome} @ ${fmtPct(gtcPrice)} (floor price)`);
         if (!DRY_RUN) {
@@ -7540,7 +7541,7 @@ async function handleCancelledPosition(
       scalarSettlement: true,
       kalSettlementValue: svDecimal,
       pmSettlementValue: pmHeld > 0 ? (pmRevenue / pmHeld) : 0,
-      resolutionNote: `Kalshi scalar settlement (${(svDecimal * 100).toFixed(0)}¢). ${pmHeld > 0 ? "PM sell attempted." : "No PM tokens held."}`,
+      resolutionNote: `Kalshi scalar settlement (${(svDecimal * 100).toFixed(0)}c). ${pmHeld > 0 ? "PM sell attempted." : "No PM tokens held."}`,
       realizedPnl: newPnl,
     }, pos.tradeId);
     console.log(
@@ -7550,7 +7551,7 @@ async function handleCancelledPosition(
     return;
   }
 
-  // ── Scenarios 1 & 2: We hold PM tokens (filled/hedging) — need to sell them ─
+  // -- Scenarios 1 & 2: We hold PM tokens (filled/hedging) -- need to sell them -
 
   // Step 3: Check actual PM holdings via on-chain balance (authoritative)
   let actualShares = pos.shares;
@@ -7563,7 +7564,7 @@ async function handleCancelledPosition(
   } catch { /* use trade record shares as fallback */ }
 
   if (actualShares <= 0) {
-    console.log(`[CANC-MON] No PM shares to sell for ${pos.pmOutcome} — skipping sell.`);
+    console.log(`[CANC-MON] No PM shares to sell for ${pos.pmOutcome} -- skipping sell.`);
     if (matchingHs) matchingHs.position.sharesHeld = 0;
     return;
   }
@@ -7573,9 +7574,9 @@ async function handleCancelledPosition(
   console.log(`[CANC-MON] PM best bid for ${pos.pmOutcome}: ${bestBid !== null ? fmtPct(bestBid) : "no bids"}`);
 
   // Step 5: Sell strategy
-  //   - If bestBid >= 50¢ → aggressive FOK sell into bids at bestBid price (instant fill)
-  //   - If bestBid < 50¢ or no bids → GTC ask at 50¢ (wait for someone to buy;
-  //     PM cancellation resolves 50/50 so 50¢ is guaranteed floor value)
+  //   - If bestBid >= 50c -> aggressive FOK sell into bids at bestBid price (instant fill)
+  //   - If bestBid < 50c or no bids -> GTC ask at 50c (wait for someone to buy;
+  //     PM cancellation resolves 50/50 so 50c is guaranteed floor value)
   const MIN_SELL_PRICE = 0.50;
   const tick = pos.tickSize || 0.01;
   let sellPrice: number;
@@ -7586,7 +7587,7 @@ async function handleCancelledPosition(
     useAggressive = true; // sell INTO bids immediately
   } else {
     sellPrice = MIN_SELL_PRICE;
-    useAggressive = false; // rest a GTC ask at 50¢
+    useAggressive = false; // rest a GTC ask at 50c
   }
 
   // Round to tick size
@@ -7618,10 +7619,10 @@ async function handleCancelledPosition(
     try {
       let result: unknown;
       if (useAggressive) {
-        // Aggressive: FOK sell into existing bids — fills instantly or fails
+        // Aggressive: FOK sell into existing bids -- fills instantly or fails
         result = await placePmFOKSell(pos.pmTokenId, sellPrice, actualShares, pos.tickSize, pos.negRisk, false);
       } else {
-        // Passive: GTC ask resting at 50¢ — waits for buyers
+        // Passive: GTC ask resting at 50c -- waits for buyers
         result = await placePmGTCAsk(pos.pmTokenId, sellPrice, actualShares, pos.tickSize, pos.negRisk, false);
       }
       const orderId = pickString((result as Record<string, unknown>)?.orderID ?? (result as Record<string, unknown>)?.order_id ?? "");
@@ -7630,7 +7631,7 @@ async function handleCancelledPosition(
         `${actualShares}x@${fmtPct(sellPrice)}`
       );
 
-      // If FOK failed to fill (size_matched < size), fall back to GTC at 50¢
+      // If FOK failed to fill (size_matched < size), fall back to GTC at 50c
       const sizeMatched = Number((result as Record<string, unknown>)?.size_matched ?? actualShares);
       if (useAggressive && sizeMatched < actualShares) {
         const remaining = actualShares - Math.round(sizeMatched);
@@ -7648,7 +7649,7 @@ async function handleCancelledPosition(
       console.error(`[CANC-MON] PM sell FAILED: ${(err as Error).message}`);
       // Fallback: try GTC if FOK failed
       if (useAggressive) {
-        console.log(`[CANC-MON] FOK failed — trying GTC ask at ${fmtPct(MIN_SELL_PRICE)}...`);
+        console.log(`[CANC-MON] FOK failed -- trying GTC ask at ${fmtPct(MIN_SELL_PRICE)}...`);
         try {
           const gtcPrice = Math.round(MIN_SELL_PRICE / tick) * tick;
           await placePmGTCAsk(pos.pmTokenId, gtcPrice, actualShares, pos.tickSize, pos.negRisk, false);
@@ -7678,7 +7679,7 @@ async function handleCancelledPosition(
     scalarSettlement: true,
     kalSettlementValue: svDecimal,
     pmSettlementValue: sellPrice,
-    resolutionNote: `Kalshi scalar settlement (${(svDecimal * 100).toFixed(0)}¢). PM sold @ ${fmtPct(sellPrice)}.`,
+    resolutionNote: `Kalshi scalar settlement (${(svDecimal * 100).toFixed(0)}c). PM sold @ ${fmtPct(sellPrice)}.`,
   }, pos.tradeId);
   console.log(
     `[CANC-MON] Trade ${pos.tradeId} resolved: ` +
@@ -7699,12 +7700,12 @@ async function runHedgeCycle(state: HedgeState, clobBase: string): Promise<void>
 
   if (pos.sharesHeld <= 0) return;
 
-  // ── Step 0: Check if the Kalshi market has closed/resolved ──────────────────
-  // If the match finished, the market settles automatically — no hedging needed.
+  // -- Step 0: Check if the Kalshi market has closed/resolved ------------------
+  // If the match finished, the market settles automatically -- no hedging needed.
   // Detect this by checking the market status; if closed/resolved, clear hedge.
   // ALSO: detect scalar (cancelled) settlements and trigger emergency PM sell.
 
-  // Live score early detection (before Kalshi API call — zero latency)
+  // Live score early detection (before Kalshi API call -- zero latency)
   // Derive matchCode from arb_trades log: find the "hedging" trade for this kalTicker
   const _hedgeTrade = loadArbTrades().find(t => t.kalTicker === pos.kalLeg.ticker && t.status === "hedging");
   const _hedgeMatchCode = _hedgeTrade?.match ?? "";
@@ -7713,10 +7714,10 @@ async function runHedgeCycle(state: HedgeState, clobBase: string): Promise<void>
     const _lsCancelled = isMatchCancelled(_hedgeMatchCode);
     if (_lsFinished) {
       const ls = getMatchState(_hedgeMatchCode);
-      console.log(`[HEDGE] Live score: ${_hedgeMatchCode} FINISHED (${ls?.homeScore ?? "?"}-${ls?.awayScore ?? "?"}, ${ls?.detail}) — checking Kalshi settlement...`);
+      console.log(`[HEDGE] Live score: ${_hedgeMatchCode} FINISHED (${ls?.homeScore ?? "?"}-${ls?.awayScore ?? "?"}, ${ls?.detail}) -- checking Kalshi settlement...`);
     } else if (_lsCancelled) {
       const ls = getMatchState(_hedgeMatchCode);
-      console.warn(`[HEDGE] Live score: ${_hedgeMatchCode} ${ls?.status?.toUpperCase() ?? "CANCELLED"} — scalar settlement risk!`);
+      console.warn(`[HEDGE] Live score: ${_hedgeMatchCode} ${ls?.status?.toUpperCase() ?? "CANCELLED"} -- scalar settlement risk!`);
     }
   }
 
@@ -7727,15 +7728,15 @@ async function runHedgeCycle(state: HedgeState, clobBase: string): Promise<void>
     if (mktStatus === "closed" || mktStatus === "settled" || mktStatus === "resolved" || mktStatus === "finalized") {
       const kalResult = pickString(mkt.result ?? "").toLowerCase();
 
-      // ── Scalar (cancelled) settlement: emergency sell PM tokens ──────────
+      // -- Scalar (cancelled) settlement: emergency sell PM tokens ----------
       if (isScalarSettlement(mkt) && pos.heldExchange === "pm" && !_cancelledTickers.has(pos.kalLeg.ticker)) {
         const sv = Number(mkt.settlement_value ?? 0);
         console.error(
-          `\n╔══════════════════════════════════════════════════════════════════╗\n` +
-          `║  ⚠ SCALAR SETTLEMENT in hedge: ${pos.kalLeg.ticker}\n` +
-          `║  Result: ${kalResult}  Settlement: ${sv}¢\n` +
-          `║  Holding ${pos.sharesHeld} PM shares — triggering emergency sell!\n` +
-          `╚══════════════════════════════════════════════════════════════════╝\n`
+          `\n+==================================================================+\n` +
+          `|  [!] SCALAR SETTLEMENT in hedge: ${pos.kalLeg.ticker}\n` +
+          `|  Result: ${kalResult}  Settlement: ${sv}c\n` +
+          `|  Holding ${pos.sharesHeld} PM shares -- triggering emergency sell!\n` +
+          `+==================================================================+\n`
         );
         _cancelledTickers.add(pos.kalLeg.ticker);
         _cancelledEventKeys.add(extractEventDateKey(pos.kalLeg.ticker));
@@ -7769,16 +7770,16 @@ async function runHedgeCycle(state: HedgeState, clobBase: string): Promise<void>
         return;
       }
 
-      // ── Normal (binary) settlement: standard hedge clearance ────────────
+      // -- Normal (binary) settlement: standard hedge clearance ------------
       console.warn(
-        `\n[HEDGE] Market ${pos.kalLeg.ticker} is ${mktStatus}. Position settles automatically — clearing hedge.\n`
+        `\n[HEDGE] Market ${pos.kalLeg.ticker} is ${mktStatus}. Position settles automatically -- clearing hedge.\n`
       );
       // Cancel any resting orders (they'll fail on a closed market anyway)
       for (const [oid, ho] of activeOrders) {
         try {
           if (ho.exchange === "pm") await cancelPmOrder(oid, DRY_RUN);
           else await cancelKalshiOrder(oid, DRY_RUN);
-        } catch { /* market closed — order may already be gone */ }
+        } catch { /* market closed -- order may already be gone */ }
       }
       activeOrders.clear();
       // Settlement P&L: we held one leg only (hedge incomplete).
@@ -7786,19 +7787,19 @@ async function runHedgeCycle(state: HedgeState, clobBase: string): Promise<void>
       let settlePnl: number;
       const isScalar = kalResult === "scalar" || (mkt.result === "scalar" && Number(mkt.settlement_value ?? 0) > 0);
       if (isScalar) {
-        // Scalar settlement: fractional payout per share (e.g., cancelled match → 86¢)
+        // Scalar settlement: fractional payout per share (e.g., cancelled match -> 86c)
         const sv = Number(mkt.settlement_value ?? 0);
         const svDec = sv > 1 ? sv / 100 : sv;
         const kalPayout = pos.initialShares * (pos.kalSide === "yes" ? svDec : (1 - svDec));
         const hedgedShares = pos.initialShares - pos.sharesHeld;
         settlePnl = kalPayout + hedgedShares - pos.initialCost - pos.hedgeFillCost;
       } else if (pos.heldExchange === "kal") {
-        // We hold Kalshi contracts. If our side won → payout $1/share; if lost → $0.
+        // We hold Kalshi contracts. If our side won -> payout $1/share; if lost -> $0.
         const kalWon = (pos.kalSide === "yes" && kalResult === "yes") || (pos.kalSide === "no" && kalResult === "no");
         const payout = kalWon ? pos.initialShares : 0;
         settlePnl = payout - pos.initialCost - pos.hedgeFillCost;
       } else {
-        // We hold PM tokens. Kalshi market settled → PM market should settle too.
+        // We hold PM tokens. Kalshi market settled -> PM market should settle too.
         const kalSideWon = (pos.kalSide === "yes" && kalResult === "yes") || (pos.kalSide === "no" && kalResult === "no");
         const pmWon = !kalSideWon && kalResult !== "";
         const hedgedShares = pos.initialShares - pos.sharesHeld;
@@ -7842,24 +7843,24 @@ async function runHedgeCycle(state: HedgeState, clobBase: string): Promise<void>
       return;
     }
   } catch {
-    // Transient error fetching market status — continue hedge cycle normally.
+    // Transient error fetching market status -- continue hedge cycle normally.
     // If the market is truly gone, order placement will fail and fetchFailures will clean up.
   }
 
-  // ── Step 0b: Periodically verify PM-held position via on-chain balanceOf ────
+  // -- Step 0b: Periodically verify PM-held position via on-chain balanceOf ----
   // Every ~50 hedge cycles, check the token is still in the wallet on-chain.
   // Primary: on-chain balanceOf (authoritative). Fallback: data-api.
   if (_hedgeLogCounter > 10 && _hedgeLogCounter % 50 === 0 && pos.heldExchange === "pm") {
     try {
       let held = await getOnChainBalance(pos.pmLeg.tokenId);
       if (held < 0) {
-        // RPC failed — fallback to data-api
+        // RPC failed -- fallback to data-api
         const positions = await fetchPmPositionsCached(0);
         held = sumPmHeld(positions, pos.pmLeg.tokenId);
       }
       if (held <= 0) {
         console.warn(
-          `\n[HEDGE] ⚠ PM position ${pos.pmLeg.outcome} no longer exists in wallet (on-chain verified)!` +
+          `\n[HEDGE] [!] PM position ${pos.pmLeg.outcome} no longer exists in wallet (on-chain verified)!` +
           ` Cancelling all hedge orders and clearing.\n`
         );
         for (const [oid, ho] of activeOrders) {
@@ -7877,7 +7878,7 @@ async function runHedgeCycle(state: HedgeState, clobBase: string): Promise<void>
     }
   }
 
-  // ── Step 1: Check fills on all active GTC orders ────────────────────────────
+  // -- Step 1: Check fills on all active GTC orders ----------------------------
   // Collect counterpart cancellations here to avoid mutating the map mid-iteration
   const toCancel: Array<{ oid: string; ho: HedgeOrder }> = [];
 
@@ -7901,18 +7902,18 @@ async function runHedgeCycle(state: HedgeState, clobBase: string): Promise<void>
           const remaining = Number(order.remaining_count ?? ho.shares);
           const inferred = ho.shares - remaining;
           if (inferred > 0) {
-            console.warn(`[HEDGE] Fill count missing for ${st} order ${oid.slice(0,12)}... — inferred ${inferred} fills from remaining_count=${remaining}`);
+            console.warn(`[HEDGE] Fill count missing for ${st} order ${oid.slice(0,12)}... -- inferred ${inferred} fills from remaining_count=${remaining}`);
             totalFilled = inferred;
           }
         }
         filledShares = Math.max(0, totalFilled - ho.filledSoFar);
         ho.filledSoFar = Math.max(ho.filledSoFar, totalFilled);
-        // Extract Kalshi fees from order response (cumulative total → track delta)
+        // Extract Kalshi fees from order response (cumulative total -> track delta)
         const kalOrdFees = (Number(order.taker_fees ?? 0) + Number(order.maker_fees ?? 0)) / 100;
         const prevFees = ho._lastFeeSeen ?? 0;
         ho._lastFeeSeen = kalOrdFees;
         ho._feeDelta = kalOrdFees - prevFees;
-        // Log Kalshi order status only when it changes or every ~30s (75 cycles × 400ms)
+        // Log Kalshi order status only when it changes or every ~30s (75 cycles x 400ms)
         const logKey = `${st}:${totalFilled}`;
         if (orderDone || filledShares > 0 || ho._lastLogKey !== logKey) {
           console.log(`[HEDGE] KAL order ${oid.slice(0,12)}... status=${st} filled=${totalFilled}/${ho.shares} remaining=${order.remaining_count ?? "?"}`);
@@ -7926,7 +7927,7 @@ async function runHedgeCycle(state: HedgeState, clobBase: string): Promise<void>
           pos.hedgeFillCost += filledShares * ho.price;
           if (ho.exchange === "kal") {
             pos.hedgeFillCostKal += filledShares * ho.price;
-            // Add Kalshi fee delta (not cumulative total — prevents double-counting on incremental fills)
+            // Add Kalshi fee delta (not cumulative total -- prevents double-counting on incremental fills)
             const feeDelta = ho._feeDelta ?? 0;
             if (feeDelta > 0) pos.kalFees += feeDelta;
           }
@@ -7936,10 +7937,10 @@ async function runHedgeCycle(state: HedgeState, clobBase: string): Promise<void>
           `\n[HEDGE] ${ho.exchange.toUpperCase()} ${ho.role} filled ${filledShares} @${fmtPct(ho.price)}.` +
           ` Remaining: ${pos.sharesHeld} (hedgeCost=$${pos.hedgeFillCost.toFixed(2)})`
         );
-        // ── Cancel-on-fill race ────────────────────────────────────────────
-        // complete fills → cancel ALL other orders (other completes + exits):
+        // -- Cancel-on-fill race --------------------------------------------
+        // complete fills -> cancel ALL other orders (other completes + exits):
         //   arb resolved on this exchange, don't let the other complete overbuy
-        // exit fills → cancel complete orders only:
+        // exit fills -> cancel complete orders only:
         //   position sold, no longer need to complete the hedge
         if (ho.role === "complete") {
           for (const [coid, cho] of activeOrders) {
@@ -7952,30 +7953,30 @@ async function runHedgeCycle(state: HedgeState, clobBase: string): Promise<void>
         }
       }
 
-      ho.fetchFailures = 0; // successful fetch — reset counter
+      ho.fetchFailures = 0; // successful fetch -- reset counter
       if (orderDone || pos.sharesHeld <= 0) activeOrders.delete(oid);
     } catch (err) {
       // Transient errors: keep the order and retry next cycle.
       // After 10 consecutive failures, CANCEL the order on the exchange before removing it
-      // from tracking — this prevents orphaned live orders that accumulate and all fill
+      // from tracking -- this prevents orphaned live orders that accumulate and all fill
       // simultaneously when volume finally appears (causing oversized positions).
       ho.fetchFailures = (ho.fetchFailures ?? 0) + 1;
       if (ho.fetchFailures === 1 || ho.fetchFailures % 5 === 0) {
         console.warn(`[HEDGE] Order ${oid.slice(0, 16)}... (${ho.exchange} ${ho.role}) status check fail #${ho.fetchFailures}: ${(err as Error).message ?? err}`);
       }
       if (ho.fetchFailures >= 10) {
-        console.warn(`[HEDGE] Order ${oid} (${ho.exchange} ${ho.role}) failed status check 10× — cancelling on exchange and removing.`);
+        console.warn(`[HEDGE] Order ${oid} (${ho.exchange} ${ho.role}) failed status check 10x -- cancelling on exchange and removing.`);
         try {
           if (ho.exchange === "pm") await cancelPmOrder(oid, DRY_RUN);
           else await cancelKalshiOrder(oid, DRY_RUN);
           console.log(`[HEDGE] Cancelled orphan order ${oid.slice(0, 16)}...`);
-        } catch { /* order may already be gone on the exchange — safe to remove */ }
+        } catch { /* order may already be gone on the exchange -- safe to remove */ }
         activeOrders.delete(oid);
       }
     }
   }
 
-  // ── Cancel counterpart orders collected above (deduplicated) ─────────────────
+  // -- Cancel counterpart orders collected above (deduplicated) -----------------
   const cancelSeen = new Set<string>();
   for (const { oid, ho: cho } of toCancel) {
     if (cancelSeen.has(oid)) continue;  // duplicate from multiple fills in same cycle
@@ -7990,11 +7991,11 @@ async function runHedgeCycle(state: HedgeState, clobBase: string): Promise<void>
       activeOrders.delete(oid);
       console.log(
         `[HEDGE] Cancelled ${cho.exchange.toUpperCase()} ${cho.role} order ${oid}` +
-        ` — other side filled first (race resolved).`
+        ` -- other side filled first (race resolved).`
       );
     } catch (e) {
       const msg = (e as Error).message ?? "";
-      // Order already gone (executed/expired) — clean it from activeOrders
+      // Order already gone (executed/expired) -- clean it from activeOrders
       if (msg.includes("404") || msg.includes("not_found") || msg.includes("Not Found")) {
         activeOrders.delete(oid);
         console.warn(
@@ -8013,18 +8014,18 @@ async function runHedgeCycle(state: HedgeState, clobBase: string): Promise<void>
   let sharesNeeded = pos.sharesHeld;
 
   if (pos.heldExchange === "pm") {
-    // ── Held PM token, missing the Kalshi leg ──────────────────────────────────
+    // -- Held PM token, missing the Kalshi leg ----------------------------------
     // We own pmLeg (e.g. P2_token). We need EITHER:
-    //   complete-kal: buy Kalshi P1_YES at ≤ maxKalPrice
-    //   complete-pm:  buy PM P1_token (pmOppLeg) at ≤ maxOppPrice  (P1+P2 tokens → $1)
-    // Simultaneously exit: sell pmLeg at best ask ≥ cost basis
-    // First fill on any complete → cancel the other complete + exit
-    // First fill on exit → cancel all completes
+    //   complete-kal: buy Kalshi P1_YES at <= maxKalPrice
+    //   complete-pm:  buy PM P1_token (pmOppLeg) at <= maxOppPrice  (P1+P2 tokens -> $1)
+    // Simultaneously exit: sell pmLeg at best ask >= cost basis
+    // First fill on any complete -> cancel the other complete + exit
+    // First fill on exit -> cancel all completes
     // payout mode: accept any fill up to breakeven; profit mode: require MIN_EDGE margin
     const hedgeEdge = HEDGE_TARGET === "payout" ? 0 : MIN_EDGE;
     // Deduct estimated completing-leg fees only. pmCostBasis is the initial PM cost (0% fee on tennis).
-    // KAL completing: KALSHI_FEE_RATE × P × (1-P).
-    // PM opposite completing: PM_FEE_RATE × P × (1-P) (currently 0 for tennis).
+    // KAL completing: KALSHI_FEE_RATE x P x (1-P).
+    // PM opposite completing: PM_FEE_RATE x P x (1-P) (currently 0 for tennis).
     const estCompletePrice = 1 - pos.pmCostBasis;
     const kalFeeReserve = KALSHI_FEE_RATE * estCompletePrice * (1 - estCompletePrice);
     const pmOppFeeReserve = PM_FEE_RATE * estCompletePrice * (1 - estCompletePrice);
@@ -8035,10 +8036,10 @@ async function runHedgeCycle(state: HedgeState, clobBase: string): Promise<void>
       console.log(`[HEDGE] PM-held breakeven: pmCostBasis=${fmtPct(pos.pmCostBasis)} maxKalPrice=${fmtPct(maxKalPrice)} maxOppPrice=${fmtPct(maxOppPrice)} shares=${sharesNeeded}`);
     }
 
-    // ── Single-exchange hedging: PM-only first, then KAL-only after PM_ONLY_MAX_CYCLES ──
+    // -- Single-exchange hedging: PM-only first, then KAL-only after PM_ONLY_MAX_CYCLES --
     const inPmPhasePH = (state.pmOnlyCycles ?? 0) < PM_ONLY_MAX_CYCLES && !isPmServiceDown();
 
-    // ── IOC sweeps: aggressively grab available asks each cycle ─────────────────
+    // -- IOC sweeps: aggressively grab available asks each cycle -----------------
     // 1) Sweep Kalshi ask for pos.kalSide (throttled: back off 30s after each failure)
     if (!inPmPhasePH && Date.now() >= state.kalNextRetryAt) {
       const { ask: kalYesAsk, noAsk: kalNoAsk } = await fetchKalshiSingleMarket(pos.kalLeg.ticker);
@@ -8070,7 +8071,7 @@ async function runHedgeCycle(state: HedgeState, clobBase: string): Promise<void>
         }
       }
     }
-    // 2) Sweep PM opposite token (pmOppLeg) ask — only in PM phase
+    // 2) Sweep PM opposite token (pmOppLeg) ask -- only in PM phase
     if (inPmPhasePH && pos.pmOppLeg && sharesNeeded >= 5) {
       const oppCurrentAsk = await fetchPmAsk(pos.pmOppLeg.tokenId, clobBase);
       if (oppCurrentAsk !== null && oppCurrentAsk <= maxOppPrice && sharesNeeded * oppCurrentAsk >= PM_MARKETABLE_MIN_VALUE) {
@@ -8086,7 +8087,7 @@ async function runHedgeCycle(state: HedgeState, clobBase: string): Promise<void>
             console.log(`  [HEDGE] PM opp-sweep on-chain pending, polling...`);
             const finalStatus = await waitForPmOrderFill(String(meta.orderId), 20_000, pos.pmOppLeg?.tokenId);
             if (finalStatus === "matched") filled = sharesNeeded;
-            // cancelled/timeout → filled stays 0
+            // cancelled/timeout -> filled stays 0
           }
           if (filled > 0) {
             pos.sharesHeld = Math.max(0, pos.sharesHeld - filled);
@@ -8105,11 +8106,11 @@ async function runHedgeCycle(state: HedgeState, clobBase: string): Promise<void>
       }
     }
 
-    // ── Track PM-only cycles for single-exchange hedging ──
+    // -- Track PM-only cycles for single-exchange hedging --
     if (inPmPhasePH && sharesNeeded > 0) {
       state.pmOnlyCycles = (state.pmOnlyCycles ?? 0) + 1;
       if (state.pmOnlyCycles >= PM_ONLY_MAX_CYCLES) {
-        console.log(`[HEDGE] PM-held: ${state.pmOnlyCycles} PM-only cycles with no fill — switching to KAL-only`);
+        console.log(`[HEDGE] PM-held: ${state.pmOnlyCycles} PM-only cycles with no fill -- switching to KAL-only`);
         // Cancel any resting PM GTC orders before switching to KAL
         for (const [oid, ho] of activeOrders) {
           if (ho.exchange === "pm") {
@@ -8120,7 +8121,7 @@ async function runHedgeCycle(state: HedgeState, clobBase: string): Promise<void>
       }
     }
 
-    // ── SEQUENTIAL complete: only ONE complete order at a time (prevents double-fill) ──
+    // -- SEQUENTIAL complete: only ONE complete order at a time (prevents double-fill) --
     // Single-exchange: GTC orders only on the active phase's exchange
     const hasAnyComplete = [...activeOrders.values()].some(o => o.role === "complete");
     if (!hasAnyComplete && sharesNeeded > 0) {
@@ -8130,12 +8131,12 @@ async function runHedgeCycle(state: HedgeState, clobBase: string): Promise<void>
         const recheckMkt = recheck.market ?? recheck as unknown as KalshiMarket;
         const recheckStatus = pickString(recheckMkt.status ?? recheckMkt.state ?? "").toLowerCase();
         if (recheckStatus === "closed" || recheckStatus === "settled" || recheckStatus === "resolved" || recheckStatus === "finalized") {
-          console.log(`[HEDGE] Market ${pos.kalLeg.ticker} is now ${recheckStatus} — skipping new order. Will resolve on next cycle.`);
+          console.log(`[HEDGE] Market ${pos.kalLeg.ticker} is now ${recheckStatus} -- skipping new order. Will resolve on next cycle.`);
           saveHedgeState(state);
           return;
         }
-        // No price-based skip — always attempt hedging regardless of current price.
-      } catch { /* non-critical — proceed with order placement */ }
+        // No price-based skip -- always attempt hedging regardless of current price.
+      } catch { /* non-critical -- proceed with order placement */ }
 
       // Single-exchange hedging: only place GTC on the current phase's exchange
       const inPmNow = (state.pmOnlyCycles ?? 0) < PM_ONLY_MAX_CYCLES && !isPmServiceDown();
@@ -8147,11 +8148,11 @@ async function runHedgeCycle(state: HedgeState, clobBase: string): Promise<void>
         if (placed) break;
 
       if (!placed && tryExchange === "kal") {
-        // ── Try Kalshi GTC YES bid ──────────────────────────────────────────
+        // -- Try Kalshi GTC YES bid ------------------------------------------
         const kalPriceCents = Math.max(1, Math.min(99, Math.floor(maxKalPrice * 100)));
         const order = buildKalshiGTCOrder(pos.kalLeg.ticker, "buy", pos.kalSide, kalPriceCents, sharesNeeded);
         try {
-          console.log(`[HEDGE] Placing Kalshi GTC: ticker=${pos.kalLeg.ticker} side=${pos.kalSide} price=${kalPriceCents}¢ qty=${sharesNeeded}`);
+          console.log(`[HEDGE] Placing Kalshi GTC: ticker=${pos.kalLeg.ticker} side=${pos.kalSide} price=${kalPriceCents}c qty=${sharesNeeded}`);
           const res = await placeKalshiOrder(order, DRY_RUN);
           console.log(`[HEDGE] Kalshi GTC raw response: ${JSON.stringify(res).slice(0, 300)}`);
           const meta = extractKalMeta(res);
@@ -8160,9 +8161,9 @@ async function runHedgeCycle(state: HedgeState, clobBase: string): Promise<void>
             activeOrders.set(oid, { role: "complete", exchange: "kal", orderId: oid, price: kalPriceCents / 100, shares: sharesNeeded, filledSoFar: 0, fetchFailures: 0, placedAt: Date.now() });
             state.lastCompleteExchange = "kal";
             saveHedgeState(state);
-            console.log(`[HEDGE] Placed Kalshi GTC BID ${sharesNeeded}×${pos.kalSide.toUpperCase()}@${fmtPct(kalPriceCents / 100)} (complete-kal). orderId=${oid}`);
+            console.log(`[HEDGE] Placed Kalshi GTC BID ${sharesNeeded}x${pos.kalSide.toUpperCase()}@${fmtPct(kalPriceCents / 100)} (complete-kal). orderId=${oid}`);
             placed = true;
-            // Verify — if filled immediately, update and return
+            // Verify -- if filled immediately, update and return
             try {
               const check = await getKalshiOrder(oid);
               const checkStatus = String(check.status ?? "");
@@ -8203,7 +8204,7 @@ async function runHedgeCycle(state: HedgeState, clobBase: string): Promise<void>
         }
       }
 
-      // ── Try PM GTC bid ──────────────────────────────────────────────────
+      // -- Try PM GTC bid --------------------------------------------------
       if (!placed && tryExchange === "pm" && pos.pmOppLeg && !isPmServiceDown() && sharesNeeded >= 5) {
         const oppTick = pos.pmOppLeg.tickSize || 0.01;
         const oppBidPrice = Math.floor(maxOppPrice / oppTick) * oppTick;
@@ -8219,7 +8220,7 @@ async function runHedgeCycle(state: HedgeState, clobBase: string): Promise<void>
                 activeOrders.set(oid, { role: "complete", exchange: "pm", orderId: oid, price: oppBidPrice, shares: sharesNeeded, filledSoFar: 0, fetchFailures: 0, placedAt: Date.now() });
                 state.lastCompleteExchange = "pm";
                 saveHedgeState(state);
-                console.log(`\n[HEDGE] Placed PM GTC BID ${sharesNeeded}×${pos.pmOppLeg.outcome}@${fmtPct(oppBidPrice)} (complete-pm). orderId=${oid}`);
+                console.log(`\n[HEDGE] Placed PM GTC BID ${sharesNeeded}x${pos.pmOppLeg.outcome}@${fmtPct(oppBidPrice)} (complete-pm). orderId=${oid}`);
                 if (!DRY_RUN && meta.status === "matched") {
                   pos.sharesHeld = Math.max(0, pos.sharesHeld - sharesNeeded);
                   pos.hedgeFillCost += sharesNeeded * oppBidPrice;
@@ -8257,8 +8258,8 @@ async function runHedgeCycle(state: HedgeState, clobBase: string): Promise<void>
       } // end for (tryOrder)
     }
 
-    // ── exit: GTC ask on PM to sell our held token at cost basis (skipped if STRICT_HEDGE)
-    // Always place at cost basis — the GTC rests on the book until price comes back up.
+    // -- exit: GTC ask on PM to sell our held token at cost basis (skipped if STRICT_HEDGE)
+    // Always place at cost basis -- the GTC rests on the book until price comes back up.
     if (!STRICT_HEDGE) {
       const hasPmExit = [...activeOrders.values()].some(o => o.role === "exit" && o.exchange === "pm");
       if (!hasPmExit && !isPmServiceDown() && sharesNeeded >= 5) {
@@ -8275,7 +8276,7 @@ async function runHedgeCycle(state: HedgeState, clobBase: string): Promise<void>
               if (oid) {
                 activeOrders.set(oid, { role: "exit", exchange: "pm", orderId: oid, price: exitPrice, shares: sharesNeeded, filledSoFar: 0, fetchFailures: 0, placedAt: Date.now() });
                 saveHedgeState(state);
-                console.log(`\n[HEDGE] Placed PM GTC ASK ${sharesNeeded}×@${fmtPct(exitPrice)} (exit at cost). orderId=${oid}`);
+                console.log(`\n[HEDGE] Placed PM GTC ASK ${sharesNeeded}x@${fmtPct(exitPrice)} (exit at cost). orderId=${oid}`);
               } else {
                 console.warn(`[HEDGE] PM exit returned no orderId. Response: ${JSON.stringify(res).slice(0, 200)}`);
               }
@@ -8288,18 +8289,18 @@ async function runHedgeCycle(state: HedgeState, clobBase: string): Promise<void>
     }
 
   } else {
-    // ── Held Kalshi contract, missing the PM leg ──────────────────────────────
+    // -- Held Kalshi contract, missing the PM leg ------------------------------
     // We own kalLeg at pos.kalSide (YES or NO). We need EITHER:
-    //   complete-pm:  buy PM token (pmLeg) at ≤ maxPmPrice
-    //   complete-kal: buy the OPPOSITE Kalshi side at ≤ maxKalOppPrice  (YES+NO → $1)
-    // Simultaneously exit: sell our Kalshi side at best bid ≥ cost basis
-    // First fill on any complete → cancel the other complete + exit
-    // First fill on exit → cancel all completes
+    //   complete-pm:  buy PM token (pmLeg) at <= maxPmPrice
+    //   complete-kal: buy the OPPOSITE Kalshi side at <= maxKalOppPrice  (YES+NO -> $1)
+    // Simultaneously exit: sell our Kalshi side at best bid >= cost basis
+    // First fill on any complete -> cancel the other complete + exit
+    // First fill on exit -> cancel all completes
     // payout mode: accept any fill up to breakeven; profit mode: require MIN_EDGE margin
     const hedgeEdge2 = HEDGE_TARGET === "payout" ? 0 : MIN_EDGE;
     // Deduct estimated completing-leg fees only. kalCostBasis already includes the initial Kalshi fee.
-    // PM completing: PM_FEE_RATE × P × (1-P) (currently 0 for tennis).
-    // KAL opposite completing: KALSHI_FEE_RATE × P × (1-P).
+    // PM completing: PM_FEE_RATE x P x (1-P) (currently 0 for tennis).
+    // KAL opposite completing: KALSHI_FEE_RATE x P x (1-P).
     const estCompletePrice2 = 1 - pos.kalCostBasis;
     const pmFeeReserve = PM_FEE_RATE * estCompletePrice2 * (1 - estCompletePrice2);
     const kalOppFeeReserve = KALSHI_FEE_RATE * estCompletePrice2 * (1 - estCompletePrice2);
@@ -8311,18 +8312,18 @@ async function runHedgeCycle(state: HedgeState, clobBase: string): Promise<void>
     }
     const hedgeKalSide: "yes" | "no" = pos.kalSide === "yes" ? "no" : "yes";
 
-    // ── Pre-hedge reconciliation: check if original PM FOK already filled on-chain ──
+    // -- Pre-hedge reconciliation: check if original PM FOK already filled on-chain --
     // The original FOK can settle on-chain minutes after the CLOB API reported it as
     // unmatched (especially for sports markets with delayed matching). If the tokens are
-    // already in the wallet, skip hedging — the position is already complete.
+    // already in the wallet, skip hedging -- the position is already complete.
     // IMPORTANT: subtract PM shares already committed to OTHER trades on the same token
     // to avoid false-positive reconciliation (e.g. trade 1 bought 9 shares, trade 2's
-    // FOK failed → wallet shows 9 but only trade 1 owns them).
+    // FOK failed -> wallet shows 9 but only trade 1 owns them).
     if (sharesNeeded > 0 && !DRY_RUN) {
       try {
         let pmHeld = await getOnChainBalanceWithFallback(pos.pmLeg.tokenId);
         if (pmHeld < 0) {
-          // All RPCs failed — try data-api as last resort
+          // All RPCs failed -- try data-api as last resort
           const positions = await fetchPmPositionsCached(0);
           pmHeld = sumPmHeld(positions, pos.pmLeg.tokenId);
         }
@@ -8334,11 +8335,11 @@ async function runHedgeCycle(state: HedgeState, clobBase: string): Promise<void>
           .reduce((sum, t) => sum + t.shares, 0);
         const availableForThisTrade = pmHeld - otherTradesShares;
         if (otherTradesShares > 0) {
-          console.log(`[HEDGE] On-chain balance ${pmHeld}× but ${otherTradesShares}× committed to other trades → ${availableForThisTrade}× available for this trade`);
+          console.log(`[HEDGE] On-chain balance ${pmHeld}x but ${otherTradesShares}x committed to other trades -> ${availableForThisTrade}x available for this trade`);
         }
         if (availableForThisTrade >= sharesNeeded) {
           console.log(
-            `\n[HEDGE] ✓ On-chain reconciliation: wallet holds ${availableForThisTrade}× available PM ${pos.pmLeg.outcome}` +
+            `\n[HEDGE] [OK] On-chain reconciliation: wallet holds ${availableForThisTrade}x available PM ${pos.pmLeg.outcome}` +
             ` (need ${sharesNeeded}). Original FOK likely filled late. Resolving hedge.\n`
           );
           // Try to recover actual fill price from CLOB getTrades()
@@ -8357,7 +8358,7 @@ async function runHedgeCycle(state: HedgeState, clobBase: string): Promise<void>
                 t => t.id !== pos.tradeId && t.pmTokenId === pos.pmLeg.tokenId && t.pmCost > 0
               );
               const otherTradesShareTotal = otherTrades.reduce((s, t) => s + t.shares, 0);
-              // Sort fills by time (newest first) — this trade's fills are likely the most recent
+              // Sort fills by time (newest first) -- this trade's fills are likely the most recent
               const sortedFills = [...fills].sort((a, b) =>
                 new Date(b.match_time).getTime() - new Date(a.match_time).getTime()
               );
@@ -8413,15 +8414,15 @@ async function runHedgeCycle(state: HedgeState, clobBase: string): Promise<void>
           return;
         }
       } catch (e) {
-        console.warn(`[HEDGE] Pre-hedge on-chain reconciliation failed: ${(e as Error).message} — continuing normal hedge.`);
+        console.warn(`[HEDGE] Pre-hedge on-chain reconciliation failed: ${(e as Error).message} -- continuing normal hedge.`);
       }
     }
 
-    // ── Single-exchange hedging: PM-only first, then KAL-only after PM_ONLY_MAX_CYCLES ──
+    // -- Single-exchange hedging: PM-only first, then KAL-only after PM_ONLY_MAX_CYCLES --
     const inPmPhaseKH = (state.pmOnlyCycles ?? 0) < PM_ONLY_MAX_CYCLES && !isPmServiceDown();
 
-    // ── IOC sweeps: aggressively grab available asks each cycle ─────────────────
-    // 1) Sweep PM token ask — only in PM phase
+    // -- IOC sweeps: aggressively grab available asks each cycle -----------------
+    // 1) Sweep PM token ask -- only in PM phase
     if (inPmPhaseKH && sharesNeeded >= 5 && !isPmServiceDown()) {
       const pmCurrentAsk = await fetchPmAsk(pos.pmLeg.tokenId, clobBase);
       if (pmCurrentAsk !== null && pmCurrentAsk <= maxPmPrice && sharesNeeded * pmCurrentAsk >= PM_MARKETABLE_MIN_VALUE) {
@@ -8458,7 +8459,7 @@ async function runHedgeCycle(state: HedgeState, clobBase: string): Promise<void>
         }
       }
     }
-    // 2) Sweep Kalshi opposite side ask — only in KAL phase
+    // 2) Sweep Kalshi opposite side ask -- only in KAL phase
     if (!inPmPhaseKH && sharesNeeded > 0 && Date.now() >= state.kalNextRetryAt) {
       const { ask: kalYesAsk, noAsk: kalNoAsk } = await fetchKalshiSingleMarket(pos.kalLeg.ticker);
       // We need the opposite side: if we hold YES, sweep NO asks; if we hold NO, sweep YES asks
@@ -8492,11 +8493,11 @@ async function runHedgeCycle(state: HedgeState, clobBase: string): Promise<void>
       }
     }
 
-    // ── Track PM-only cycles for single-exchange hedging ──
+    // -- Track PM-only cycles for single-exchange hedging --
     if (inPmPhaseKH && sharesNeeded > 0) {
       state.pmOnlyCycles = (state.pmOnlyCycles ?? 0) + 1;
       if (state.pmOnlyCycles >= PM_ONLY_MAX_CYCLES) {
-        console.log(`[HEDGE] KAL-held: ${state.pmOnlyCycles} PM-only cycles with no fill — switching to KAL-only`);
+        console.log(`[HEDGE] KAL-held: ${state.pmOnlyCycles} PM-only cycles with no fill -- switching to KAL-only`);
         // Cancel any resting PM GTC orders before switching to KAL
         for (const [oid, ho] of activeOrders) {
           if (ho.exchange === "pm") {
@@ -8507,7 +8508,7 @@ async function runHedgeCycle(state: HedgeState, clobBase: string): Promise<void>
       }
     }
 
-    // ── SEQUENTIAL complete: only ONE complete order at a time (prevents double-fill) ──
+    // -- SEQUENTIAL complete: only ONE complete order at a time (prevents double-fill) --
     // Single-exchange: GTC orders only on the active phase's exchange
     const hasAnyCompleteKH = [...activeOrders.values()].some(o => o.role === "complete");
     if (!hasAnyCompleteKH && sharesNeeded > 0) {
@@ -8517,12 +8518,12 @@ async function runHedgeCycle(state: HedgeState, clobBase: string): Promise<void>
         const recheckMkt = recheck.market ?? recheck as unknown as KalshiMarket;
         const recheckStatus = pickString(recheckMkt.status ?? recheckMkt.state ?? "").toLowerCase();
         if (recheckStatus === "closed" || recheckStatus === "settled" || recheckStatus === "resolved" || recheckStatus === "finalized") {
-          console.log(`[HEDGE] Market ${pos.kalLeg.ticker} is now ${recheckStatus} — skipping new order. Will resolve on next cycle.`);
+          console.log(`[HEDGE] Market ${pos.kalLeg.ticker} is now ${recheckStatus} -- skipping new order. Will resolve on next cycle.`);
           saveHedgeState(state);
           return;
         }
-        // No price-based skip — always attempt hedging regardless of current price.
-      } catch { /* non-critical — proceed with order placement */ }
+        // No price-based skip -- always attempt hedging regardless of current price.
+      } catch { /* non-critical -- proceed with order placement */ }
 
       // Single-exchange hedging: only place GTC on the current phase's exchange
       const inPmNowKH = (state.pmOnlyCycles ?? 0) < PM_ONLY_MAX_CYCLES && !isPmServiceDown();
@@ -8534,7 +8535,7 @@ async function runHedgeCycle(state: HedgeState, clobBase: string): Promise<void>
         if (placed) break;
 
       if (!placed && tryExchangeKH === "pm") {
-        // ── Try PM GTC BID for the needed token ─────────────────────────────
+        // -- Try PM GTC BID for the needed token -----------------------------
         const pmTick = pos.pmLeg.tickSize || 0.01;
         const pmBidPrice = Math.floor(maxPmPrice / pmTick) * pmTick;
         if (pmBidPrice > 0 && sharesNeeded * pmBidPrice >= PM_MARKETABLE_MIN_VALUE) {
@@ -8549,7 +8550,7 @@ async function runHedgeCycle(state: HedgeState, clobBase: string): Promise<void>
                 activeOrders.set(oid, { role: "complete", exchange: "pm", orderId: oid, price: pmBidPrice, shares: sharesNeeded, filledSoFar: 0, fetchFailures: 0, placedAt: Date.now() });
                 state.lastCompleteExchange = "pm";
                 saveHedgeState(state);
-                console.log(`\n[HEDGE] Placed PM GTC BID ${sharesNeeded}×${pos.pmLeg.outcome}@${fmtPct(pmBidPrice)} (complete-pm). orderId=${oid}`);
+                console.log(`\n[HEDGE] Placed PM GTC BID ${sharesNeeded}x${pos.pmLeg.outcome}@${fmtPct(pmBidPrice)} (complete-pm). orderId=${oid}`);
                 placed = true;
                 if (!DRY_RUN && meta.status === "matched") {
                   pos.sharesHeld = Math.max(0, pos.sharesHeld - sharesNeeded);
@@ -8579,7 +8580,7 @@ async function runHedgeCycle(state: HedgeState, clobBase: string): Promise<void>
         }
       }
 
-      // ── Try Kalshi opposite-side GTC bid ─────────────────────────────────────
+      // -- Try Kalshi opposite-side GTC bid -------------------------------------
       if (!placed && tryExchangeKH === "kal" && sharesNeeded > 0) {
         const kalOppCents = Math.max(1, Math.min(99, Math.floor(maxKalOppPrice * 100)));
         const order = buildKalshiGTCOrder(pos.kalLeg.ticker, "buy", hedgeKalSide, kalOppCents, sharesNeeded);
@@ -8591,7 +8592,7 @@ async function runHedgeCycle(state: HedgeState, clobBase: string): Promise<void>
             activeOrders.set(oid, { role: "complete", exchange: "kal", orderId: oid, price: kalOppCents / 100, shares: sharesNeeded, filledSoFar: 0, fetchFailures: 0, placedAt: Date.now() });
             state.lastCompleteExchange = "kal";
             saveHedgeState(state);
-            console.log(`\n[HEDGE] Placed Kalshi GTC ${hedgeKalSide.toUpperCase()}-BID ${sharesNeeded}×@${fmtPct(kalOppCents / 100)} (complete-kal ${hedgeKalSide.toUpperCase()}). orderId=${oid}`);
+            console.log(`\n[HEDGE] Placed Kalshi GTC ${hedgeKalSide.toUpperCase()}-BID ${sharesNeeded}x@${fmtPct(kalOppCents / 100)} (complete-kal ${hedgeKalSide.toUpperCase()}). orderId=${oid}`);
             try {
               const check = await getKalshiOrder(oid);
               const checkStatus = String(check.status ?? "");
@@ -8633,8 +8634,8 @@ async function runHedgeCycle(state: HedgeState, clobBase: string): Promise<void>
       } // end for (tryOrderKH)
     }
 
-    // ── exit: sell our Kalshi side at cost basis (skipped if STRICT_HEDGE)
-    // Always place at cost basis — the GTC rests until price comes back up.
+    // -- exit: sell our Kalshi side at cost basis (skipped if STRICT_HEDGE)
+    // Always place at cost basis -- the GTC rests until price comes back up.
     if (!STRICT_HEDGE && pos.sharesHeld > 0) {
       const hasKalExit = [...activeOrders.values()].some(o => o.role === "exit" && o.exchange === "kal");
       if (!hasKalExit) {
@@ -8647,7 +8648,7 @@ async function runHedgeCycle(state: HedgeState, clobBase: string): Promise<void>
           if (oid) {
             activeOrders.set(oid, { role: "exit", exchange: "kal", orderId: oid, price: exitCents / 100, shares: pos.sharesHeld, filledSoFar: 0, fetchFailures: 0, placedAt: Date.now() });
             saveHedgeState(state);
-            console.log(`\n[HEDGE] Placed Kalshi GTC ${pos.kalSide.toUpperCase()}-ASK ${pos.sharesHeld}×@${fmtPct(exitCents / 100)} (exit at cost). orderId=${oid}`);
+            console.log(`\n[HEDGE] Placed Kalshi GTC ${pos.kalSide.toUpperCase()}-ASK ${pos.sharesHeld}x@${fmtPct(exitCents / 100)} (exit at cost). orderId=${oid}`);
           }
         } catch (e) {
           console.error(`[HEDGE] Failed to place Kalshi GTC sell: ${(e as Error).message}`);
@@ -8657,10 +8658,10 @@ async function runHedgeCycle(state: HedgeState, clobBase: string): Promise<void>
   }
 }
 
-// ─── Startup position scan ────────────────────────────────────────────────────
+// --- Startup position scan ----------------------------------------------------
 // When no saved hedge_state.json exists, scan the Polymarket wallet for live
 // positions and cross-reference against the current watchlist.
-// If a match is found the bot automatically enters hedge mode — no manual action needed.
+// If a match is found the bot automatically enters hedge mode -- no manual action needed.
 
 async function detectUnhedgedPmPositions(watchlist: WatchEntry[], hedgeStateTickers?: Set<string>): Promise<HedgeState[]> {
   let positions: PmPosition[];
@@ -8676,10 +8677,10 @@ async function detectUnhedgedPmPositions(watchlist: WatchEntry[], hedgeStateTick
 
   // Load resolved trades to avoid re-processing PM positions that are already accounted for.
   // When a Kalshi market settles, the KAL position disappears from the portfolio, making
-  // the PM tokens look "unhedged". But the arb was already resolved — don't re-process.
+  // the PM tokens look "unhedged". But the arb was already resolved -- don't re-process.
   const existingTrades = loadArbTrades();
-  const resolvedSharesByPm = new Map<string, number>(); // key: "pmSlug|pmOutcome" → total resolved shares
-  const resolvedSharesByTokenId = new Map<string, number>(); // key: pmTokenId → total resolved shares
+  const resolvedSharesByPm = new Map<string, number>(); // key: "pmSlug|pmOutcome" -> total resolved shares
+  const resolvedSharesByTokenId = new Map<string, number>(); // key: pmTokenId -> total resolved shares
   for (const t of existingTrades) {
     if (t.status === "resolved" || t.status === "filled") {
       const key = `${t.pmSlug}|${t.pmOutcome}`;
@@ -8700,28 +8701,28 @@ async function detectUnhedgedPmPositions(watchlist: WatchEntry[], hedgeStateTick
     }
   }
 
-  // Build tokenId → watchlist leg lookup.
-  // 2-way: Holding pm1 → needs kal2 YES to complete (dir=B), oppLeg=pm2
-  //        Holding pm2 → needs kal1 YES to complete (dir=A), oppLeg=pm1
-  // 3-way: Holding pm1 YES → needs kal1 NO to complete (dir=G: KAL Home NO + PM Home YES)
-  //        Holding pm2 YES → needs kal2 NO to complete (dir=I: KAL Away NO + PM Away YES)
-  //        Holding pm3 YES → needs kal3 NO to complete (dir=H: KAL Draw NO + PM Draw YES)
-  //        Holding pm1 NO  → needs kal1 YES to complete (dir=J: KAL Home YES + PM Home NO)
-  //        Holding pm2 NO  → needs kal2 YES to complete (dir=L: KAL Away YES + PM Away NO)
-  //        Holding pm3 NO  → needs kal3 YES to complete (dir=K: KAL Draw YES + PM Draw NO)
+  // Build tokenId -> watchlist leg lookup.
+  // 2-way: Holding pm1 -> needs kal2 YES to complete (dir=B), oppLeg=pm2
+  //        Holding pm2 -> needs kal1 YES to complete (dir=A), oppLeg=pm1
+  // 3-way: Holding pm1 YES -> needs kal1 NO to complete (dir=G: KAL Home NO + PM Home YES)
+  //        Holding pm2 YES -> needs kal2 NO to complete (dir=I: KAL Away NO + PM Away YES)
+  //        Holding pm3 YES -> needs kal3 NO to complete (dir=H: KAL Draw NO + PM Draw YES)
+  //        Holding pm1 NO  -> needs kal1 YES to complete (dir=J: KAL Home YES + PM Home NO)
+  //        Holding pm2 NO  -> needs kal2 YES to complete (dir=L: KAL Away YES + PM Away NO)
+  //        Holding pm3 NO  -> needs kal3 YES to complete (dir=K: KAL Draw YES + PM Draw NO)
   //   Using opposite-player KAL (2-way mapping) in 3-way leaves draw UNCOVERED.
   //   Using same-outcome KAL guarantees $1 payout regardless of result.
   type LegMatch = { entry: WatchEntry; pmLeg: PmLeg; pmOppLeg: PmLeg | null; kalLeg: KalshiLeg; kalSide3Way?: "yes" | "no" };
   const tokenMap = new Map<string, LegMatch>();
   for (const entry of watchlist) {
     if (entry.is3Way) {
-      // YES tokens → hedge with KAL NO on SAME outcome (Dir G/H/I)
+      // YES tokens -> hedge with KAL NO on SAME outcome (Dir G/H/I)
       tokenMap.set(entry.pm1.tokenId, { entry, pmLeg: entry.pm1, pmOppLeg: null, kalLeg: entry.kal1, kalSide3Way: "no" });
       tokenMap.set(entry.pm2.tokenId, { entry, pmLeg: entry.pm2, pmOppLeg: null, kalLeg: entry.kal2, kalSide3Way: "no" });
       if (entry.pm3 && entry.kal3) {
         tokenMap.set(entry.pm3.tokenId, { entry, pmLeg: entry.pm3, pmOppLeg: null, kalLeg: entry.kal3, kalSide3Way: "no" });
       }
-      // NO tokens → hedge with KAL YES on SAME outcome (Dir J/K/L)
+      // NO tokens -> hedge with KAL YES on SAME outcome (Dir J/K/L)
       if (entry.pm1.noTokenId) {
         tokenMap.set(entry.pm1.noTokenId, { entry, pmLeg: { ...entry.pm1, tokenId: entry.pm1.noTokenId, outcome: `${entry.pm1.outcome} [NO]` }, pmOppLeg: null, kalLeg: entry.kal1, kalSide3Way: "yes" });
       }
@@ -8751,14 +8752,14 @@ async function detectUnhedgedPmPositions(watchlist: WatchEntry[], hedgeStateTick
       // Position exists on PM but is not in the current watchlist
       // (e.g. the match resolved, or discovery couldn't find it today)
       console.warn(
-        `[STARTUP] Unrecognized PM position — tokenId=${tokenId.slice(0, 16)}... size=${size}.` +
-        ` Not in today's watchlist — please resolve manually.`
+        `[STARTUP] Unrecognized PM position -- tokenId=${tokenId.slice(0, 16)}... size=${size}.` +
+        ` Not in today's watchlist -- please resolve manually.`
       );
       continue;
     }
 
     // Conservative cost basis: if API doesn't return avg price, assume 0.50 (mid-market).
-    // Using tickSize (0.01) would make maxKalPrice ≈ 0.99, effectively a market-buy — dangerous.
+    // Using tickSize (0.01) would make maxKalPrice ≈ 0.99, effectively a market-buy -- dangerous.
     // 0.50 keeps the GTC bid at ~0.50, which is safe and breakeven-ish for most head-to-head markets.
     // IMPORTANT: PM positions API avgPrice can be MARKET PRICE, not fill price.
     // Prefer actual fill price from pending_fills when available.
@@ -8780,13 +8781,13 @@ async function detectUnhedgedPmPositions(watchlist: WatchEntry[], hedgeStateTick
     // Count how many shares are already covered by the Kalshi leg (complete-kal path)
     const kalAlreadyFilledRaw = await getKalshiPosition(m.kalLeg.ticker);
     if (kalAlreadyFilledRaw < 0) {
-      console.warn(`[STARTUP] Kalshi API error for ${m.kalLeg.ticker} — skipping PM position to avoid duplicate arbs.`);
+      console.warn(`[STARTUP] Kalshi API error for ${m.kalLeg.ticker} -- skipping PM position to avoid duplicate arbs.`);
       continue;
     }
     const kalAlreadyFilled = kalAlreadyFilledRaw;
 
     // Count shares already accounted for in resolved/active arb trades
-    // Use BOTH slug+outcome and tokenId lookups — whichever finds more (handles string mismatches)
+    // Use BOTH slug+outcome and tokenId lookups -- whichever finds more (handles string mismatches)
     const tradeKey = `${m.entry.pmSlug}|${m.pmLeg.outcome}`;
     const bySlug = resolvedSharesByPm.get(tradeKey) ?? 0;
     const byToken = resolvedSharesByTokenId.get(m.pmLeg.tokenId) ?? 0;
@@ -8805,7 +8806,7 @@ async function detectUnhedgedPmPositions(watchlist: WatchEntry[], hedgeStateTick
       if (oppPmSize > 0) parts.push(`PM-opp ${oppPmSize}`);
       if (alreadyTracked > 0) parts.push(`trades ${alreadyTracked}`);
       console.log(
-        `[STARTUP] PM ${totalPmShares}×${m.pmLeg.outcome} — fully covered` +
+        `[STARTUP] PM ${totalPmShares}x${m.pmLeg.outcome} -- fully covered` +
         ` (${parts.join(" + ")}). Arb complete, skipping.\n`
       );
       continue;
@@ -8813,13 +8814,13 @@ async function detectUnhedgedPmPositions(watchlist: WatchEntry[], hedgeStateTick
 
     if (covered > 0) {
       console.log(
-        `[STARTUP] PM ${totalPmShares}×${m.pmLeg.outcome} — ${covered} already covered` +
+        `[STARTUP] PM ${totalPmShares}x${m.pmLeg.outcome} -- ${covered} already covered` +
         ` (KAL ${kalAlreadyFilled} + PM-opp ${oppPmSize}). Net unhedged: ${sharesHeld}.`
       );
     }
 
     console.warn(
-      `\n[STARTUP] Found unhedged PM position: ${sharesHeld}×${m.pmLeg.outcome}` +
+      `\n[STARTUP] Found unhedged PM position: ${sharesHeld}x${m.pmLeg.outcome}` +
       ` @${fmtPct(avgPrice)} (${m.entry.pmSlug}). Will hedge automatically.\n`
     );
 
@@ -8881,18 +8882,18 @@ async function detectUnhedgedPmPositions(watchlist: WatchEntry[], hedgeStateTick
   return results;
 }
 
-// ─── Startup Kalshi position scan ─────────────────────────────────────────────
-// Mirror of detectUnhedgedPmPositions — scans the Kalshi portfolio for open YES
+// --- Startup Kalshi position scan ---------------------------------------------
+// Mirror of detectUnhedgedPmPositions -- scans the Kalshi portfolio for open YES
 // positions and cross-references against the watchlist.  If a match is found and
 // neither the PM leg nor the Kalshi NO leg is already held, enters hedge mode.
 
 async function detectUnhedgedKalPositions(watchlist: WatchEntry[], kalPosMap?: Map<string, { yesCount: number; noCount: number; avgPriceCents: number }>, hedgeStateTickers?: Set<string>): Promise<HedgeState[]> {
-  // Build ticker → watchlist leg lookup.
-  // 2-way markets: Holding kal1 YES → needs pm2 to complete (dir=A logic)
-  //                Holding kal2 YES → needs pm1 to complete (dir=B logic)
-  // 3-way soccer:  Holding kal1 YES → needs PM Home NO to complete (dir=J logic)
-  //                Holding kal2 YES → needs PM Away NO to complete (dir=L logic)
-  //                Holding kal3 YES → needs PM Draw NO to complete (dir=K logic)
+  // Build ticker -> watchlist leg lookup.
+  // 2-way markets: Holding kal1 YES -> needs pm2 to complete (dir=A logic)
+  //                Holding kal2 YES -> needs pm1 to complete (dir=B logic)
+  // 3-way soccer:  Holding kal1 YES -> needs PM Home NO to complete (dir=J logic)
+  //                Holding kal2 YES -> needs PM Away NO to complete (dir=L logic)
+  //                Holding kal3 YES -> needs PM Draw NO to complete (dir=K logic)
   //   Using opposite-player YES (2-way mapping) in 3-way leaves draw UNCOVERED.
   //   Using same-outcome NO token guarantees $1 payout regardless of result.
   type KalLegMatch = { entry: WatchEntry; kalLeg: KalshiLeg; pmLeg: PmLeg };
@@ -8930,7 +8931,7 @@ async function detectUnhedgedKalPositions(watchlist: WatchEntry[], kalPosMap?: M
     console.log(`[STARTUP] KAL scan: No YES positions found on Kalshi.`);
     return [];
   }
-  console.log(`[STARTUP] KAL scan: ${kalYesPositions.length} YES position(s): ${kalYesPositions.map(p => `${p.yesCount}×${p.ticker}`).join(", ")}`);
+  console.log(`[STARTUP] KAL scan: ${kalYesPositions.length} YES position(s): ${kalYesPositions.map(p => `${p.yesCount}x${p.ticker}`).join(", ")}`);
 
   // Use cached PM positions (already fetched by detectUnhedgedPmPositions on same startup)
   let pmPositions: PmPosition[] = [];
@@ -8944,7 +8945,7 @@ async function detectUnhedgedKalPositions(watchlist: WatchEntry[], kalPosMap?: M
 
   // Load resolved trades to avoid re-processing Kalshi positions already accounted for.
   const existingTrades = loadArbTrades();
-  const resolvedSharesByKal = new Map<string, number>(); // key: kalTicker → total resolved shares
+  const resolvedSharesByKal = new Map<string, number>(); // key: kalTicker -> total resolved shares
   for (const t of existingTrades) {
     if (t.status === "resolved" || t.status === "filled") {
       resolvedSharesByKal.set(t.kalTicker, (resolvedSharesByKal.get(t.kalTicker) ?? 0) + (t.shares ?? 0));
@@ -8954,7 +8955,7 @@ async function detectUnhedgedKalPositions(watchlist: WatchEntry[], kalPosMap?: M
       if (hedgeStateTickers?.has(t.kalTicker)) {
         resolvedSharesByKal.set(t.kalTicker, (resolvedSharesByKal.get(t.kalTicker) ?? 0) + (t.shares ?? 0));
       } else {
-        console.warn(`[STARTUP] Orphaned hedge trade: ${t.kalTicker} (${t.shares} shares) — status=hedging but NOT in hedge_state.json. Will re-detect.`);
+        console.warn(`[STARTUP] Orphaned hedge trade: ${t.kalTicker} (${t.shares} shares) -- status=hedging but NOT in hedge_state.json. Will re-detect.`);
       }
     }
   }
@@ -8976,15 +8977,15 @@ async function detectUnhedgedKalPositions(watchlist: WatchEntry[], kalPosMap?: M
       } catch { /* ignore fetch errors */ }
       const extra = result ? ` result=${result}` : "";
       console.warn(
-        `\n[STARTUP] ⚠ Orphaned Kalshi position: ${yesCount}×${ticker} YES` +
+        `\n[STARTUP] [!] Orphaned Kalshi position: ${yesCount}x${ticker} YES` +
         `  status=${status}${extra}` +
         (title ? `\n         ${title}` : "") +
-        `\n         Not in today's watchlist — cannot auto-hedge.` +
+        `\n         Not in today's watchlist -- cannot auto-hedge.` +
         (status === "finalized" || status === "settled"
           ? `\n         Market is settled. Kalshi should pay out automatically.`
           : status === "closed"
-          ? `\n         Event finished but not yet settled — payout pending.`
-          : `\n         Market still open — resolve manually or add to watchlist.\n`)
+          ? `\n         Event finished but not yet settled -- payout pending.`
+          : `\n         Market still open -- resolve manually or add to watchlist.\n`)
       );
       continue;
     }
@@ -8992,7 +8993,7 @@ async function detectUnhedgedKalPositions(watchlist: WatchEntry[], kalPosMap?: M
     const totalKalShares = yesCount;
 
     // Count how many shares are already covered by the Kalshi NO leg (YES + NO = $1)
-    // Use the pre-fetched position map — no extra API call per ticker.
+    // Use the pre-fetched position map -- no extra API call per ticker.
     const kalNoFilled = posMap.get(ticker)?.noCount ?? 0;
 
     // Count how many shares are already covered by the PM leg (complete-pm path)
@@ -9005,7 +9006,7 @@ async function detectUnhedgedKalPositions(watchlist: WatchEntry[], kalPosMap?: M
     // Count shares already accounted for in resolved/active arb trades
     const alreadyTracked = resolvedSharesByKal.get(ticker) ?? 0;
 
-    console.log(`[STARTUP] KAL ${totalKalShares}×${ticker}: kalNO=${kalNoFilled} pmHeld=${pmHeld} tracked=${alreadyTracked} inHedgeState=${hedgeStateTickers?.has(ticker) ?? "n/a"}`);
+    console.log(`[STARTUP] KAL ${totalKalShares}x${ticker}: kalNO=${kalNoFilled} pmHeld=${pmHeld} tracked=${alreadyTracked} inHedgeState=${hedgeStateTickers?.has(ticker) ?? "n/a"}`);
 
     // Net unhedged = total Kalshi YES minus whatever is already covered on either side
     // alreadyTracked may overlap with kalNoFilled/pmHeld, so use max to avoid double-counting
@@ -9019,7 +9020,7 @@ async function detectUnhedgedKalPositions(watchlist: WatchEntry[], kalPosMap?: M
       if (pmHeld > 0) parts.push(`PM ${pmHeld}`);
       if (alreadyTracked > 0) parts.push(`trades ${alreadyTracked}`);
       console.log(
-        `[STARTUP] Kalshi ${totalKalShares}×${ticker} YES — fully covered` +
+        `[STARTUP] Kalshi ${totalKalShares}x${ticker} YES -- fully covered` +
         ` (${parts.join(" + ")}). Arb complete, skipping.\n`
       );
       continue;
@@ -9027,7 +9028,7 @@ async function detectUnhedgedKalPositions(watchlist: WatchEntry[], kalPosMap?: M
 
     if (covered > 0) {
       console.log(
-        `[STARTUP] Kalshi ${totalKalShares}×${ticker} YES — ${covered} already covered` +
+        `[STARTUP] Kalshi ${totalKalShares}x${ticker} YES -- ${covered} already covered` +
         ` (KAL NO ${kalNoFilled} + PM ${pmHeld}). Net unhedged: ${sharesHeld}.`
       );
     }
@@ -9050,7 +9051,7 @@ async function detectUnhedgedKalPositions(watchlist: WatchEntry[], kalPosMap?: M
     const kalFeePerShare = actualKalFees / Math.max(sharesHeld, 1);
 
     console.warn(
-      `\n[STARTUP] Found unhedged Kalshi position: ${sharesHeld}×${ticker} YES` +
+      `\n[STARTUP] Found unhedged Kalshi position: ${sharesHeld}x${ticker} YES` +
       ` @~${fmtPct(avgFillPrice)} fee=$${actualKalFees.toFixed(2)} (${fmtPct(kalFeePerShare)}/sh) (${m.entry.pmSlug}). Will hedge automatically.\n`
     );
 
@@ -9108,23 +9109,23 @@ async function detectUnhedgedKalPositions(watchlist: WatchEntry[], kalPosMap?: M
   return results;
 }
 
-// ─── Monitor loop ─────────────────────────────────────────────────────────────
+// --- Monitor loop -------------------------------------------------------------
 
 async function monitorLoop(watchlist: WatchEntry[]): Promise<void> {
   const clobBase = process.env.POLY_CLOB_URL ?? "https://clob.polymarket.com";
 
-  // cooldownMap: matchCode → timestamp of last trade ATTEMPT (success or fail)
+  // cooldownMap: matchCode -> timestamp of last trade ATTEMPT (success or fail)
   const cooldownMap = new Map<string, number>();
-  // kalTickerCooldown: kalTicker → timestamp — prevents firing the same Kalshi market
+  // kalTickerCooldown: kalTicker -> timestamp -- prevents firing the same Kalshi market
   // from different watchlist entries (e.g. GAME vs MAP entries sharing a ticker)
   const kalTickerCooldown = new Map<string, number>();
-  // pmSlugCooldown: pmSlug → timestamp — prevents buying same PM market from GAME+MAP entries
+  // pmSlugCooldown: pmSlug -> timestamp -- prevents buying same PM market from GAME+MAP entries
   const pmSlugCooldown = new Map<string, number>();
-  // abortCooldown: matchCode → { count, cooldownUntil } — after 3 consecutive aborts, skip for 5 min
+  // abortCooldown: matchCode -> { count, cooldownUntil } -- after 3 consecutive aborts, skip for 5 min
   const ABORT_COOLDOWN_THRESHOLD = 3;
   const ABORT_COOLDOWN_MS = 5 * 60 * 1000; // 5 minutes
   const abortCountMap = new Map<string, { count: number; cooldownUntil: number }>();
-  // sessionSkipSet: matches already traded — don't trade again this session.
+  // sessionSkipSet: matches already traded -- don't trade again this session.
   // Prevents re-arbing the same match in the opposite direction (which nets out to a fee loss).
   // Seeded at startup from arb_trades.json: includes recent trades (last 3 days) AND any
   // non-resolved trades (a trade placed days ago on a future game should still block).
@@ -9147,9 +9148,9 @@ async function monitorLoop(watchlist: WatchEntry[]): Promise<void> {
       console.log(`[STARTUP] Seeded sessionSkipSet with ${sessionSkipSet.size} match(es) from recent/active trades: ${Array.from(sessionSkipSet).join(", ")}`);
     }
   }
-  // Coin-flip warning: PM pricing ~50/50 — only warn once per match
+  // Coin-flip warning: PM pricing ~50/50 -- only warn once per match
   const coinFlipWarned = new Set<string>();
-  // inflight: markets currently executing an arb — prevents concurrent execution on same market
+  // inflight: markets currently executing an arb -- prevents concurrent execution on same market
   const inflight = new Set<string>();
   // Circuit breaker: consecutive arb execution errors
   let consecutiveErrors = 0;
@@ -9167,9 +9168,9 @@ async function monitorLoop(watchlist: WatchEntry[]): Promise<void> {
     }
   }
 
-  // Active hedge states — load from file first; if none, scan both wallets.
+  // Active hedge states -- load from file first; if none, scan both wallets.
   // Supports MULTIPLE simultaneous hedges (e.g. Tirante on PM + Elegance on Kalshi).
-  // Fetch all Kalshi positions in ONE API call — reused by resume loop + detectUnhedgedKal.
+  // Fetch all Kalshi positions in ONE API call -- reused by resume loop + detectUnhedgedKal.
   const kalPosMap = await getKalshiPositionMap();
 
   let hedgeStates: HedgeState[] = loadHedgeStates();
@@ -9180,7 +9181,7 @@ async function monitorLoop(watchlist: WatchEntry[]): Promise<void> {
     for (const hs of hedgeStates) {
       const pos = hs.position;
       if (!DRY_RUN) {
-        // ── Verify the HELD position actually exists on the exchange ──────────
+        // -- Verify the HELD position actually exists on the exchange ----------
         // Prevents ghost positions: state file says we hold shares but wallet/API disagrees.
         if (pos.heldExchange === "pm") {
           try {
@@ -9188,7 +9189,7 @@ async function monitorLoop(watchlist: WatchEntry[]): Promise<void> {
             const heldQty = sumPmHeld(pmPos, pos.pmLeg.tokenId);
             if (heldQty <= 0) {
               console.warn(
-                `\n[HEDGE RESUME] ⚠ GHOST POSITION: PM ${pos.pmLeg.outcome} not found in wallet!` +
+                `\n[HEDGE RESUME] [!] GHOST POSITION: PM ${pos.pmLeg.outcome} not found in wallet!` +
                 ` Persisted sharesHeld=${pos.sharesHeld} but wallet has 0. Clearing.\n`
               );
               if (hs.activeOrders.size > 0) await cancelAllHedgeOrders(hs.activeOrders);
@@ -9199,14 +9200,14 @@ async function monitorLoop(watchlist: WatchEntry[]): Promise<void> {
               pos.sharesHeld = heldQty;
             }
           } catch (e) {
-            console.error(`[HEDGE RESUME] PM held-position verify failed: ${(e as Error).message} — proceeding with persisted qty.`);
+            console.error(`[HEDGE RESUME] PM held-position verify failed: ${(e as Error).message} -- proceeding with persisted qty.`);
           }
         } else {
           try {
             const kalQty = kalPosMap.get(pos.kalLeg.ticker)?.yesCount ?? 0;
             if (kalQty <= 0) {
               console.warn(
-                `\n[HEDGE RESUME] ⚠ GHOST POSITION: Kalshi ${pos.kalLeg.ticker} YES not found!` +
+                `\n[HEDGE RESUME] [!] GHOST POSITION: Kalshi ${pos.kalLeg.ticker} YES not found!` +
                 ` Persisted sharesHeld=${pos.sharesHeld} but API has 0. Clearing.\n`
               );
               if (hs.activeOrders.size > 0) await cancelAllHedgeOrders(hs.activeOrders);
@@ -9217,11 +9218,11 @@ async function monitorLoop(watchlist: WatchEntry[]): Promise<void> {
               pos.sharesHeld = kalQty;
             }
           } catch (e) {
-            console.error(`[HEDGE RESUME] Kalshi held-position verify failed: ${(e as Error).message} — proceeding with persisted qty.`);
+            console.error(`[HEDGE RESUME] Kalshi held-position verify failed: ${(e as Error).message} -- proceeding with persisted qty.`);
           }
         }
 
-        // ── Check coverage on opposite legs (using pre-fetched maps) ─────────
+        // -- Check coverage on opposite legs (using pre-fetched maps) ---------
         let covered = 0;
         if (pos.heldExchange === "pm") {
           covered += kalPosMap.get(pos.kalLeg.ticker)?.yesCount ?? 0;
@@ -9244,7 +9245,7 @@ async function monitorLoop(watchlist: WatchEntry[]): Promise<void> {
         }
         covered = Math.min(pos.sharesHeld, covered);
 
-        // Always cancel stale orders from previous session — they may have expired,
+        // Always cancel stale orders from previous session -- they may have expired,
         // been cancelled, or partially filled on the exchange. The hedge cycle will
         // place fresh orders with up-to-date prices.
         if (hs.activeOrders.size > 0) {
@@ -9273,9 +9274,9 @@ async function monitorLoop(watchlist: WatchEntry[]): Promise<void> {
     hedgeStates = surviving;
   }
 
-  // ── Restore orphaned "hedging" trades from arb_trades.json ─────────────────
+  // -- Restore orphaned "hedging" trades from arb_trades.json -----------------
   // If hedge_state.json was lost on restart but arb_trades still has "hedging" records,
-  // reconstruct correct HedgeState from the trade record (preserving dir → kalSide).
+  // reconstruct correct HedgeState from the trade record (preserving dir -> kalSide).
   // This prevents detectUnhedgedPmPositions from re-detecting with hardcoded kalSide="yes"
   // which is WRONG for Dir C/D trades (kalSide should be "no").
   {
@@ -9283,7 +9284,7 @@ async function monitorLoop(watchlist: WatchEntry[]): Promise<void> {
     const allTrades = loadArbTrades();
     const orphanedHedging = allTrades.filter(t => t.status === "hedging" && !hsTickers.has(t.kalTicker));
     if (orphanedHedging.length > 0) {
-      // Build kalTicker → watchlist lookup
+      // Build kalTicker -> watchlist lookup
       const kalTickerToWatch = new Map<string, { entry: WatchEntry; kalLeg: KalshiLeg; pmLeg: PmLeg }>();
       for (const entry of watchlist) {
         kalTickerToWatch.set(entry.kal1.ticker, { entry, kalLeg: entry.kal1, pmLeg: entry.pm1 });
@@ -9295,7 +9296,7 @@ async function monitorLoop(watchlist: WatchEntry[]): Promise<void> {
       for (const t of orphanedHedging) {
         const wm = kalTickerToWatch.get(t.kalTicker);
         if (!wm) {
-          console.warn(`[STARTUP] Orphaned hedging trade ${t.id} (${t.kalTicker}) not in watchlist — cannot restore.`);
+          console.warn(`[STARTUP] Orphaned hedging trade ${t.id} (${t.kalTicker}) not in watchlist -- cannot restore.`);
           continue;
         }
         // Derive kalSide from dir: C/D/G/H/I use KAL NO, everything else uses KAL YES
@@ -9308,14 +9309,14 @@ async function monitorLoop(watchlist: WatchEntry[]): Promise<void> {
         let pmOppLeg: PmLeg | null = null;
         const is3WayDir = "GHIJKL".includes(t.dir);
         if (!is3WayDir) {
-          // 2-way: Dir A: kal1→pm2.  Dir B: kal2→pm1.  Dir C: kal1→pm1.  Dir D: kal2→pm2.
+          // 2-way: Dir A: kal1->pm2.  Dir B: kal2->pm1.  Dir C: kal1->pm1.  Dir D: kal2->pm2.
           if (t.dir === "A" || t.dir === "D") { pmLeg = entry.pm2; pmOppLeg = entry.pm1; }
           else if (t.dir === "B" || t.dir === "C") { pmLeg = entry.pm1; pmOppLeg = entry.pm2; }
         } else {
           // 3-way soccer: no pmOppLeg (can't complete with a single opposite token)
           pmOppLeg = null;
         }
-        // Override with trade's tokenId if available (more reliable — handles NO tokens too)
+        // Override with trade's tokenId if available (more reliable -- handles NO tokens too)
         if (t.pmTokenId) {
           for (const leg of [entry.pm1, entry.pm2, entry.pm3].filter(Boolean) as PmLeg[]) {
             if (leg.tokenId === t.pmTokenId || leg.noTokenId === t.pmTokenId) {
@@ -9366,14 +9367,14 @@ async function monitorLoop(watchlist: WatchEntry[]): Promise<void> {
     }
   }
 
-  // Always scan both wallets — even if we loaded persisted states, there may be OTHER positions.
+  // Always scan both wallets -- even if we loaded persisted states, there may be OTHER positions.
   // Pass current hedgeState tickers so detection knows which "hedging" arb trades are actually active.
   console.log("[STARTUP] Scanning both wallets for unhedged positions...");
   const hsTickerSet = new Set(hedgeStates.map(hs => hs.position.kalLeg.ticker));
   const pmFound = await detectUnhedgedPmPositions(watchlist, hsTickerSet);
   const kalFound = await detectUnhedgedKalPositions(watchlist, kalPosMap, hsTickerSet);
 
-  // ── Cross-match dedup for 3-way markets ───────────────────────────────────
+  // -- Cross-match dedup for 3-way markets -----------------------------------
   // When both detection functions find positions from the SAME 3-way match
   // (e.g., KAL BRC YES + PM MID YES from an old 2-way hedge), hedging just ONE
   // side is sufficient. The hedged pair guarantees $1 in all outcomes; the
@@ -9401,9 +9402,9 @@ async function monitorLoop(watchlist: WatchEntry[]): Promise<void> {
     if (entry?.is3Way && pmBySlug.has(entry.pmSlug)) {
       const pmHs = pmBySlug.get(entry.pmSlug)!;
       console.log(
-        `[STARTUP] 3-way cross-match dedup: KAL ${hs.position.sharesHeld}×${hs.position.kalLeg.ticker} YES` +
-        ` and PM ${pmHs.position.sharesHeld}×${pmHs.position.pmLeg.outcome} are from the same match.` +
-        ` Keeping PM-side hedge only — KAL position becomes bonus coverage.`
+        `[STARTUP] 3-way cross-match dedup: KAL ${hs.position.sharesHeld}x${hs.position.kalLeg.ticker} YES` +
+        ` and PM ${pmHs.position.sharesHeld}x${pmHs.position.pmLeg.outcome} are from the same match.` +
+        ` Keeping PM-side hedge only -- KAL position becomes bonus coverage.`
       );
       continue; // skip this KAL hedge state
     }
@@ -9412,7 +9413,7 @@ async function monitorLoop(watchlist: WatchEntry[]): Promise<void> {
   const freshFound = [...pmFound, ...deduplicatedKalFound];
 
   // Deduplicate: don't add positions that are already being hedged (same kalLeg ticker).
-  // Also update kalCostBasis from fresh API data — the persisted value may have used
+  // Also update kalCostBasis from fresh API data -- the persisted value may have used
   // an old formula (net-of-fees) that understates the true purchase price.
   const existingTickers = new Set(hedgeStates.map(hs => hs.position.kalLeg.ticker));
   for (const hs of freshFound) {
@@ -9428,17 +9429,17 @@ async function monitorLoop(watchlist: WatchEntry[]): Promise<void> {
           existing.position.kalCostBasis = hs.position.kalCostBasis;
           console.warn(
             `[HEDGE RESUME] Updated kalCostBasis for ${hs.position.kalLeg.ticker}: ` +
-            `${fmtPct(oldCb)} → ${fmtPct(hs.position.kalCostBasis)} (fresh from API)`
+            `${fmtPct(oldCb)} -> ${fmtPct(hs.position.kalCostBasis)} (fresh from API)`
           );
         }
       }
     }
   }
 
-  // ── Cancel ALL resting Kalshi orders at startup ─────────────────────────────
+  // -- Cancel ALL resting Kalshi orders at startup -----------------------------
   // Prevents over-hedging: if the bot crashed after placing a GTC order but before
   // saving hedge_state.json, the order is still live on Kalshi but invisible to us.
-  // On restart, the hedge cycle would place ANOTHER order → double-fill → over-hedge.
+  // On restart, the hedge cycle would place ANOTHER order -> double-fill -> over-hedge.
   // Safe to cancel everything: the bot only places hedge orders, never manual orders.
   try {
     const restingOrders = await fetchOpenKalshiOrders();
@@ -9447,7 +9448,7 @@ async function monitorLoop(watchlist: WatchEntry[]): Promise<void> {
       for (const ro of restingOrders) {
         try {
           await cancelKalshiOrder(ro.orderId, DRY_RUN);
-          console.log(`[STARTUP]   Cancelled ${ro.side.toUpperCase()} ${ro.ticker} ${ro.remainingCount}×@${ro.priceCents}¢ (${ro.orderId.slice(0, 16)}...)`);
+          console.log(`[STARTUP]   Cancelled ${ro.side.toUpperCase()} ${ro.ticker} ${ro.remainingCount}x@${ro.priceCents}c (${ro.orderId.slice(0, 16)}...)`);
         } catch (e) {
           console.error(`[STARTUP]   Failed to cancel order ${ro.orderId.slice(0, 16)}...: ${(e as Error).message}`);
         }
@@ -9468,7 +9469,7 @@ async function monitorLoop(watchlist: WatchEntry[]): Promise<void> {
   }
   let cycle = 0;
 
-  // ── P&L summary ────────────────────────────────────────────────────────────
+  // -- P&L summary ------------------------------------------------------------
   const arbTrades = loadArbTrades();
   if (arbTrades.length > 0) {
     const filled = arbTrades.filter(t => t.status === "filled");
@@ -9488,7 +9489,7 @@ async function monitorLoop(watchlist: WatchEntry[]): Promise<void> {
     `  poll=${POLL_INTERVAL_MS}ms  cooldown=${TRADE_COOLDOWN_MS / 1000}s\n`
   );
 
-  // ── Pre-warm PM ClobClient (avoids ~200-500ms cold start on first trade) ──
+  // -- Pre-warm PM ClobClient (avoids ~200-500ms cold start on first trade) --
   try {
     const warmStart = performance.now();
     await createPmClient();
@@ -9497,7 +9498,7 @@ async function monitorLoop(watchlist: WatchEntry[]): Promise<void> {
     console.warn(`[STARTUP] PM client warmup failed: ${(e as Error).message}`);
   }
 
-  // ── Seed cancelled-event keys from trade history ────────────────────────────
+  // -- Seed cancelled-event keys from trade history ----------------------------
   // If any past trade resolved via scalar settlement, block that event date
   // to prevent trading sibling/rescheduled markets for the same match.
   {
@@ -9511,7 +9512,7 @@ async function monitorLoop(watchlist: WatchEntry[]): Promise<void> {
       // Only check recent trades to avoid excessive API calls at startup
       const tradeTime = new Date(t.ts).getTime();
       if (tradeTime < recentCutoff) continue;
-      // Check resolved + filled trades — both could be on scalar-settled markets
+      // Check resolved + filled trades -- both could be on scalar-settled markets
       if (t.status === "resolved" || t.status === "filled") {
         checkedTickers.add(t.kalTicker);
         try {
@@ -9520,10 +9521,10 @@ async function monitorLoop(watchlist: WatchEntry[]): Promise<void> {
           if (isScalarSettlement(mkt)) {
             _cancelledTickers.add(t.kalTicker);
             _cancelledEventKeys.add(extractEventDateKey(t.kalTicker));
-            console.log(`[STARTUP] Flagged cancelled event: ${t.kalTicker} → key="${extractEventDateKey(t.kalTicker)}"`);
+            console.log(`[STARTUP] Flagged cancelled event: ${t.kalTicker} -> key="${extractEventDateKey(t.kalTicker)}"`);
           }
         } catch {
-          // Market may be delisted — that's also a cancellation signal
+          // Market may be delisted -- that's also a cancellation signal
         }
       }
     }
@@ -9536,7 +9537,7 @@ async function monitorLoop(watchlist: WatchEntry[]): Promise<void> {
     const cycleStart = Date.now();
     cycle++;
 
-    // ── MID-SESSION RECOVERY: pick up auto-recovered trades from reconciliation ──
+    // -- MID-SESSION RECOVERY: pick up auto-recovered trades from reconciliation --
     // reconcilePositions may create "hedging" trades mid-session. Without this,
     // they'd sit in arb_trades.json doing nothing until the next restart.
     if (_reconcileRecoveredTrades) {
@@ -9545,7 +9546,7 @@ async function monitorLoop(watchlist: WatchEntry[]): Promise<void> {
       const freshTrades = loadArbTrades();
       const newHedging = freshTrades.filter(t => t.status === "hedging" && !hsTickers.has(t.kalTicker));
       if (newHedging.length > 0) {
-        // Build kalTicker → watchlist lookup
+        // Build kalTicker -> watchlist lookup
         const kalTickerToWatch = new Map<string, { entry: WatchEntry; kalLeg: KalshiLeg; pmLeg: PmLeg }>();
         for (const entry of watchlist) {
           kalTickerToWatch.set(entry.kal1.ticker, { entry, kalLeg: entry.kal1, pmLeg: entry.pm1 });
@@ -9557,7 +9558,7 @@ async function monitorLoop(watchlist: WatchEntry[]): Promise<void> {
         for (const t of newHedging) {
           const wm = kalTickerToWatch.get(t.kalTicker);
           if (!wm) {
-            console.warn(`[RECONCILE→HEDGE] Recovered trade ${t.id} (${t.kalTicker}) not in watchlist — cannot start hedge.`);
+            console.warn(`[RECONCILE->HEDGE] Recovered trade ${t.id} (${t.kalTicker}) not in watchlist -- cannot start hedge.`);
             continue;
           }
           const kalNoSideDirs = new Set(["C", "D", "G", "H", "I"]);
@@ -9613,7 +9614,7 @@ async function monitorLoop(watchlist: WatchEntry[]): Promise<void> {
           hedgeStates.push(newHs);
           hsTickers.add(t.kalTicker);
           console.log(
-            `\n[RECONCILE→HEDGE] Picked up recovered trade: ${t.match} dir=${t.dir} kalSide=${kalSide}` +
+            `\n[RECONCILE->HEDGE] Picked up recovered trade: ${t.match} dir=${t.dir} kalSide=${kalSide}` +
             ` held=${heldExchange} shares=${t.shares} ticker=${t.kalTicker}\n`
           );
         }
@@ -9622,8 +9623,8 @@ async function monitorLoop(watchlist: WatchEntry[]): Promise<void> {
       }
     }
 
-    // ── HEDGE CHECK: process unhedged positions, then CONTINUE to arb scanning ──
-    // Hedge orders are GTC — they rest on the book. We only need to:
+    // -- HEDGE CHECK: process unhedged positions, then CONTINUE to arb scanning --
+    // Hedge orders are GTC -- they rest on the book. We only need to:
     //  1) Place orders that aren't placed yet (first cycle after detection)
     //  2) Check fills periodically (~every 10s, not every 400ms cycle)
     // Normal arb scanning ALWAYS runs regardless of hedge state.
@@ -9644,7 +9645,7 @@ async function monitorLoop(watchlist: WatchEntry[]): Promise<void> {
             const name = p.heldExchange === "pm" ? p.pmLeg.outcome : p.kalLeg.ticker;
 
             if (p.hedgeFillCost > 0) {
-              // Genuine hedge-complete: both legs filled → guaranteed $1/share payout.
+              // Genuine hedge-complete: both legs filled -> guaranteed $1/share payout.
               const isPmInitial = p.heldExchange === "pm";
               // initialCost already includes initial Kalshi fees for KAL-held positions.
               // For KAL-held, add hedge fees separately (kalFees - initialKalFees).
@@ -9690,7 +9691,7 @@ async function monitorLoop(watchlist: WatchEntry[]): Promise<void> {
             } else {
               // Position resolved without hedge (market settled while unhedged).
               // The settlement path in runHedgeCycle already called resolveArbTrade
-              // with correct P&L. Just log removal — don't double-resolve.
+              // with correct P&L. Just log removal -- don't double-resolve.
               console.log(`\n[HEDGE] ${name} cleared (settled without hedge).`);
             }
             const resolvedTokenId = p.pmLeg.tokenId;
@@ -9710,10 +9711,10 @@ async function monitorLoop(watchlist: WatchEntry[]): Promise<void> {
           saveHedgeStates(hedgeStates);
         }
       }
-      // Fall through to normal arb scanning — don't block!
+      // Fall through to normal arb scanning -- don't block!
     }
 
-    // ── CANCELLATION MONITOR: detect scalar settlements & emergency-sell PM ──
+    // -- CANCELLATION MONITOR: detect scalar settlements & emergency-sell PM --
     // Runs every 60s. Checks Kalshi market status for all open positions.
     // If a market settled as "scalar" (cancelled/voided), immediately sells PM tokens.
     try {
@@ -9722,7 +9723,7 @@ async function monitorLoop(watchlist: WatchEntry[]): Promise<void> {
       console.warn(`[CANC-MON] Monitor error: ${(err as Error).message}`);
     }
 
-    // ── 1. Refresh Kalshi prices: WS primary, REST every 30 cycles (~12s) ──
+    // -- 1. Refresh Kalshi prices: WS primary, REST every 30 cycles (~12s) --
     // WS gives real-time best ask; REST is only needed for markets without WS data
     // or as a periodic fallback to catch any WS drift.
     let wsKalHits = 0;
@@ -9753,7 +9754,7 @@ async function monitorLoop(watchlist: WatchEntry[]): Promise<void> {
       }
     }
 
-    // ── 2. Fetch PM prices + compute edges ────────────────────────────────
+    // -- 2. Fetch PM prices + compute edges --------------------------------
     let bestEdge = -Infinity;
     let bestEntry: WatchEntry | null = null;
     let bestDir: ArbDir = "A";
@@ -9762,7 +9763,7 @@ async function monitorLoop(watchlist: WatchEntry[]): Promise<void> {
 
     const statusLines: string[] = [];
 
-    // Build a set of matchCodes with active hedge positions — never arb these
+    // Build a set of matchCodes with active hedge positions -- never arb these
     const hedgingMatchCodes = new Set<string>();
     for (const hs of hedgeStates) {
       const t = hs.position.kalLeg.ticker;
@@ -9771,7 +9772,7 @@ async function monitorLoop(watchlist: WatchEntry[]): Promise<void> {
       }
     }
 
-    // ── Pre-fetch ALL PM prices: WS first, REST fallback ──────────────────────
+    // -- Pre-fetch ALL PM prices: WS first, REST fallback ----------------------
     const activePairs = watchlist.filter(
       e => !sessionSkipSet.has(e.matchCode) && !hedgingMatchCodes.has(e.matchCode) &&
         !(abortCountMap.has(e.matchCode) && Date.now() < (abortCountMap.get(e.matchCode)!.cooldownUntil))
@@ -9828,7 +9829,7 @@ async function monitorLoop(watchlist: WatchEntry[]): Promise<void> {
       }
 
       const lastAttempt = cooldownMap.get(entry.matchCode) ?? 0;
-      // Also check per-ticker and per-slug cooldown — prevents firing same Kalshi market
+      // Also check per-ticker and per-slug cooldown -- prevents firing same Kalshi market
       // or same PM market from different watchlist entries (e.g. GAME vs MAP entries)
       const kalTicker1Cd = kalTickerCooldown.get(entry.kal1.ticker) ?? 0;
       const kalTicker2Cd = kalTickerCooldown.get(entry.kal2.ticker) ?? 0;
@@ -9845,8 +9846,8 @@ async function monitorLoop(watchlist: WatchEntry[]): Promise<void> {
 
       if (pm1Ask === null || pm2Ask === null) continue;
 
-      // ── Coin-flip detection: PM asks ~50/50 → suspicious pricing, skip arb ──
-      // If both asks are 48-52¢ the market is priced as a coin-flip.
+      // -- Coin-flip detection: PM asks ~50/50 -> suspicious pricing, skip arb --
+      // If both asks are 48-52c the market is priced as a coin-flip.
       // Fetch bids via WS first, REST fallback if WS unavailable.
       {
         const isCoinFlipAsk = (ask: number) => ask >= 0.48 && ask <= 0.52;
@@ -9859,10 +9860,10 @@ async function monitorLoop(watchlist: WatchEntry[]): Promise<void> {
           if (!coinFlipWarned.has(entry.matchCode)) {
             coinFlipWarned.add(entry.matchCode);
             console.warn(
-              `[COIN-FLIP] ${entry.kal1.surname} vs ${entry.kal2.surname} — ` +
+              `[COIN-FLIP] ${entry.kal1.surname} vs ${entry.kal2.surname} -- ` +
               `PM pricing ~50/50 (asks: ${fmtPct(pm1Ask)}/${fmtPct(pm2Ask)}, ` +
               `bids: ${bid1 !== null ? fmtPct(bid1) : "?"}/${bid2 !== null ? fmtPct(bid2) : "?"}) ` +
-              `KAL: ${fmtPct(entry.kal1.yesAsk)}/${fmtPct(entry.kal2.yesAsk)} — ` +
+              `KAL: ${fmtPct(entry.kal1.yesAsk)}/${fmtPct(entry.kal2.yesAsk)} -- ` +
               `check manually! Skipping arb.`
             );
           }
@@ -9875,9 +9876,9 @@ async function monitorLoop(watchlist: WatchEntry[]): Promise<void> {
       // IMPORTANT: null = "no WS data, trust listing price". A numeric return = "WS has real depth data".
       const realisticEdge = (ticker: string, side: "yes" | "no", pmAskVal: number, minShares: number): number | null => {
         const book = getWsKalBook(ticker);
-        if (!book) return null;  // no WS data → can't verify, let listing price stand
+        if (!book) return null;  // no WS data -> can't verify, let listing price stand
         const askLevels = side === "yes" ? deriveYesAsks(book.no) : deriveNoAsks(book.yes);
-        if (askLevels.length === 0) return -1;  // WS confirms zero depth → kill the edge
+        if (askLevels.length === 0) return -1;  // WS confirms zero depth -> kill the edge
         const limitCents = Math.max(1, Math.min(99, Math.floor((1 - pmAskVal - MIN_EDGE) * 100)));
         const sweep = sweepKalshiDepth(askLevels, minShares, limitCents);
         if (!sweep || sweep.totalQty < minShares) return -1;  // insufficient depth at profitable prices
@@ -9890,7 +9891,7 @@ async function monitorLoop(watchlist: WatchEntry[]): Promise<void> {
       let edges: { dir: ArbDir; edge: number; kalAsk: number; pmAsk: number }[];
 
       if (entry.is3Way && entry.kal3 && entry.pm3) {
-        // ── Soccer 3-way: 12 directions ──────────────────────────────────────
+        // -- Soccer 3-way: 12 directions --------------------------------------
         // Notation: KH/KD/KA = Kalshi Home/Draw/Away yesAsk
         //           PH/PD/PA = PM Home/Draw/Away ask
         //           KH_no/KD_no/KA_no = Kalshi Home/Draw/Away noAsk
@@ -9902,7 +9903,7 @@ async function monitorLoop(watchlist: WatchEntry[]): Promise<void> {
         const pmMin3 = Math.max(entry.pm3.minSize ?? 5, PD > 0 ? Math.ceil(PM_MARKETABLE_MIN_VALUE / PD) : 5);
 
         // 3-leg YES combos (A-F): buy YES on all 3 outcomes across platforms
-        // These require 3 orders to execute — not yet supported by executeArb
+        // These require 3 orders to execute -- not yet supported by executeArb
         const feeA3 = estimateFees(KH, 0) + estimateFees(KD, 0); // KAL fees only (PM has 0% on soccer currently)
         const feeB3 = estimateFees(KH, 0) + estimateFees(KA, 0);
         const feeC3 = estimateFees(KD, 0) + estimateFees(KA, 0);
@@ -9920,7 +9921,7 @@ async function monitorLoop(watchlist: WatchEntry[]): Promise<void> {
         let eG = 1 - KH_no - PH - estimateFees(KH_no, PH);  // G: KAL Home NO + PM Home YES
         let eH = 1 - KD_no - PD - estimateFees(KD_no, PD);  // H: KAL Draw NO + PM Draw YES
         let eI = 1 - KA_no - PA - estimateFees(KA_no, PA);  // I: KAL Away NO + PM Away YES
-        // J/K/L: KAL YES + PM NO on same outcome — use real PM NO token ask prices
+        // J/K/L: KAL YES + PM NO on same outcome -- use real PM NO token ask prices
         const PH_no = entry.pm1.noTokenId ? (pmPriceMap.get(entry.pm1.noTokenId) ?? null) : null;
         const PA_no = entry.pm2.noTokenId ? (pmPriceMap.get(entry.pm2.noTokenId) ?? null) : null;
         const PD_no = entry.pm3.noTokenId ? (pmPriceMap.get(entry.pm3.noTokenId) ?? null) : null;
@@ -9976,9 +9977,9 @@ async function monitorLoop(watchlist: WatchEntry[]): Promise<void> {
           bestPmAsk = bestExec.pmAsk;
         }
       } else if (entry.isBinary) {
-        // ── Binary (non-moneyline): single-ticker, only dirs A and C are valid arbs ──
-        // Dir A: buy KAL YES + PM outcome2 (opposing) → guaranteed $1
-        // Dir C: buy KAL NO + PM outcome1 (matching) → guaranteed $1
+        // -- Binary (non-moneyline): single-ticker, only dirs A and C are valid arbs --
+        // Dir A: buy KAL YES + PM outcome2 (opposing) -> guaranteed $1
+        // Dir C: buy KAL NO + PM outcome1 (matching) -> guaranteed $1
         // Dirs B/D are INVALID: they bet same outcome on both sides (directional, not arb)
         const rawEdgeA = 1 - entry.kal1.yesAsk - pm2Ask;
         const rawEdgeC = 1 - entry.kal1.noAsk - pm1Ask;
@@ -10011,7 +10012,7 @@ async function monitorLoop(watchlist: WatchEntry[]): Promise<void> {
         }
 
       } else {
-        // ── Standard 2-way: tennis/NBA/esports (4 directions A-D) ──────────
+        // -- Standard 2-way: tennis/NBA/esports (4 directions A-D) ----------
         const rawEdgeA = 1 - entry.kal1.yesAsk - pm2Ask;
         const rawEdgeB = 1 - entry.kal2.yesAsk - pm1Ask;
         const rawEdgeC = 1 - entry.kal1.noAsk - pm1Ask;
@@ -10052,7 +10053,7 @@ async function monitorLoop(watchlist: WatchEntry[]): Promise<void> {
       }
     }
 
-    // ── 2b. Speculative orderbook pre-cache for top candidate ──────────────
+    // -- 2b. Speculative orderbook pre-cache for top candidate --------------
     // Skip if WS already has live data for this ticker
     if (bestEntry && bestEdge > MIN_EDGE * 0.5) {
       const targetTicker = (bestDir === "A" || bestDir === "C") ? bestEntry.kal1.ticker : bestEntry.kal2.ticker;
@@ -10066,7 +10067,7 @@ async function monitorLoop(watchlist: WatchEntry[]): Promise<void> {
       }
     }
 
-    // ── 3. Status line ─────────────────────────────────────────────────────
+    // -- 3. Status line -----------------------------------------------------
     process.stdout.write(
       `\r${ts()} cycle=${cycle}  best=${fmtPct(bestEdge)}` +
       (bestEntry ? `  [${bestEntry.kal1.surname} vs ${bestEntry.kal2.surname}]` : "") +
@@ -10099,7 +10100,7 @@ async function monitorLoop(watchlist: WatchEntry[]): Promise<void> {
       }
     }
 
-    // ── 4. Execute if edge ≥ threshold ─────────────────────────────────────
+    // -- 4. Execute if edge >= threshold -------------------------------------
     if (bestEntry && bestEdge >= MIN_EDGE) {
       console.log(); // newline from \r
       console.log(
@@ -10125,34 +10126,34 @@ async function monitorLoop(watchlist: WatchEntry[]): Promise<void> {
         appendMetric(m);
       };
 
-      // ── Circuit breaker checks ──────────────────────────────────────────
+      // -- Circuit breaker checks ------------------------------------------
       if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
-        console.warn(`[CIRCUIT BREAKER] ${consecutiveErrors} consecutive errors — pausing new arbs until next cycle without error.`);
+        console.warn(`[CIRCUIT BREAKER] ${consecutiveErrors} consecutive errors -- pausing new arbs until next cycle without error.`);
         logSkippedArb("circuit-breaker-errors");
       } else if (hedgeStates.length >= MAX_HEDGE_POSITIONS) {
-        console.warn(`[CIRCUIT BREAKER] ${hedgeStates.length} open hedge positions (max ${MAX_HEDGE_POSITIONS}) — resolve existing before opening new.`);
+        console.warn(`[CIRCUIT BREAKER] ${hedgeStates.length} open hedge positions (max ${MAX_HEDGE_POSITIONS}) -- resolve existing before opening new.`);
         logSkippedArb("max-hedge-positions");
       } else if (isPmServiceDown()) {
         const waitSec = Math.ceil((pmServiceDownUntil - Date.now()) / 1000);
-        console.warn(`[ARB SKIP] PM service down — retrying in ~${waitSec}s`);
+        console.warn(`[ARB SKIP] PM service down -- retrying in ~${waitSec}s`);
         logSkippedArb("pm-service-down");
       } else if (inflight.has(bestEntry.matchCode)) {
         console.warn(`[ARB SKIP] ${bestEntry.matchCode} already in-flight.`);
         logSkippedArb("already-inflight");
       } else if (isLateGame(bestEntry.matchCode)) {
         const ls = getMatchState(bestEntry.matchCode);
-        console.warn(`[ARB SKIP] ${bestEntry.matchCode} — late game (${ls?.detail ?? "?"}, ${ls?.completionPct?.toFixed(0) ?? "?"}% complete, ${ls?.homeScore ?? "?"}-${ls?.awayScore ?? "?"})`);
+        console.warn(`[ARB SKIP] ${bestEntry.matchCode} -- late game (${ls?.detail ?? "?"}, ${ls?.completionPct?.toFixed(0) ?? "?"}% complete, ${ls?.homeScore ?? "?"}-${ls?.awayScore ?? "?"})`);
         logSkippedArb("late-game");
       } else if (isMatchCancelled(bestEntry.matchCode)) {
         const ls = getMatchState(bestEntry.matchCode);
-        console.warn(`[ARB SKIP] ${bestEntry.matchCode} — ${ls?.status?.toUpperCase() ?? "CANCELLED"} (${ls?.detail ?? "?"}). Scalar settlement risk.`);
+        console.warn(`[ARB SKIP] ${bestEntry.matchCode} -- ${ls?.status?.toUpperCase() ?? "CANCELLED"} (${ls?.detail ?? "?"}). Scalar settlement risk.`);
         logSkippedArb("match-cancelled");
       } else if (process.env.LICENSE_SERVER && !isLicenseValid()) {
-        console.warn(`[ARB SKIP] License invalid — skipping new arbs until revalidated`);
+        console.warn(`[ARB SKIP] License invalid -- skipping new arbs until revalidated`);
         logSkippedArb("license-invalid");
       } else {
 
-      // Mark cooldown BEFORE executing — prevents re-entry during execution
+      // Mark cooldown BEFORE executing -- prevents re-entry during execution
       cooldownMap.set(bestEntry.matchCode, Date.now());
       kalTickerCooldown.set(bestEntry.kal1.ticker, Date.now());
       kalTickerCooldown.set(bestEntry.kal2.ticker, Date.now());
@@ -10160,7 +10161,7 @@ async function monitorLoop(watchlist: WatchEntry[]): Promise<void> {
       pmSlugCooldown.set(bestEntry.pmSlug, Date.now());
       inflight.add(bestEntry.matchCode);
 
-      // ── Start continuous book tracker (20s, 500ms intervals) ────────────
+      // -- Start continuous book tracker (20s, 500ms intervals) ------------
       {
         const trackKalTicker = (bestDir === "A" || bestDir === "C") ? bestEntry.kal1.ticker
           : (bestDir === "H" || bestDir === "K") ? bestEntry.kal3!.ticker
@@ -10190,32 +10191,32 @@ async function monitorLoop(watchlist: WatchEntry[]): Promise<void> {
         consecutiveErrors = 0; // reset on successful execution
 
         // Track consecutive aborts per match for cooldown
-        // Soft aborts (depth/edge insufficient) don't count — the opportunity is real,
+        // Soft aborts (depth/edge insufficient) don't count -- the opportunity is real,
         // just waiting for liquidity. Only hard aborts (order failures) trigger cooldown.
         if (!sessionSkip && !unhedged) {
           if (abortReason === "soft") {
-            // Soft abort — light cooldown (60s after 3 consecutive) to prevent spam
+            // Soft abort -- light cooldown (60s after 3 consecutive) to prevent spam
             const sc = abortCountMap.get(bestEntry.matchCode) ?? { count: 0, cooldownUntil: 0 };
             sc.count++;
             if (sc.count >= 3) {
               sc.cooldownUntil = Date.now() + 60_000;
-              console.log(`[SOFT COOLDOWN] ${bestEntry.kal1.surname} vs ${bestEntry.kal2.surname} — ${sc.count} soft aborts, pausing 60s`);
+              console.log(`[SOFT COOLDOWN] ${bestEntry.kal1.surname} vs ${bestEntry.kal2.surname} -- ${sc.count} soft aborts, pausing 60s`);
               sc.count = 0;
             }
             abortCountMap.set(bestEntry.matchCode, sc);
           } else {
-            // Hard abort (order failed, IOC no fill, etc.) — increment counter
+            // Hard abort (order failed, IOC no fill, etc.) -- increment counter
             const ac = abortCountMap.get(bestEntry.matchCode) ?? { count: 0, cooldownUntil: 0 };
             ac.count++;
             if (ac.count >= ABORT_COOLDOWN_THRESHOLD) {
               ac.cooldownUntil = Date.now() + ABORT_COOLDOWN_MS;
-              console.log(`[ABORT COOLDOWN] ${bestEntry.kal1.surname} vs ${bestEntry.kal2.surname} — ${ac.count} consecutive hard aborts, cooling down ${ABORT_COOLDOWN_MS / 1000}s`);
+              console.log(`[ABORT COOLDOWN] ${bestEntry.kal1.surname} vs ${bestEntry.kal2.surname} -- ${ac.count} consecutive hard aborts, cooling down ${ABORT_COOLDOWN_MS / 1000}s`);
               ac.count = 0; // reset so it can trigger again after cooldown
             }
             abortCountMap.set(bestEntry.matchCode, ac);
           }
         } else {
-          // Success (filled or hedge) — reset abort counter
+          // Success (filled or hedge) -- reset abort counter
           abortCountMap.delete(bestEntry.matchCode);
         }
 
@@ -10223,7 +10224,7 @@ async function monitorLoop(watchlist: WatchEntry[]): Promise<void> {
           sessionSkipSet.add(bestEntry.matchCode);
           console.log(
             `[SESSION SKIP] ${bestEntry.kal1.surname} vs ${bestEntry.kal2.surname}` +
-            ` — removed from watchlist for this session.`
+            ` -- removed from watchlist for this session.`
           );
         }
         if (unhedged) {
@@ -10251,9 +10252,9 @@ async function monitorLoop(watchlist: WatchEntry[]): Promise<void> {
       } // end circuit breaker / inflight / pm-down checks
     }
 
-    // ── 5. Wait — yield event loop, then immediately scan again ─────────────
+    // -- 5. Wait -- yield event loop, then immediately scan again -------------
     // With WS feeds, poll cycles are pure Map reads (no API calls).
-    // POLL_INTERVAL_MS=0 → max speed; >0 → throttle to save CPU on slower machines.
+    // POLL_INTERVAL_MS=0 -> max speed; >0 -> throttle to save CPU on slower machines.
     const elapsed = Date.now() - cycleStart;
     const wait = Math.max(0, POLL_INTERVAL_MS - elapsed);
     if (wait > 0) await sleep(wait);
@@ -10261,12 +10262,12 @@ async function monitorLoop(watchlist: WatchEntry[]): Promise<void> {
   }
 }
 
-// ─── Hardcoded watchlist (for manual market overrides) ────────────────────────
+// --- Hardcoded watchlist (for manual market overrides) ------------------------
 // Set HARDCODED_MARKETS=true in env to skip auto-discovery and use these entries.
 
 function buildHardcodedWatchlist(): WatchEntry[] {
   return [
-    // ── ATP Dubai (Feb 26) ──────────────────────────────────────────────────────
+    // -- ATP Dubai (Feb 26) ------------------------------------------------------
     {
       matchCode: "KXATPMATCH-26FEB26MEDBRO",
       pmSlug: "atp-medvede-brooksb-2026-02-26",
@@ -10276,7 +10277,7 @@ function buildHardcodedWatchlist(): WatchEntry[] {
       pm1: { outcome: "Daniil Medvedev", tokenId: "113206786303297881608970499012659120457525717582590216312541942529377809611966", tickSize: 0.01, minSize: 5, negRisk: false },
       pm2: { outcome: "Jenson Brooksby", tokenId: "101976526833981232003632259338174330180735889970494312719492559490304236617519", tickSize: 0.01, minSize: 5, negRisk: false },
     },
-    // ── ATP Chile Open / Santiago (Feb 26) ─────────────────────────────────────
+    // -- ATP Chile Open / Santiago (Feb 26) -------------------------------------
     {
       matchCode: "KXATPMATCH-26FEB26TABTIR",
       pmSlug: "atp-tabilo-tirante-2026-02-26",
@@ -10304,7 +10305,7 @@ function buildHardcodedWatchlist(): WatchEntry[] {
       pm1: { outcome: "Vallejo", tokenId: "61551056532064752059084036941305269272842570343246679144920545317921480517521", tickSize: 0.01, minSize: 5, negRisk: false },
       pm2: { outcome: "Nava",    tokenId: "28494910870856779759459720911747991186149206227651575913131743043404396897428", tickSize: 0.01, minSize: 5, negRisk: false },
     },
-    // ── ATP Chile Open / Santiago (Feb 25) ─────────────────────────────────────
+    // -- ATP Chile Open / Santiago (Feb 25) -------------------------------------
     {
       matchCode: "KXATPMATCH-26FEB25NAVDAR",
       pmSlug: "atp-navone-darderi-2026-02-25",
@@ -10323,7 +10324,7 @@ function buildHardcodedWatchlist(): WatchEntry[] {
       pm1: { outcome: "Prizmic", tokenId: "76530282059250612204463640032266790512445126876916631348635403368539115982722", tickSize: 0.01, minSize: 5, negRisk: false },
       pm2: { outcome: "Gaubas",  tokenId: "96521385161593719946137010044968935260064081562017387310780021038817524963599", tickSize: 0.01, minSize: 5, negRisk: false },
     },
-    // ── ATP Acapulco / Mexican Open (Feb 25) ────────────────────────────────────
+    // -- ATP Acapulco / Mexican Open (Feb 25) ------------------------------------
     {
       matchCode: "KXATPMATCH-26FEB25VACMON",
       pmSlug: "atp-vachero-monfils-2026-02-25",
@@ -10399,23 +10400,23 @@ function buildHardcodedWatchlist(): WatchEntry[] {
   ];
 }
 
-// ─── Main ─────────────────────────────────────────────────────────────────────
+// --- Main ---------------------------------------------------------------------
 
 async function main() {
   // License validation (skipped if not configured)
   if (process.env.LICENSE_SERVER && process.env.LICENSE_TOKEN) {
-    await validateLicense(); // throws if invalid → bot won't start
+    await validateLicense(); // throws if invalid -> bot won't start
     startPeriodicRevalidation();
     startPeriodicPush();
     console.log("[TRADER] License validated, dashboard push active");
   }
 
   if (DRY_RUN) {
-    console.log(`[TRADER] DRY RUN mode — no real orders will be placed`);
+    console.log(`[TRADER] DRY RUN mode -- no real orders will be placed`);
   } else {
-    console.log(`[TRADER] *** LIVE MODE *** — orders WILL be placed on real markets!`);
-    console.log(`[TRADER] Budget: $${TRADE_USD}/trade | Max: ${MAX_CONTRACTS} contracts | MinEdge: ${fmtPct(MIN_EDGE)} | DepthMult: ${MIN_DEPTH_MULT}×`);
-    console.log(`[TRADER] KAL_MAKER_MODE: ${KAL_MAKER_MODE ? "ON (GTC bid at ask-1¢, wait " + KAL_MAKER_WAIT_MS + "ms)" : "OFF (IOC taker)"}`);
+    console.log(`[TRADER] *** LIVE MODE *** -- orders WILL be placed on real markets!`);
+    console.log(`[TRADER] Budget: $${TRADE_USD}/trade | Max: ${MAX_CONTRACTS} contracts | MinEdge: ${fmtPct(MIN_EDGE)} | DepthMult: ${MIN_DEPTH_MULT}x`);
+    console.log(`[TRADER] KAL_MAKER_MODE: ${KAL_MAKER_MODE ? "ON (GTC bid at ask-1c, wait " + KAL_MAKER_WAIT_MS + "ms)" : "OFF (IOC taker)"}`);
     if (!process.env.POLY_WALLET_PRIVATE_KEY?.trim()) {
       throw new Error("Set POLY_WALLET_PRIVATE_KEY for live trading (or set DRY_RUN=true).");
     }
@@ -10445,7 +10446,7 @@ async function main() {
     }
   }
 
-  // ── Merge static pairs from CSV ──
+  // -- Merge static pairs from CSV --
   try {
     const staticPairs = await loadStaticPairs();
     if (staticPairs.length > 0) {
@@ -10478,7 +10479,7 @@ async function main() {
     const kalStr = kalBal >= 0 ? `$${kalBal.toFixed(2)}` : "unavailable";
     const pmStr = pmBal >= 0 ? `$${pmBal.toFixed(2)}` : "unavailable";
     const totalStr = kalBal >= 0 && pmBal >= 0 ? `$${(kalBal + pmBal).toFixed(2)}` : "partial";
-    console.log(`[STARTUP] Wallet balances — Kalshi: ${kalStr} | PM USDC: ${pmStr} | Total: ${totalStr}`);
+    console.log(`[STARTUP] Wallet balances -- Kalshi: ${kalStr} | PM USDC: ${pmStr} | Total: ${totalStr}`);
     // Persist balance to file for historical tracking
     try {
       const balLogPath = path.join(DATA_DIR, "balance_log.json");
@@ -10514,7 +10515,7 @@ async function main() {
     await subscribeToFills((tokenId, shares, txHash, block) => {
       console.log(`[CHAIN] Fill detected: ${shares} shares, token=...${tokenId.slice(-12)} block=${block} tx=${txHash.slice(0, 18)}...`);
       // Ghost fill detection: check if this fill matches an incomplete pending fill.
-      // If so, a previous attempt's order just settled on-chain — find the hedging trade and link it.
+      // If so, a previous attempt's order just settled on-chain -- find the hedging trade and link it.
       handleGhostFill(tokenId, shares, txHash).catch(err =>
         console.warn(`[GHOST] Detection error: ${(err as Error).message}`)
       );
@@ -10533,7 +10534,7 @@ async function main() {
   connectPmWs();
   subscribeWatchlist(watchlist);
 
-  // Live scores disabled — not trading soccer currently.
+  // Live scores disabled -- not trading soccer currently.
   // To re-enable: uncomment startLiveScores() and import from liveScores.js
   // startLiveScores(trackedMatches);
 
@@ -10569,7 +10570,7 @@ async function runFullSync(): Promise<void> {
     }
   }
 
-  // ── Merge static pairs from CSV ──
+  // -- Merge static pairs from CSV --
   try {
     const staticPairs = await loadStaticPairs();
     if (staticPairs.length > 0) {
@@ -10609,7 +10610,7 @@ async function runFullSync(): Promise<void> {
           const pmPos = await fetchPmPositionsCached(0);
           const heldQty = sumPmHeld(pmPos, pos.pmLeg.tokenId);
           if (heldQty <= 0) {
-            console.warn(`[SYNC] Ghost PM position: ${pos.pmLeg.outcome} — wallet has 0. Removing.`);
+            console.warn(`[SYNC] Ghost PM position: ${pos.pmLeg.outcome} -- wallet has 0. Removing.`);
             continue;
           }
           if (heldQty < pos.sharesHeld) {
@@ -10617,12 +10618,12 @@ async function runFullSync(): Promise<void> {
             pos.sharesHeld = heldQty;
           }
         } catch (e) {
-          console.error(`[SYNC] PM verify failed: ${(e as Error).message} — keeping.`);
+          console.error(`[SYNC] PM verify failed: ${(e as Error).message} -- keeping.`);
         }
       } else {
         const kalQty = kalPosMap.get(pos.kalLeg.ticker)?.yesCount ?? 0;
         if (kalQty <= 0) {
-          console.warn(`[SYNC] Ghost Kalshi position: ${pos.kalLeg.ticker} YES — API has 0. Removing.`);
+          console.warn(`[SYNC] Ghost Kalshi position: ${pos.kalLeg.ticker} YES -- API has 0. Removing.`);
           continue;
         }
         if (kalQty < pos.sharesHeld) {
@@ -10663,7 +10664,7 @@ async function runFullSync(): Promise<void> {
     hedgeStates = surviving;
   }
 
-  // 5a) Restore orphaned "hedging" trades (same logic as main startup — see comment there)
+  // 5a) Restore orphaned "hedging" trades (same logic as main startup -- see comment there)
   {
     const hsTickers = new Set(hedgeStates.map(hs => hs.position.kalLeg.ticker));
     const allTrades = loadArbTrades();
@@ -10744,7 +10745,7 @@ async function runFullSync(): Promise<void> {
   const pmFound = await detectUnhedgedPmPositions(watchlist, hsTickerSet);
   const kalFound = await detectUnhedgedKalPositions(watchlist, kalPosMap, hsTickerSet);
 
-  // ── Cross-match dedup for 3-way markets (same logic as main startup) ──────
+  // -- Cross-match dedup for 3-way markets (same logic as main startup) ------
   const pmBySlugSync = new Map<string, HedgeState>();
   for (const hs of pmFound) {
     const slug = watchlist.find(w =>
@@ -10766,7 +10767,7 @@ async function runFullSync(): Promise<void> {
     );
     if (entry?.is3Way && pmBySlugSync.has(entry.pmSlug)) {
       console.log(
-        `[SYNC] 3-way cross-match dedup: KAL ${hs.position.sharesHeld}×${hs.position.kalLeg.ticker} YES` +
+        `[SYNC] 3-way cross-match dedup: KAL ${hs.position.sharesHeld}x${hs.position.kalLeg.ticker} YES` +
         ` already covered by PM-side hedge from same match. Skipping.`
       );
       continue;
@@ -10805,7 +10806,7 @@ async function runFullSync(): Promise<void> {
 
 /**
  * Hedge-only mode: sync + place hedge orders until all positions are filled.
- * No new arbs are opened — only existing unhedged positions get hedged.
+ * No new arbs are opened -- only existing unhedged positions get hedged.
  * Exits when all hedges are complete (or Ctrl+C).
  */
 async function runHedgeOnly(): Promise<void> {
@@ -10822,7 +10823,7 @@ async function runHedgeOnly(): Promise<void> {
 
   console.log(`\n[HEDGE-ONLY] ${hedgeStates.length} position(s) to hedge. Starting hedge loop...`);
   if (DRY_RUN) {
-    console.log("[HEDGE-ONLY] DRY RUN mode — no real orders will be placed.");
+    console.log("[HEDGE-ONLY] DRY RUN mode -- no real orders will be placed.");
   }
 
   // Pre-warm PM client

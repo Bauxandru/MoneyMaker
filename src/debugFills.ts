@@ -1,5 +1,5 @@
 /**
- * debugFills.ts — Dump all Kalshi fills and check which arb_trades tickers have no matching fills.
+ * debugFills.ts -- Dump all Kalshi fills and check which arb_trades tickers have no matching fills.
  * Usage: npx tsx src/debugFills.ts
  */
 import dotenv from "dotenv";
@@ -22,7 +22,7 @@ const zeroCostTrades = trades.filter((t: any) => t.kalCost === 0 && t.kalTicker)
 console.log(`\nTrades with kalCost=0: ${zeroCostTrades.length}`);
 for (const t of zeroCostTrades) {
   const hasFill = fillTickers.has(t.kalTicker);
-  console.log(`  ${t.kalTicker} (${t.match} dir=${t.dir}) → fills found: ${hasFill}`);
+  console.log(`  ${t.kalTicker} (${t.match} dir=${t.dir}) -> fills found: ${hasFill}`);
   if (!hasFill) {
     // Check if any fill ticker partially matches
     const partial = [...fillTickers].filter(ft => {

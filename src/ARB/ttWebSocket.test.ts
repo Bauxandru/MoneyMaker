@@ -67,7 +67,7 @@ describe("getWsKalBestAsk", () => {
       no: new Map([[60, 5], [55, 3]]),
       ts: Date.now(),
     });
-    // YES ask = 100 - best NO bid (60) = 40 → 0.40
+    // YES ask = 100 - best NO bid (60) = 40 -> 0.40
     expect(getWsKalBestAsk("T", "yes")).toBe(0.40);
   });
 
@@ -77,7 +77,7 @@ describe("getWsKalBestAsk", () => {
       no: new Map([[55, 3]]),
       ts: Date.now(),
     });
-    // NO ask = 100 - best YES bid (45) = 55 → 0.55
+    // NO ask = 100 - best YES bid (45) = 55 -> 0.55
     expect(getWsKalBestAsk("T", "no")).toBe(0.55);
   });
 
@@ -171,7 +171,7 @@ describe("getWsPmAsks / getWsPmBids", () => {
   });
 });
 
-// ─── Momentum tracking ─────────────────────────────────────────────────────
+// --- Momentum tracking -----------------------------------------------------
 
 describe("recordPrice / getMomentum", () => {
   it("returns 0 for unknown key", () => {

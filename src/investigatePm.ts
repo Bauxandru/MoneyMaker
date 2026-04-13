@@ -137,7 +137,7 @@ async function main() {
     // Check if this token has fills that are also tracked (same token, different fills)
     const trackedOnSameToken = allByToken.get(tokenId);
 
-    console.log("═".repeat(100));
+    console.log("=".repeat(100));
     console.log(
       `MARKET: ${name.slice(0, 90)}`
     );
@@ -157,7 +157,7 @@ async function main() {
         const sibTrades = trades.filter((t) => t.pmTokenId === sib.token_id);
         for (const st of sibTrades) {
           console.log(
-            `    → Arb trade: ${st.id} | ${st.match} | ${st.shares} shares | pmCost=$${st.pmCost} | status=${st.status} | dir=${st.dir}`
+            `    -> Arb trade: ${st.id} | ${st.match} | ${st.shares} shares | pmCost=$${st.pmCost} | status=${st.status} | dir=${st.dir}`
           );
         }
       }
@@ -171,13 +171,13 @@ async function main() {
           (s) => s.token_id === mt.pmTokenId
         );
         console.log(
-          `    → ${mt.id} | ${mt.match} | ${mt.shares} shares | pmToken=${mt.pmTokenId?.slice(0, 15) ?? "none"}... | pmCost=$${mt.pmCost} | status=${mt.status} | dir=${mt.dir} | ${isSameToken ? "SAME TOKEN" : isSibToken ? "SIBLING TOKEN" : "DIFF TOKEN"}`
+          `    -> ${mt.id} | ${mt.match} | ${mt.shares} shares | pmToken=${mt.pmTokenId?.slice(0, 15) ?? "none"}... | pmCost=$${mt.pmCost} | status=${mt.status} | dir=${mt.dir} | ${isSameToken ? "SAME TOKEN" : isSibToken ? "SIBLING TOKEN" : "DIFF TOKEN"}`
         );
       }
     }
 
     if (matchingTrades.length === 0 && trackedSiblings.length === 0) {
-      console.log(`  ⚠ NO MATCHING ARB TRADE FOUND — likely crash before logging`);
+      console.log(`  [!] NO MATCHING ARB TRADE FOUND -- likely crash before logging`);
     }
 
     // Show fill timestamps for context

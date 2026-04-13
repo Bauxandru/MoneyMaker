@@ -1,9 +1,9 @@
 /**
- * goalTrade.ts — Goal-Based Trading Experiment (Multi-Match)
+ * goalTrade.ts -- Goal-Based Trading Experiment (Multi-Match)
  *
  * Monitors multiple live soccer matches via API-Football, detects goals,
  * and immediately buys "scoring team wins" on both Kalshi and Polymarket.
- * No hedging — just buy and hold.
+ * No hedging -- just buy and hold.
  *
  * Usage:
  *   DRY_RUN=true npx tsx src/goalTrade.ts       # test mode (no real orders)
@@ -17,14 +17,14 @@ import { fetchJsonWithRetry } from "./http.js";
 import { placeKalshiOrder, buildKalshiOrder } from "./kalshiTrade.js";
 import { sleep } from "./utils.js";
 
-// ─── Config ──────────────────────────────────────────────────────────────────
+// --- Config ------------------------------------------------------------------
 
 const DRY_RUN = (process.env.DRY_RUN ?? "true").toLowerCase() !== "false";
 const TRADE_USD = Number(process.env.GOAL_TRADE_USD ?? "50");
 const API_FOOTBALL_KEY = process.env.API_FOOTBALL_KEY ?? "";
 const POLL_INTERVAL_MS = Number(process.env.GOAL_POLL_MS ?? "1000");  // 1s polling
 
-// ─── Match Definitions ──────────────────────────────────────────────────────
+// --- Match Definitions ------------------------------------------------------
 
 type MatchConfig = {
   label: string;
@@ -75,7 +75,7 @@ const MATCHES: MatchConfig[] = [
   },
 ];
 
-// ─── State ───────────────────────────────────────────────────────────────────
+// --- State -------------------------------------------------------------------
 
 type GoalTrade = {
   matchLabel: string;
@@ -91,7 +91,7 @@ type GoalTrade = {
 
 const trades: GoalTrade[] = [];
 
-// ─── Price Fetching ──────────────────────────────────────────────────────────
+// --- Price Fetching ----------------------------------------------------------
 
 async function getKalshiPricesForMatch(match: MatchConfig) {
   const tickers = [match.kalshi.homeTicker, match.kalshi.awayTicker, match.kalshi.tieTicker];
@@ -111,7 +111,7 @@ async function getKalshiPricesForMatch(match: MatchConfig) {
   return prices;
 }
 
-// ─── API-Football Polling ────────────────────────────────────────────────────
+// --- API-Football Polling ----------------------------------------------------
 
 type ScoreResult = {
   homeGoals: number;
@@ -209,12 +209,12 @@ async function pollAllScores(): Promise<Map<MatchConfig, ScoreResult>> {
   return results;
 }
 
-// ─── Order Execution ─────────────────────────────────────────────────────────
+// --- Order Execution ---------------------------------------------------------
 
 async function buyOnGoal(match: MatchConfig, scorer: "home" | "away", minute: number, homeGoals: number, awayGoals: number) {
   const scorerTeam = scorer === "home" ? match.homeTeam : match.awayTeam;
 
-  // Strategy: scoring team wins — buy their YES shares
+  // Strategy: scoring team wins -- buy their YES shares
   const buyLabel = scorerTeam;
   const kalTicker = scorer === "home" ? match.kalshi.homeTicker : match.kalshi.awayTicker;
 
@@ -234,7 +234,7 @@ async function buyOnGoal(match: MatchConfig, scorer: "home" | "away", minute: nu
     entryKalAsk: 0,
   };
 
-  // ── Fetch Kalshi prices ──────────────────────────────────────────────
+  // -- Fetch Kalshi prices ----------------------------------------------
   console.log(`[GOAL] Fetching Kalshi prices...`);
   const kalPrices = await getKalshiPricesForMatch(match);
 
@@ -247,14 +247,14 @@ async function buyOnGoal(match: MatchConfig, scorer: "home" | "away", minute: nu
   console.log(`[GOAL] Kalshi ${kalTicker}: ask=${kalPrice.ask} bid=${kalPrice.bid} size=${kalPrice.askSize}`);
   trade.entryKalAsk = kalPrice.ask;
 
-  // ── Place Kalshi order (no slippage — buy at best ask) ───────────────
+  // -- Place Kalshi order (no slippage -- buy at best ask) ---------------
   const kalAskCents = Math.round(kalPrice.ask * 100);
   const kalContracts = Math.max(1, Math.floor(TRADE_USD / (kalAskCents / 100)));
 
-  console.log(`[GOAL] Kalshi: buying ${kalContracts} contracts of ${kalTicker} YES @ ${kalAskCents}¢ (FOK)`);
+  console.log(`[GOAL] Kalshi: buying ${kalContracts} contracts of ${kalTicker} YES @ ${kalAskCents}c (FOK)`);
 
   if (DRY_RUN) {
-    console.log(`[DRY] Would place Kalshi FOK: ${kalContracts}x ${kalTicker} YES @ ${kalAskCents}¢`);
+    console.log(`[DRY] Would place Kalshi FOK: ${kalContracts}x ${kalTicker} YES @ ${kalAskCents}c`);
     trade.kalshiResult = { dryRun: true, contracts: kalContracts, price: kalAskCents };
   } else {
     try {
@@ -282,12 +282,12 @@ async function buyOnGoalDraw(match: MatchConfig, minute: number) {
   const kalAskCents = Math.round(kalPrice.ask * 100);
   const kalContracts = Math.max(1, Math.floor(TRADE_USD / (kalAskCents / 100)));
 
-  console.log(`[GOAL] Kalshi: buying ${kalContracts} contracts of ${kalTicker} YES @ ${kalAskCents}¢ (FOK)`);
+  console.log(`[GOAL] Kalshi: buying ${kalContracts} contracts of ${kalTicker} YES @ ${kalAskCents}c (FOK)`);
 
   const trade: GoalTrade = { matchLabel: match.label, minute, scorer: "home", team: "Draw", homeGoals: 0, awayGoals: 0, timestamp: Date.now(), entryKalAsk: kalPrice.ask };
 
   if (DRY_RUN) {
-    console.log(`[DRY] Would place Kalshi FOK: ${kalContracts}x ${kalTicker} YES @ ${kalAskCents}¢`);
+    console.log(`[DRY] Would place Kalshi FOK: ${kalContracts}x ${kalTicker} YES @ ${kalAskCents}c`);
     trade.kalshiResult = { dryRun: true, contracts: kalContracts, price: kalAskCents };
   } else {
     try {
@@ -303,7 +303,7 @@ async function buyOnGoalDraw(match: MatchConfig, minute: number) {
   trades.push(trade);
 }
 
-// ─── Main Loop ───────────────────────────────────────────────────────────────
+// --- Main Loop ---------------------------------------------------------------
 
 async function main() {
   console.log(`\n${"=".repeat(70)}`);
@@ -315,7 +315,7 @@ async function main() {
 
   if (!DRY_RUN) {
     if (!process.env.KALSHI_API_KEY_ID) throw new Error("Missing KALSHI_API_KEY_ID");
-    console.log(`[GOAL] LIVE trading mode — Kalshi only, no slippage`);
+    console.log(`[GOAL] LIVE trading mode -- Kalshi only, no slippage`);
   }
 
   // Pre-fetch initial prices for all matches
@@ -351,7 +351,7 @@ async function main() {
           // If 0-0 draw and no goals were traded, buy Draw
           const matchTrades = trades.filter(t => t.matchLabel === match.label);
           if (score.homeGoals === 0 && score.awayGoals === 0 && matchTrades.length === 0) {
-            console.log(`[GOAL] ${match.label}: 0-0 with no goals → buying Draw!`);
+            console.log(`[GOAL] ${match.label}: 0-0 with no goals -> buying Draw!`);
             await buyOnGoalDraw(match, score.elapsed);
           }
           finishedCount++;
@@ -406,7 +406,7 @@ async function main() {
     await sleep(POLL_INTERVAL_MS);
   }
 
-  // ── Final Summary ──────────────────────────────────────────────────────
+  // -- Final Summary ------------------------------------------------------
   console.log(`\n${"=".repeat(70)}`);
   console.log(`[GOAL TRADE] Session Summary`);
   console.log(`${"=".repeat(70)}`);

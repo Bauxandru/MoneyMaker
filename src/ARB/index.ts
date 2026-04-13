@@ -13,3 +13,4 @@ export * from "./ttDiscovery.js";
 export * from "./ttReconcile.js";
 export * from "./ttHedge.js";
 export * from "./ttExecution.js";
+export * from "./ttEventLog.js";

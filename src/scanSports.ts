@@ -31,15 +31,15 @@ dotenv.config();
 
 type AnyRecord = Record<string, unknown>;
 
-// ─── Rate-limited fetch helpers ───────────────────────────────────────────────
+// --- Rate-limited fetch helpers -----------------------------------------------
 
 const retryOpts = { timeoutMs: 15000, maxRetries: 4, baseDelayMs: 700, maxDelayMs: 10000, jitterMs: 300 };
 const kalFetch = createRateLimitedFetcher(Number(process.env.KALSHI_REQUEST_INTERVAL_MS ?? 120), retryOpts);
 const polyFetch = createRateLimitedFetcher(Number(process.env.POLY_REQUEST_INTERVAL_MS ?? 150), retryOpts);
 
-// ─── Team mappings ───────────────────────────────────────────────────────────
+// --- Team mappings -----------------------------------------------------------
 
-// Kalshi yes_sub_title (city/name) → PM outcome (nickname)
+// Kalshi yes_sub_title (city/name) -> PM outcome (nickname)
 // Kalshi uses city names, PM uses team nicknames
 const NBA_TEAM_MAP: Record<string, string> = {
   "Atlanta": "Hawks", "Boston": "Celtics", "Brooklyn": "Nets",
@@ -68,7 +68,7 @@ const MLB_TEAM_MAP: Record<string, string> = {
   "Texas": "Rangers", "Toronto": "Blue Jays", "Washington": "Nationals",
 };
 
-// ─── Date and ticker parsing ─────────────────────────────────────────────────
+// --- Date and ticker parsing -------------------------------------------------
 
 const MONTHS: Record<string, string> = {
   JAN: "01", FEB: "02", MAR: "03", APR: "04", MAY: "05", JUN: "06",
@@ -77,7 +77,7 @@ const MONTHS: Record<string, string> = {
 
 /**
  * Parse date from Kalshi event ticker.
- * "KXNBAGAME-26MAR17OKCORL" → "2026-03-17"
+ * "KXNBAGAME-26MAR17OKCORL" -> "2026-03-17"
  */
 function parseDateFromEventTicker(eventTicker: string): string {
   const m = eventTicker.match(/(\d{2})(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)(\d{2})/i);
@@ -87,7 +87,7 @@ function parseDateFromEventTicker(eventTicker: string): string {
 
 /**
  * Extract team codes from event ticker.
- * "KXNBAGAME-26MAR17OKCORL" → codes after the date portion
+ * "KXNBAGAME-26MAR17OKCORL" -> codes after the date portion
  * We get them from the market tickers instead (more reliable).
  */
 function extractTeamCodesFromMarkets(markets: AnyRecord[]): string[] {
@@ -97,7 +97,7 @@ function extractTeamCodesFromMarkets(markets: AnyRecord[]): string[] {
   });
 }
 
-// ─── Types ────────────────────────────────────────────────────────────────────
+// --- Types --------------------------------------------------------------------
 
 type KalshiTeamMarket = {
   ticker: string;
@@ -134,7 +134,7 @@ type ArbOpportunity = {
   edgeB: number;
 };
 
-// ─── Kalshi: Fetch game markets ──────────────────────────────────────────────
+// --- Kalshi: Fetch game markets ----------------------------------------------
 
 async function fetchKalshiGames(
   seriesTicker: string,
@@ -221,7 +221,7 @@ async function fetchKalshiGames(
   return groups;
 }
 
-// ─── Polymarket: Find and fetch game market ──────────────────────────────────
+// --- Polymarket: Find and fetch game market ----------------------------------
 
 async function fetchPmGameMarket(
   sport: "nba" | "mlb",
@@ -279,7 +279,7 @@ async function fetchPmPrices(
     try {
       const book = await polyFetch<AnyRecord>(`${clobBase}/book?token_id=${encodeURIComponent(tokenIds[i])}`);
       const asks = Array.isArray(book.asks) ? (book.asks as AnyRecord[]) : [];
-      // Asks sorted DESCENDING — cheapest (best) is LAST
+      // Asks sorted DESCENDING -- cheapest (best) is LAST
       if (asks.length > 0) {
         const bestAsk = Number(asks[asks.length - 1].price || 0);
         if (bestAsk > 0) priceMap.set(outcomes[i], bestAsk);
@@ -291,7 +291,7 @@ async function fetchPmPrices(
   return priceMap;
 }
 
-// ─── Formatting ──────────────────────────────────────────────────────────────
+// --- Formatting --------------------------------------------------------------
 
 function fmtPct(v: number, d = 1): string {
   return (v * 100).toFixed(d) + "%";
@@ -305,7 +305,7 @@ function padLeft(s: string, n: number): string {
   return s.length >= n ? s.slice(0, n) : " ".repeat(n - s.length) + s;
 }
 
-// ─── Main ─────────────────────────────────────────────────────────────────────
+// --- Main ---------------------------------------------------------------------
 
 async function main() {
   const args = process.argv.slice(2);
@@ -348,7 +348,7 @@ async function main() {
     // Fetch CLOB prices
     const pmPrices = await fetchPmPrices(pmMarket.tokenIds, pmMarket.outcomes);
 
-    // Match Kalshi team → PM outcome by nickname
+    // Match Kalshi team -> PM outcome by nickname
     function findPmAsk(nickname: string, teamName: string): { outcome: string; ask: number } | null {
       for (const [outcome, ask] of pmPrices) {
         const oNorm = outcome.toLowerCase();
@@ -426,7 +426,7 @@ async function main() {
     "Match",
   ].join("  ");
   console.log(header);
-  console.log("─".repeat(header.length));
+  console.log("-".repeat(header.length));
 
   for (let i = 0; i < arbs.length; i++) {
     const a = arbs[i];

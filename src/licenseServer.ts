@@ -21,7 +21,7 @@ if (!ADMIN_KEY) {
   process.exit(1);
 }
 
-// ── JSON file storage (no native deps) ──────────────────────────────────────
+// -- JSON file storage (no native deps) --------------------------------------
 
 interface User {
   id: number;
@@ -71,7 +71,7 @@ function addLog(data: LicenseData, token: string, ip: string, result: string, us
   saveDb(data);
 }
 
-// ── Helpers ─────────────────────────────────────────────────────────────────
+// -- Helpers -----------------------------------------------------------------
 
 function generateToken(): string {
   return crypto.randomUUID();
@@ -94,7 +94,7 @@ function checkAdmin(req: express.Request, res: express.Response): boolean {
   return true;
 }
 
-// ── Rate Limiting ───────────────────────────────────────────────────────────
+// -- Rate Limiting -----------------------------------------------------------
 
 const rateLimitMap = new Map<string, { count: number; resetAt: number; blocked: boolean }>();
 const RATE_WINDOW_MS = 60_000;    // 1 minute window
@@ -122,7 +122,7 @@ function rateLimit(req: express.Request, res: express.Response, next: express.Ne
   if (entry.count > RATE_MAX_REQUESTS) {
     entry.blocked = true;
     entry.resetAt = now + BLOCK_DURATION_MS;
-    console.warn(`[RATE] IP ${ip} blocked for ${BLOCK_DURATION_MS / 1000}s — exceeded ${RATE_MAX_REQUESTS} req/min`);
+    console.warn(`[RATE] IP ${ip} blocked for ${BLOCK_DURATION_MS / 1000}s -- exceeded ${RATE_MAX_REQUESTS} req/min`);
     res.status(429).json({ error: "Rate limit exceeded. Blocked for 10 minutes." });
     return;
   }
@@ -138,7 +138,7 @@ setInterval(() => {
   }
 }, 300_000);
 
-// ── SSL Certificate ────────────────────────────────────────────────────────
+// -- SSL Certificate --------------------------------------------------------
 
 const CERTS_DIR = join(ROOT, "certs");
 
@@ -163,7 +163,7 @@ function ensureSelfSignedCert(): { key: string; cert: string } {
     );
     console.log("[SSL] Self-signed certificate created (valid 365 days)");
   } catch {
-    console.warn("[SSL] openssl not found — falling back to HTTP only");
+    console.warn("[SSL] openssl not found -- falling back to HTTP only");
     return { key: "", cert: "" };
   }
 
@@ -173,13 +173,13 @@ function ensureSelfSignedCert(): { key: string; cert: string } {
   };
 }
 
-// ── Express App ─────────────────────────────────────────────────────────────
+// -- Express App -------------------------------------------------------------
 
 const app = express();
 app.use(express.json());
 app.use(rateLimit);
 
-// ── Validate License (called by bots) ───────────────────────────────────────
+// -- Validate License (called by bots) ---------------------------------------
 
 app.post("/validate", (req, res) => {
   const { token } = req.body || {};
@@ -222,14 +222,14 @@ app.post("/validate", (req, res) => {
   res.json({ valid: true, user_name: user.name, user_id: user.id, min_version: data.min_version || null });
 });
 
-// ── Admin: List Users ───────────────────────────────────────────────────────
+// -- Admin: List Users -------------------------------------------------------
 
 app.get("/users", (req, res) => {
   if (!checkAdmin(req, res)) return;
   res.json(loadDb().users);
 });
 
-// ── Admin: Add User ─────────────────────────────────────────────────────────
+// -- Admin: Add User ---------------------------------------------------------
 
 app.post("/users", (req, res) => {
   if (!checkAdmin(req, res)) return;
@@ -268,7 +268,7 @@ app.post("/users", (req, res) => {
   });
 });
 
-// ── Admin: Deactivate User ──────────────────────────────────────────────────
+// -- Admin: Deactivate User --------------------------------------------------
 
 app.delete("/users/:id", (req, res) => {
   if (!checkAdmin(req, res)) return;
@@ -283,7 +283,7 @@ app.delete("/users/:id", (req, res) => {
   res.json({ ok: true });
 });
 
-// ── Admin: Reactivate User ──────────────────────────────────────────────────
+// -- Admin: Reactivate User --------------------------------------------------
 
 app.post("/users/:id/activate", (req, res) => {
   if (!checkAdmin(req, res)) return;
@@ -298,7 +298,7 @@ app.post("/users/:id/activate", (req, res) => {
   res.json({ ok: true });
 });
 
-// ── Admin: Update Allowed IPs ───────────────────────────────────────────────
+// -- Admin: Update Allowed IPs -----------------------------------------------
 
 app.patch("/users/:id", (req, res) => {
   if (!checkAdmin(req, res)) return;
@@ -320,7 +320,7 @@ app.patch("/users/:id", (req, res) => {
   res.json({ ok: true });
 });
 
-// ── Admin: View Validation Logs ─────────────────────────────────────────────
+// -- Admin: View Validation Logs ---------------------------------------------
 
 app.get("/logs", (req, res) => {
   if (!checkAdmin(req, res)) return;
@@ -328,7 +328,7 @@ app.get("/logs", (req, res) => {
   res.json(logs);
 });
 
-// ── Admin: Get/Set Minimum Version ───────────────────────────────────────
+// -- Admin: Get/Set Minimum Version ---------------------------------------
 
 app.get("/version", (req, res) => {
   if (!checkAdmin(req, res)) return;
@@ -350,7 +350,7 @@ app.post("/version", (req, res) => {
   res.json({ ok: true, min_version });
 });
 
-// ── Admin Dashboard (browser UI) ────────────────────────────────────────────
+// -- Admin Dashboard (browser UI) --------------------------------------------
 
 app.get("/admin", (req, res) => {
   const key = req.query.key as string;
@@ -461,7 +461,7 @@ function addUser() {
   fetch("/users", {method:"POST",headers:headers,body:JSON.stringify({name:name,allowed_ips:ips})})
     .then(function(r){return r.json();})
     .then(function(u){
-      showStatus("Added "+u.name+" — token: "+u.token, true);
+      showStatus("Added "+u.name+" -- token: "+u.token, true);
       document.getElementById("newName").value = "";
       document.getElementById("newIps").value = "";
       loadUsers();
@@ -512,7 +512,7 @@ loadLogs();
 setInterval(loadLogs, 15000);
 </script></body></html>`;
 
-// ── Start ───────────────────────────────────────────────────────────────────
+// -- Start -------------------------------------------------------------------
 
 const ssl = ensureSelfSignedCert();
 
@@ -523,12 +523,12 @@ if (ssl.key && ssl.cert) {
     console.log(`[LICENSE] HTTPS server running at https://0.0.0.0:${PORT}`);
     console.log(`[LICENSE] Rate limit: ${RATE_MAX_REQUESTS} req/min per IP, 10min block on exceed`);
     console.log(`[LICENSE] Admin: https://your-ip:${PORT}/admin?key=YOUR_KEY`);
-    console.log(`[LICENSE] Note: self-signed cert — users set LICENSE_SERVER=https://your-ip:${PORT}`);
+    console.log(`[LICENSE] Note: self-signed cert -- users set LICENSE_SERVER=https://your-ip:${PORT}`);
   });
 } else {
   // Fallback to HTTP if openssl not available
   app.listen(PORT, "0.0.0.0", () => {
-    console.log(`[LICENSE] HTTP server running at http://0.0.0.0:${PORT} (no SSL — install openssl for HTTPS)`);
+    console.log(`[LICENSE] HTTP server running at http://0.0.0.0:${PORT} (no SSL -- install openssl for HTTPS)`);
     console.log(`[LICENSE] Rate limit: ${RATE_MAX_REQUESTS} req/min per IP, 10min block on exceed`);
     console.log(`[LICENSE] Admin: http://your-ip:${PORT}/admin?key=YOUR_KEY`);
   });

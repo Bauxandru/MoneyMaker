@@ -1,5 +1,5 @@
 /**
- * checkBalances.ts — Get current Kalshi + PM balances and reverse-calculate starting balances.
+ * checkBalances.ts -- Get current Kalshi + PM balances and reverse-calculate starting balances.
  * Usage: npx tsx src/checkBalances.ts
  */
 import crypto from "crypto";
@@ -10,7 +10,7 @@ import { kalSideForDir } from "./utils.js";
 import dotenv from "dotenv";
 dotenv.config();
 
-// ─── Kalshi auth ──────────────────────────────────────────────────────────────
+// --- Kalshi auth --------------------------------------------------------------
 
 function loadPrivateKey(): string {
   if (process.env.KALSHI_PRIVATE_KEY) return process.env.KALSHI_PRIVATE_KEY.replace(/\\n/g, "\n");
@@ -66,7 +66,7 @@ async function kalshiFetchAll(basePath: string, key: string): Promise<Record<str
   return all;
 }
 
-// ─── PM USDC balance (on-chain) ───────────────────────────────────────────────
+// --- PM USDC balance (on-chain) -----------------------------------------------
 
 const USDC_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"; // Polygon USDC
 const USDC_ABI = ["function balanceOf(address account) view returns (uint256)"];
@@ -81,14 +81,14 @@ async function getUsdcBalance(): Promise<number> {
   return Number(rawBalance) / 1e6;
 }
 
-// ─── Main ─────────────────────────────────────────────────────────────────────
+// --- Main ---------------------------------------------------------------------
 
 async function main() {
   console.log("=== WALLET BALANCES ===\n");
 
-  // ── Current Kalshi balance ──
+  // -- Current Kalshi balance --
   let kalshiBalanceCents = 0;
-  console.log("── Kalshi ──");
+  console.log("-- Kalshi --");
   try {
     const bal = await kalshiGet("/portfolio/balance");
     kalshiBalanceCents = Number(bal.balance ?? 0);
@@ -97,9 +97,9 @@ async function main() {
     console.error(`  Balance error: ${(e as Error).message}`);
   }
 
-  // ── Current PM USDC balance ──
+  // -- Current PM USDC balance --
   let pmUsdcBalance = 0;
-  console.log("\n── Polymarket (Polygon USDC) ──");
+  console.log("\n-- Polymarket (Polygon USDC) --");
   try {
     pmUsdcBalance = await getUsdcBalance();
     console.log(`  Current USDC balance: $${pmUsdcBalance.toFixed(2)}`);
@@ -108,8 +108,8 @@ async function main() {
     console.error(`  USDC balance error: ${(e as Error).message}`);
   }
 
-  // ── Kalshi fills: total spent + total revenue ──
-  console.log("\n── Kalshi Trade Activity ──");
+  // -- Kalshi fills: total spent + total revenue --
+  console.log("\n-- Kalshi Trade Activity --");
   let kalTotalSpent = 0;  // cents spent on buys
   let kalTotalRevenue = 0; // cents from settlements
   try {
@@ -143,8 +143,8 @@ async function main() {
     console.error(`  Fills error: ${(e as Error).message}`);
   }
 
-  // ── PM trade activity from arb_trades.json ──
-  console.log("\n── PM Trade Activity (from arb_trades.json) ──");
+  // -- PM trade activity from arb_trades.json --
+  console.log("\n-- PM Trade Activity (from arb_trades.json) --");
   try {
     interface ArbTrade {
       pmCost: number;
@@ -184,7 +184,7 @@ async function main() {
     console.error(`  Trades error: ${(e as Error).message}`);
   }
 
-  // ── Summary ──
+  // -- Summary --
   console.log("\n" + "=".repeat(50));
   console.log("CURRENT BALANCES");
   console.log("=".repeat(50));

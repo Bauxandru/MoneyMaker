@@ -59,7 +59,7 @@ async function main() {
     if (!t.pmTokenId) continue;
 
     console.log(`\n${"=".repeat(70)}`);
-    console.log(`${t.pmSlug} — ${t.shares} shares @ $${t.pmFillPrice} = $${t.pmCost}`);
+    console.log(`${t.pmSlug} -- ${t.shares} shares @ $${t.pmFillPrice} = $${t.pmCost}`);
 
     let onChainShares = -1;
     try {
@@ -117,7 +117,7 @@ async function main() {
       ? "CAPPED"
       : "UNCHANGED";
     console.log(
-      `  ${method}: ${oldShares} → ${t.shares} shares | cost $${oldCost.toFixed(2)} → $${t.pmCost.toFixed(2)} | pnl $${oldPnl.toFixed(2)} → $${t.realizedPnl.toFixed(2)}`
+      `  ${method}: ${oldShares} -> ${t.shares} shares | cost $${oldCost.toFixed(2)} -> $${t.pmCost.toFixed(2)} | pnl $${oldPnl.toFixed(2)} -> $${t.realizedPnl.toFixed(2)}`
     );
   }
 

@@ -5,13 +5,13 @@
  * live match scores.  Exposes getMatchState / isLateGame / isMatchFinished for
  * the trading bot to detect match completion and avoid late-game entries.
  *
- * Design: FAIL-OPEN — if all sources fail, the bot trades exactly as before.
+ * Design: FAIL-OPEN -- if all sources fail, the bot trades exactly as before.
  */
 
 import { fetchJsonWithRetry } from "./http.js";
 import { sleep, numEnv } from "./utils.js";
 
-// ─── Types ────────────────────────────────────────────────────────────────────
+// --- Types --------------------------------------------------------------------
 
 export type TrackedMatch = {
   matchCode: string;       // "Leicester vs QPR"
@@ -38,7 +38,7 @@ export type MatchState = {
   lastUpdated: number;     // Date.now()
 };
 
-// ─── API-Football response types ──────────────────────────────────────────────
+// --- API-Football response types ----------------------------------------------
 
 interface ApiFootballFixture {
   fixture: {
@@ -66,7 +66,7 @@ interface ApiFootballResponse {
   errors?: Record<string, string> | string[];
 }
 
-// ─── ESPN response types ──────────────────────────────────────────────────────
+// --- ESPN response types ------------------------------------------------------
 
 interface EspnCompetitor {
   team: { displayName: string; abbreviation?: string };
@@ -94,12 +94,12 @@ interface EspnScoreboardResponse {
   events?: EspnEvent[];
 }
 
-// ─── Module state ─────────────────────────────────────────────────────────────
+// --- Module state -------------------------------------------------------------
 
 const _matchStates = new Map<string, MatchState>();          // key: matchCode
 const _trackedMatches: TrackedMatch[] = [];
-const _apiMatchCache = new Map<number, string>();            // API-Football fixtureId → matchCode
-const _espnMatchCache = new Map<string, string>();           // ESPN eventId → matchCode
+const _apiMatchCache = new Map<number, string>();            // API-Football fixtureId -> matchCode
+const _espnMatchCache = new Map<string, string>();           // ESPN eventId -> matchCode
 
 let _apiFootballInterval: ReturnType<typeof setInterval> | null = null;
 let _espnInterval: ReturnType<typeof setInterval> | null = null;
@@ -109,7 +109,7 @@ let _apiFootballPolls = 0;
 let _espnPolls = 0;
 let _started = false;
 
-// ─── Name normalization ───────────────────────────────────────────────────────
+// --- Name normalization -------------------------------------------------------
 
 const STRIP_SUFFIXES = /\b(fc|afc|sc|cf|cd|ssc|fk|sk|bk|if|rsc|bsc|vfb|vfl|tsv|sv|fsv|sg|1\.|club|de|real)\b/gi;
 const STRIP_COMMON = /\b(city|united|wanderers|rovers|athletic|sporting|hotspur|albion|town|county|borough|rangers|palace|villa|ham|forest|wednesday)\b/gi;
@@ -152,7 +152,7 @@ function namesMatch(a: string, b: string): boolean {
   return false;
 }
 
-// ─── Match lookup ─────────────────────────────────────────────────────────────
+// --- Match lookup -------------------------------------------------------------
 
 /**
  * Find the TrackedMatch that corresponds to a live event's home/away names.
@@ -186,7 +186,7 @@ function findTrackedMatch(
   return null;
 }
 
-// ─── Status mapping ───────────────────────────────────────────────────────────
+// --- Status mapping -----------------------------------------------------------
 
 const FINISHED_STATUSES = new Set(["FT", "AET", "PEN"]);
 const CANCELLED_STATUSES = new Set(["PST", "CANC", "ABD", "AWD", "WO"]);
@@ -218,7 +218,7 @@ function computeCompletionPct(minute: number, statusShort: string): number {
   if (statusShort === "NS" || statusShort === "TBD") return 0;
   if (statusShort === "ET" || statusShort === "BT") return Math.min(100, 95 + (minute - 90) / 30 * 5);
   if (statusShort === "P") return 99;
-  // Normal time: 0-90 minutes → 0-95%
+  // Normal time: 0-90 minutes -> 0-95%
   return Math.min(95, (minute / 95) * 100);
 }
 
@@ -236,7 +236,7 @@ function formatDetail(statusShort: string, minute: number): string {
   return period;
 }
 
-// ─── API-Football provider ────────────────────────────────────────────────────
+// --- API-Football provider ----------------------------------------------------
 
 const API_FOOTBALL_BASE = "https://v3.football.api-sports.io";
 
@@ -300,11 +300,11 @@ async function pollApiFootball(): Promise<void> {
       // Log significant transitions
       if (!prev || prev.status !== state.status) {
         if (state.status === "finished") {
-          console.log(`[LIVE] ${tm.matchCode} → FINISHED (${state.homeScore}-${state.awayScore}) via API-Football`);
+          console.log(`[LIVE] ${tm.matchCode} -> FINISHED (${state.homeScore}-${state.awayScore}) via API-Football`);
         } else if (state.status === "cancelled" || state.status === "suspended") {
-          console.warn(`[LIVE] ${tm.matchCode} → ${state.status.toUpperCase()} via API-Football`);
+          console.warn(`[LIVE] ${tm.matchCode} -> ${state.status.toUpperCase()} via API-Football`);
         } else if (state.status === "live" && (!prev || prev.status === "scheduled")) {
-          console.log(`[LIVE] ${tm.matchCode} → KICKED OFF (${state.detail}) via API-Football`);
+          console.log(`[LIVE] ${tm.matchCode} -> KICKED OFF (${state.detail}) via API-Football`);
         }
       }
     }
@@ -326,19 +326,19 @@ async function pollApiFootball(): Promise<void> {
   }
 }
 
-// ─── ESPN provider (fallback) ─────────────────────────────────────────────────
+// --- ESPN provider (fallback) -------------------------------------------------
 
 const ESPN_BASE = "https://site.api.espn.com/apis/site/v2/sports";
 
 const ESPN_LEAGUE_SLUGS: Record<string, string> = {
-  // Soccer — Top 5
+  // Soccer -- Top 5
   "epl": "soccer/eng.1",
   "elc": "soccer/eng.2",
   "lal": "soccer/esp.1",
   "bun": "soccer/ger.1",
   "sea": "soccer/ita.1",
   "fl1": "soccer/fra.1",
-  // Soccer — Other major
+  // Soccer -- Other major
   "mls": "soccer/usa.1",
   "ucl": "soccer/uefa.champions",
   "uel": "soccer/uefa.europa",
@@ -432,7 +432,7 @@ async function pollEspnBatch(): Promise<void> {
         // Log significant transitions (only if we're the sole source)
         if ((!prev || prev.source === "espn") && prev?.status !== state.status) {
           if (state.status === "finished") {
-            console.log(`[LIVE] ${tm.matchCode} → FINISHED (${state.homeScore}-${state.awayScore}) via ESPN`);
+            console.log(`[LIVE] ${tm.matchCode} -> FINISHED (${state.homeScore}-${state.awayScore}) via ESPN`);
           }
         }
       }
@@ -452,7 +452,7 @@ async function pollEspnBatch(): Promise<void> {
   _espnPolls++;
 }
 
-// ─── Also check for recently-finished matches via /fixtures?date= ─────────────
+// --- Also check for recently-finished matches via /fixtures?date= -------------
 // The live=all endpoint only returns currently-in-progress matches.
 // Once a match finishes, it drops off the live feed. We poll ?date= less
 // frequently to catch matches that just finished between our polls.
@@ -516,10 +516,10 @@ async function pollApiFootballDate(): Promise<void> {
       });
 
       if (status === "finished") {
-        console.log(`[LIVE] ${tm.matchCode} → FINISHED (${f.goals.home ?? 0}-${f.goals.away ?? 0}) via date poll`);
+        console.log(`[LIVE] ${tm.matchCode} -> FINISHED (${f.goals.home ?? 0}-${f.goals.away ?? 0}) via date poll`);
         newFinished++;
       } else if (status === "cancelled" || status === "suspended") {
-        console.warn(`[LIVE] ${tm.matchCode} → ${status.toUpperCase()} via date poll`);
+        console.warn(`[LIVE] ${tm.matchCode} -> ${status.toUpperCase()} via date poll`);
       }
     }
 
@@ -527,16 +527,16 @@ async function pollApiFootballDate(): Promise<void> {
       console.log(`[LIVE] Date poll: ${newFinished} newly-finished match(es) detected`);
     }
   } catch (err) {
-    // Non-critical — live poll is primary. Don't spam logs.
+    // Non-critical -- live poll is primary. Don't spam logs.
     if (_apiFootballPolls % 30 === 0) {
       console.error(`[LIVE] Date poll failed: ${((err as Error).message ?? "").slice(0, 150)}`);
     }
   }
 }
 
-// ─── Public API ───────────────────────────────────────────────────────────────
+// --- Public API ---------------------------------------------------------------
 
-const STALE_THRESHOLD = 120_000;  // 2 minutes — treat data as stale
+const STALE_THRESHOLD = 120_000;  // 2 minutes -- treat data as stale
 
 /**
  * Start polling live scores in the background.
@@ -544,7 +544,7 @@ const STALE_THRESHOLD = 120_000;  // 2 minutes — treat data as stale
  */
 export function startLiveScores(matches: TrackedMatch[]): void {
   if (_started) {
-    console.warn("[LIVE] Already started — ignoring duplicate startLiveScores call");
+    console.warn("[LIVE] Already started -- ignoring duplicate startLiveScores call");
     return;
   }
 
@@ -558,7 +558,7 @@ export function startLiveScores(matches: TrackedMatch[]): void {
   const otherCount = matches.length - soccerCount;
 
   if (!apiKey) {
-    console.warn("[LIVE] API_FOOTBALL_KEY not set — live scores disabled. Set it in .env for live match detection.");
+    console.warn("[LIVE] API_FOOTBALL_KEY not set -- live scores disabled. Set it in .env for live match detection.");
     // Still start ESPN as fallback
   }
 
@@ -621,7 +621,7 @@ export function getMatchState(matchCode: string): MatchState | null {
 
 /**
  * Is the match in a late-game phase where entering new arbs is risky?
- * Returns FALSE if no data available (fail-open — don't block trading).
+ * Returns FALSE if no data available (fail-open -- don't block trading).
  */
 export function isLateGame(matchCode: string): boolean {
   const state = getMatchState(matchCode);
@@ -631,7 +631,7 @@ export function isLateGame(matchCode: string): boolean {
 
 /**
  * Has the match finished according to live score sources?
- * Returns FALSE if no data available (fail-open — falls back to Kalshi detection).
+ * Returns FALSE if no data available (fail-open -- falls back to Kalshi detection).
  */
 export function isMatchFinished(matchCode: string): boolean {
   const state = getMatchState(matchCode);

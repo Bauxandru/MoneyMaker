@@ -1,5 +1,5 @@
 /**
- * Resolve backfilled PM trades — update status and P&L.
+ * Resolve backfilled PM trades -- update status and P&L.
  * Uses Gamma events API (has explicit `winner` field) instead of markets API.
  * For markets without events data, falls back to outcomePrices from markets API.
  */
@@ -140,11 +140,11 @@ async function main() {
 
       let ourOutcome = "?";
       // Try to determine from the token position in the slug
-      // For esports: slug like "cs2-3dmax-sfe-2026-03-02" → outcomes are team names
+      // For esports: slug like "cs2-3dmax-sfe-2026-03-02" -> outcomes are team names
       // For tennis: slug like "atp-player1-player2-2026-02-25"
 
-      // We bought this token — need to figure out which outcome it represents
-      // Since we don't have the token→outcome mapping stored, fetch it
+      // We bought this token -- need to figure out which outcome it represents
+      // Since we don't have the token->outcome mapping stored, fetch it
       let didWin: boolean | null = null;
 
       if (winner === "CANCELLED") {
@@ -161,7 +161,7 @@ async function main() {
       }
 
       // Need to look up which outcome our token represents
-      // Fetch the market to get token→outcome mapping
+      // Fetch the market to get token->outcome mapping
       try {
         const resp = await fetch(
           `https://gamma-api.polymarket.com/markets?clob_token_ids=${t.pmTokenId}`
@@ -180,7 +180,7 @@ async function main() {
       } catch {}
 
       if (ourOutcome === "?") {
-        // Can't determine our outcome — skip
+        // Can't determine our outcome -- skip
         console.log(`  ? UNKN  Can't determine outcome for token ${t.pmTokenId?.slice(0, 20)}... | ${slug}`);
         stillOpen++;
         continue;
@@ -200,7 +200,7 @@ async function main() {
         totalPnl += t.realizedPnl;
         won++;
         const pnlStr = t.realizedPnl >= 0 ? `+$${t.realizedPnl.toFixed(2)}` : `-$${Math.abs(t.realizedPnl).toFixed(2)}`;
-        console.log(`  ✓ WON   ${String(t.shares).padStart(4)} shares @ $${t.pmFillPrice.toFixed(2)} → ${pnlStr.padStart(8)} | ${ourOutcome} beat ${winner !== ourOutcome ? winner : '?'} | ${slug}`);
+        console.log(`  [OK] WON   ${String(t.shares).padStart(4)} shares @ $${t.pmFillPrice.toFixed(2)} -> ${pnlStr.padStart(8)} | ${ourOutcome} beat ${winner !== ourOutcome ? winner : '?'} | ${slug}`);
       } else {
         // Lost: shares worth $0
         t.realizedPnl = -t.pmCost;
@@ -209,14 +209,14 @@ async function main() {
         t.resolvedTs = String(Math.floor(Date.now() / 1000));
         totalPnl += t.realizedPnl;
         lost++;
-        console.log(`  ✗ LOST  ${String(t.shares).padStart(4)} shares @ $${t.pmFillPrice.toFixed(2)} → -$${t.pmCost.toFixed(2).padStart(7)} | ${ourOutcome} lost to ${winner} | ${slug}`);
+        console.log(`  [X] LOST  ${String(t.shares).padStart(4)} shares @ $${t.pmFillPrice.toFixed(2)} -> -$${t.pmCost.toFixed(2).padStart(7)} | ${ourOutcome} lost to ${winner} | ${slug}`);
       }
     }
 
     resolved += slugTrades.length;
   }
 
-  console.log(`\n${"═".repeat(80)}`);
+  console.log(`\n${"=".repeat(80)}`);
   console.log(`Resolved: ${won + lost + cancelled} (${won} won, ${lost} lost, ${cancelled} cancelled)`);
   console.log(`Still open: ${stillOpen}`);
   console.log(`Total P&L from resolved backfills: $${totalPnl.toFixed(2)}`);

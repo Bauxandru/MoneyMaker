@@ -119,7 +119,7 @@ vi.mock("../utils.js", () => ({
 
 const { extractEventDateKey, collectOpenPositions, isScalarSettlement } = await import("./ttHedge.js");
 
-// ─── extractEventDateKey ────────────────────────────────────────────────────
+// --- extractEventDateKey ----------------------------------------------------
 
 describe("extractEventDateKey", () => {
   it("extracts series + date from standard ticker", () => {
@@ -143,7 +143,7 @@ describe("extractEventDateKey", () => {
   });
 });
 
-// ─── isScalarSettlement ─────────────────────────────────────────────────────
+// --- isScalarSettlement -----------------------------------------------------
 
 describe("isScalarSettlement", () => {
   it("returns true for result=scalar", () => {
@@ -167,7 +167,7 @@ describe("isScalarSettlement", () => {
   });
 });
 
-// ─── collectOpenPositions ───────────────────────────────────────────────────
+// --- collectOpenPositions ---------------------------------------------------
 
 describe("collectOpenPositions", () => {
   it("returns empty for no trades", async () => {

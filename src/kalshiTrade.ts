@@ -120,7 +120,7 @@ async function kalshiSignedFetch(method: "GET" | "DELETE", path: string): Promis
   const fullUrl = new URL(`${baseUrl()}${path}`);
   const timestamp = Date.now().toString();
   // Sign with the full URL pathname (e.g. /trade-api/v2/portfolio/orders/...)
-  // to match what the server sees — same as placeKalshiOrder does for POST.
+  // to match what the server sees -- same as placeKalshiOrder does for POST.
   const signature = signRequest(method, fullUrl.pathname, timestamp, privateKey);
   return fetchJson(fullUrl.toString(), {
     method,
@@ -229,7 +229,7 @@ export async function getKalshiPosition(ticker: string): Promise<number> {
     }
     return 0;
   } catch (err) {
-    console.error(`[KAL] getKalshiPosition(${ticker}) FAILED: ${(err as Error).message} — returning -1`);
+    console.error(`[KAL] getKalshiPosition(${ticker}) FAILED: ${(err as Error).message} -- returning -1`);
     return -1;
   }
 }
@@ -253,7 +253,7 @@ export async function getKalshiNoPosition(ticker: string): Promise<number> {
     }
     return 0;
   } catch (err) {
-    console.error(`[KAL] getKalshiNoPosition(${ticker}) FAILED: ${(err as Error).message} — returning -1`);
+    console.error(`[KAL] getKalshiNoPosition(${ticker}) FAILED: ${(err as Error).message} -- returning -1`);
     return -1;
   }
 }
@@ -276,7 +276,7 @@ export async function getKalshiOpenYesPositions(): Promise<Array<{ ticker: strin
       if (yesCount <= 0) continue;
       // Compute average fill price from API fields (cents).
       // total_traded = total amount debited from account in cents (includes fees).
-      // Use GROSS cost (total_traded / position) — this is the true breakeven price.
+      // Use GROSS cost (total_traded / position) -- this is the true breakeven price.
       // Subtracting fees would give a net cost below actual purchase price, causing
       // exit orders to sell at a guaranteed loss.
       // total_traded_dollars is in dollars (new API); legacy total_traded was in cents
@@ -294,7 +294,7 @@ export async function getKalshiOpenYesPositions(): Promise<Array<{ ticker: strin
   }
 }
 
-// Returns all positions as a Map: ticker → { yesCount, noCount, avgPriceCents }.
+// Returns all positions as a Map: ticker -> { yesCount, noCount, avgPriceCents }.
 // Single API call replaces multiple getKalshiPosition() + getKalshiNoPosition() calls.
 export async function getKalshiPositionMap(): Promise<Map<string, { yesCount: number; noCount: number; avgPriceCents: number }>> {
   const map = new Map<string, { yesCount: number; noCount: number; avgPriceCents: number }>();
@@ -365,7 +365,7 @@ export async function fetchKalshiOrderbook(ticker: string): Promise<{ yes: [numb
   return { yes: parseBookLevels(book.yes), no: parseBookLevels(book.no) };
 }
 
-// ─── Portfolio data: fills + settlements (for reconciliation) ────────────────
+// --- Portfolio data: fills + settlements (for reconciliation) ----------------
 
 export type KalFill = {
   ticker: string;
@@ -380,10 +380,10 @@ export type KalFill = {
 
 export type KalSettlement = {
   ticker: string;
-  revenue: number;      // cents — payout from Kalshi
-  yesCost: number;      // cents — total cost of YES contracts (no fees)
-  noCost: number;       // cents — total cost of NO contracts (no fees)
-  feeCost: number;      // dollars — actual fee paid
+  revenue: number;      // cents -- payout from Kalshi
+  yesCost: number;      // cents -- total cost of YES contracts (no fees)
+  noCost: number;       // cents -- total cost of NO contracts (no fees)
+  feeCost: number;      // dollars -- actual fee paid
   marketResult: string; // "yes" | "no" | "scalar"
   yesCount: number;
   noCount: number;
@@ -403,15 +403,17 @@ export async function fetchAllKalshiFills(): Promise<KalFill[]> {
         ticker: String(f.ticker ?? ""),
         action: String(f.action ?? ""),
         side: String(f.side ?? ""),
-        count: Number(f.count ?? f.count_fp ?? 0),
-        // yes_price = cents (old API), yes_price_dollars = dollars (new API) → normalize to cents
+        count: Number(f.count_fp ?? f.count ?? 0),
         // All branches normalize to cents. yes_price and yes_price_fixed are cents; _dollars is dollars.
-        yesPrice: f.yes_price != null ? Number(f.yes_price)
-          : f.yes_price_dollars != null ? Math.round(Number(f.yes_price_dollars) * 100)
-          : f.yes_price_fixed != null ? Math.round(Number(f.yes_price_fixed)) : 0,
-        noPrice: f.no_price != null ? Number(f.no_price)
-          : f.no_price_dollars != null ? Math.round(Number(f.no_price_dollars) * 100)
-          : f.no_price_fixed != null ? Math.round(Number(f.no_price_fixed)) : 0,
+        // Prefer _dollars fields (6 decimal precision) over legacy integer cents.
+        // _dollars = "0.0120" (dollars) → * 100 = 1.2 (cents with sub-penny precision)
+        // Legacy yes_price = 1 (integer cents, truncated — loses sub-penny)
+        yesPrice: f.yes_price_dollars != null ? Number(f.yes_price_dollars) * 100
+          : f.yes_price_fixed != null ? Number(f.yes_price_fixed)
+          : f.yes_price != null ? Number(f.yes_price) : 0,
+        noPrice: f.no_price_dollars != null ? Number(f.no_price_dollars) * 100
+          : f.no_price_fixed != null ? Number(f.no_price_fixed)
+          : f.no_price != null ? Number(f.no_price) : 0,
         feeCost: Number.isFinite(parseFloat(String(f.fee_cost ?? "0"))) ? parseFloat(String(f.fee_cost ?? "0")) : 0,
         ts: String(f.created_time ?? ""),
       });

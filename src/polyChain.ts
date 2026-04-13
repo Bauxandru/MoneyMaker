@@ -1,14 +1,14 @@
 /**
- * polyChain.ts — On-chain Polygon interactions for Polymarket CTF tokens.
+ * polyChain.ts -- On-chain Polygon interactions for Polymarket CTF tokens.
  *
  * Provides:
- *   1. getOnChainBalance(tokenId)       — instant fill verification via balanceOf
- *   2. scanTransferHistory(tokenId, ...) — historical PM fill verification
- *   3. subscribeToFills(callback)        — real-time fill notifications via WSS
- *   4. subscribeToSettlements(callback)  — real-time settlement detection via WSS
- *   5. getChainStatus()                  — dashboard status reporting
+ *   1. getOnChainBalance(tokenId)       -- instant fill verification via balanceOf
+ *   2. scanTransferHistory(tokenId, ...) -- historical PM fill verification
+ *   3. subscribeToFills(callback)        -- real-time fill notifications via WSS
+ *   4. subscribeToSettlements(callback)  -- real-time settlement detection via WSS
+ *   5. getChainStatus()                  -- dashboard status reporting
  *
- * All functions fail gracefully — never block trading if RPC is down.
+ * All functions fail gracefully -- never block trading if RPC is down.
  */
 
 import { Contract, JsonRpcProvider, WebSocketProvider, ethers, type Log } from "ethers";
@@ -20,7 +20,7 @@ function bigintToShares(raw: bigint): number {
   return Number(whole) + frac;
 }
 
-// ─── Constants ────────────────────────────────────────────────────────────────
+// --- Constants ----------------------------------------------------------------
 
 const CTF_ADDRESS = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045";
 
@@ -34,7 +34,7 @@ const CTF_ABI = [
 
 const TRANSFER_SINGLE_TOPIC = "0xc3d58168c5ae7397731d063d5bbf3d657854427343f4c083240f7aacaa2d0f62";
 
-// ─── Provider management (singletons) ─────────────────────────────────────────
+// --- Provider management (singletons) -----------------------------------------
 
 let _httpProvider: JsonRpcProvider | null = null;
 let _wssProvider: WebSocketProvider | null = null;
@@ -42,8 +42,7 @@ let _ctfContract: Contract | null = null;
 let _walletAddress: string | null = null;
 
 const POLYGON_RPC_FALLBACKS = [
-  "https://polygon-mainnet.infura.io/v3/2edd1ab9f156476d9408fa798a0ed5ce",
-  "https://polygon.drpc.org",
+  process.env.POLY_RPC_FALLBACK_1 || "https://polygon.drpc.org",
   "https://polygon-bor-rpc.publicnode.com",
   "https://1rpc.io/matic",
   "https://polygon.gateway.tenderly.co",
@@ -65,7 +64,7 @@ export async function getOnChainBalanceWithFallback(tokenId: string): Promise<nu
   const result = await getOnChainBalance(tokenId);
   if (result >= 0) return result;
 
-  // Primary RPC failed — try fallbacks
+  // Primary RPC failed -- try fallbacks
   const currentUrl = process.env.POLY_RPC_URL || process.env.POLYGON_RPC_URL || POLYGON_RPC_FALLBACKS[0];
   const chainId = Number(process.env.POLY_CHAIN_ID ?? 137);
   for (const fallback of POLYGON_RPC_FALLBACKS) {
@@ -77,7 +76,7 @@ export async function getOnChainBalanceWithFallback(tokenId: string): Promise<nu
       const wallet = getWalletAddress();
       const rawBalance: bigint = await ctf.balanceOf(wallet, BigInt(tokenId));
       const shares = bigintToShares(rawBalance);
-      // This fallback works — adopt it as the primary provider
+      // This fallback works -- adopt it as the primary provider
       _httpProvider = provider;
       _ctfContract = null; // reset so it picks up new provider
       console.log(`  [CHAIN] Fallback RPC ${fallback} succeeded. Adopting as primary.`);
@@ -96,7 +95,7 @@ function getWssProvider(): WebSocketProvider | null {
   try {
     const chainId = Number(process.env.POLY_CHAIN_ID ?? 137);
     _wssProvider = new WebSocketProvider(wssUrl, chainId);
-    // ethers v6 WebSocketLike doesn't expose .on() — cast to EventTarget-like
+    // ethers v6 WebSocketLike doesn't expose .on() -- cast to EventTarget-like
     const ws = _wssProvider.websocket as unknown as { on(ev: string, fn: (...args: unknown[]) => void): void };
     if (typeof ws.on === "function") {
       ws.on("error", (err: unknown) => {
@@ -105,7 +104,7 @@ function getWssProvider(): WebSocketProvider | null {
         _wssProvider = null;
       });
       ws.on("close", () => {
-        console.warn("[CHAIN] WSS disconnected — will reconnect on next use.");
+        console.warn("[CHAIN] WSS disconnected -- will reconnect on next use.");
         if (_wssProvider) { try { _wssProvider.destroy(); } catch {} }
         _wssProvider = null;
       });
@@ -135,7 +134,7 @@ function getWalletAddress(): string {
   return _walletAddress;
 }
 
-// ─── Feature 1 + 5: On-chain balance check ───────────────────────────────────
+// --- Feature 1 + 5: On-chain balance check -----------------------------------
 
 /**
  * Get exact share count for a PM conditional token via on-chain balanceOf.
@@ -155,7 +154,7 @@ export async function getOnChainBalance(tokenId: string): Promise<number> {
   }
 }
 
-// ─── Feature 2: Historical transfer scanning ─────────────────────────────────
+// --- Feature 2: Historical transfer scanning ---------------------------------
 
 export type ChainTransfer = {
   block: number;
@@ -217,7 +216,7 @@ export async function scanTransferHistory(
   return results.sort((a, b) => a.block - b.block);
 }
 
-// ─── Feature 3: Real-time fill notifications ─────────────────────────────────
+// --- Feature 3: Real-time fill notifications ---------------------------------
 
 export type FillCallback = (tokenId: string, shares: number, txHash: string, block: number) => void;
 
@@ -230,7 +229,7 @@ let _fillSubscriptionActive = false;
 export async function subscribeToFills(callback: FillCallback): Promise<() => void> {
   const provider = getWssProvider();
   if (!provider) {
-    console.warn("[CHAIN] No POLYGON_WSS_URL — fill subscription unavailable.");
+    console.warn("[CHAIN] No POLYGON_WSS_URL -- fill subscription unavailable.");
     return () => {};
   }
 
@@ -267,7 +266,7 @@ export function isFillSubscriptionActive(): boolean {
   return _fillSubscriptionActive;
 }
 
-// ─── Feature 4: Real-time settlement detection ──────────────────────────────
+// --- Feature 4: Real-time settlement detection ------------------------------
 
 export type SettlementCallback = (conditionId: string, payoutNumerators: bigint[], block: number) => void;
 
@@ -281,7 +280,7 @@ let _settlementSubscriptionActive = false;
 export async function subscribeToSettlements(callback: SettlementCallback): Promise<() => void> {
   const provider = getWssProvider();
   if (!provider) {
-    console.warn("[CHAIN] No POLYGON_WSS_URL — settlement subscription unavailable.");
+    console.warn("[CHAIN] No POLYGON_WSS_URL -- settlement subscription unavailable.");
     return () => {};
   }
 
@@ -318,7 +317,7 @@ export async function subscribeToSettlements(callback: SettlementCallback): Prom
   };
 }
 
-// ─── USDC balance on Polygon ──────────────────────────────────────────────────
+// --- USDC balance on Polygon --------------------------------------------------
 
 const USDC_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174";
 const USDC_ABI = ["function balanceOf(address account) view returns (uint256)"];
@@ -339,7 +338,7 @@ export async function getUsdcBalance(): Promise<number> {
   }
 }
 
-// ─── Dashboard status ─────────────────────────────────────────────────────────
+// --- Dashboard status ---------------------------------------------------------
 
 export function getChainStatus() {
   return {

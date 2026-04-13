@@ -84,7 +84,7 @@ async function main() {
   const bjkTransfers = [...allIn, ...allOut].filter(t => t.isBjk);
   console.log(`\n=== BJK/S2G Map1 Tokens ===`);
   if (bjkTransfers.length === 0) {
-    console.log("NO TRANSFERS FOUND — PM never filled for BJK/S2G Map 1.");
+    console.log("NO TRANSFERS FOUND -- PM never filled for BJK/S2G Map 1.");
   } else {
     for (const t of bjkTransfers) {
       const which = t.tokenId === BJK_TOKEN ? "Besiktas" : "S2G";

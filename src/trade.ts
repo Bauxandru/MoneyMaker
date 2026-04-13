@@ -883,8 +883,8 @@ async function runTradeOnce() {
     printSummary(pmOrder, kalOrder);
 
     if (kalFailed) {
-      // PM executed but Kalshi failed — immediately buy the opposite side on PM to neutralise the position.
-      // Cost: pmPrice + recoveryPrice = exactly $1 per share → guaranteed break-even, no extra spend.
+      // PM executed but Kalshi failed -- immediately buy the opposite side on PM to neutralise the position.
+      // Cost: pmPrice + recoveryPrice = exactly $1 per share -> guaranteed break-even, no extra spend.
       const recoveryLabel: "Yes" | "No" = pmSide === "YES" ? "No" : "Yes";
       const recoveryPrice = Math.min(0.99, 1 - pmPrice);
       console.log(

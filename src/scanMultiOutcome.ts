@@ -1,11 +1,11 @@
 /**
- * scanMultiOutcome.ts — Scan multi-outcome markets (Fed decisions, etc.) for cross-platform arb.
+ * scanMultiOutcome.ts -- Scan multi-outcome markets (Fed decisions, etc.) for cross-platform arb.
  *
  * Reads data/static_pairs.csv, fetches Kalshi + Polymarket data, matches outcomes by name,
  * and displays edge per outcome.
  *
  * Arb logic per outcome:
- *   Buy Kalshi NO + Buy PM YES → guaranteed $1 payout regardless of result
+ *   Buy Kalshi NO + Buy PM YES -> guaranteed $1 payout regardless of result
  *   Edge = 1 - kalNoAsk - pmAsk
  *
  *   Buy Kalshi YES + "Sell" PM (buy complement) is harder in multi-outcome, so we focus on the above.
@@ -36,7 +36,7 @@ async function fetchPoly<T>(url: string): Promise<T> {
   return fetchJsonWithRetry<T>(url, {}, retryOpts);
 }
 
-// ─── CSV parser ──────────────────────────────────────────────────────────────
+// --- CSV parser --------------------------------------------------------------
 
 function loadCsv(): { kalshiUrl: string; pmUrl: string }[] {
   const csvPath = path.join("data", "static_pairs.csv");
@@ -63,7 +63,7 @@ function extractLastPathSegment(url: string): string {
   }
 }
 
-// ─── Kalshi: fetch event with nested markets ─────────────────────────────────
+// --- Kalshi: fetch event with nested markets ---------------------------------
 
 interface KalOutcome {
   ticker: string;
@@ -109,7 +109,7 @@ async function fetchKalshiEvent(eventTickerRaw: string): Promise<{ title: string
       return { title, outcomes };
     }
   } catch {
-    // Not an event ticker — try other strategies
+    // Not an event ticker -- try other strategies
   }
 
   // Strategy 2: try as a single market ticker, then get its event_ticker and re-fetch
@@ -118,7 +118,7 @@ async function fetchKalshiEvent(eventTickerRaw: string): Promise<{ title: string
     const mkt = (mRes.market as AnyRecord) ?? mRes;
     const parentEvent = String(mkt.event_ticker ?? "");
     if (parentEvent) {
-      console.log(`  [KAL] ${eventTicker} is a market — parent event: ${parentEvent}`);
+      console.log(`  [KAL] ${eventTicker} is a market -- parent event: ${parentEvent}`);
       const evRes = await fetchKal<AnyRecord>(`${KAL_BASE}/events/${encodeURIComponent(parentEvent)}?with_nested_markets=true`);
       const ev = (evRes.event as AnyRecord) ?? evRes;
       const title = String(ev.title ?? ev.name ?? parentEvent);
@@ -137,7 +137,7 @@ async function fetchKalshiEvent(eventTickerRaw: string): Promise<{ title: string
     }
   } catch {}
 
-  // Strategy 3: try as series ticker — fetch all markets in the series
+  // Strategy 3: try as series ticker -- fetch all markets in the series
   try {
     const seriesRes = await fetchKal<AnyRecord>(`${KAL_BASE}/markets?series_ticker=${encodeURIComponent(eventTicker.toUpperCase())}&status=open&limit=200`);
     const mlist = Array.isArray(seriesRes.markets) ? (seriesRes.markets as AnyRecord[]) : [];
@@ -161,7 +161,7 @@ async function fetchKalshiEvent(eventTickerRaw: string): Promise<{ title: string
   return null;
 }
 
-// ─── Polymarket: fetch event with markets ────────────────────────────────────
+// --- Polymarket: fetch event with markets ------------------------------------
 
 interface PmOutcome {
   name: string;
@@ -207,7 +207,7 @@ async function fetchPmEvent(slug: string): Promise<{ title: string; outcomes: Pm
         const tids = parseJsonArray(m.clobTokenIds ?? "");
         const mSlug = String(m.slug ?? "");
         // Multi-outcome events: each market has 1 outcome (YES token for that outcome)
-        // Some have 2 outcomes (Yes/No) — use the first token (YES)
+        // Some have 2 outcomes (Yes/No) -- use the first token (YES)
         if (oc.length >= 1 && tids.length >= 1) {
           // Use the market question/title as the outcome name if it's a single-outcome market
           const outcomeName = oc.length === 2 && oc[0] === "Yes"
@@ -245,7 +245,7 @@ async function fetchPmEvent(slug: string): Promise<{ title: string; outcomes: Pm
   return null;
 }
 
-// ─── Name matching ───────────────────────────────────────────────────────────
+// --- Name matching -----------------------------------------------------------
 
 function normalize(s: string): string {
   return s.toLowerCase()
@@ -259,7 +259,7 @@ function normalize(s: string): string {
  * the common prefix and suffix shared across all titles in the same event.
  * e.g. ["Will Powell say Expectation at his Mar 2026 press conf",
  *        "Will Powell say Recession at his Mar 2026 press conf"]
- *  → ["expectation", "recession"]
+ *  -> ["expectation", "recession"]
  */
 function extractDistinctiveParts(titles: string[]): string[] {
   if (titles.length <= 1) return titles.map(normalize);
@@ -296,7 +296,7 @@ function extractDistinctiveParts(titles: string[]): string[] {
 /** Canonicalize financial synonyms so cross-platform wording matches */
 function canonicalize(s: string): string {
   return s
-    // Split concatenated number+unit: "25bps" → "25 bps", "0bps" → "0 bps"
+    // Split concatenated number+unit: "25bps" -> "25 bps", "0bps" -> "0 bps"
     .replace(/(\d+)(bps?|bp)\b/g, "$1 $2")
     // Direction synonyms
     .replace(/\bdecrease\b/g, "cut")
@@ -314,7 +314,7 @@ function canonicalize(s: string): string {
     .replace(/\binterest rates?\b/g, "rates")
     // Quantity: ">25" means "25 or more" in Kalshi = PM's "25+"
     .replace(/\bor more\b/g, "+")
-    .replace(/>(\d+)/g, "$1+")  // >25 → 25+
+    .replace(/>(\d+)/g, "$1+")  // >25 -> 25+
     .replace(/\bany amount\b/g, "0+ bp")
     // 0 bp = hold (Kalshi "Hike rates by 0bps" means no change)
     .replace(/\b(?:hike|cut) rates by 0 bp\b/g, "hold rates")
@@ -347,7 +347,7 @@ function detectCompoundMismatch(kalTitle: string, pmName: string): string | null
   for (const alt of altMatches) {
     const parts = alt.split(/\s*\/\s*|\s+or\s+/).map(s => s.trim()).filter(Boolean);
     if (parts.length < 2) continue;
-    // Check if any part is NOT in the Kalshi title — means PM covers more ground
+    // Check if any part is NOT in the Kalshi title -- means PM covers more ground
     const kalHasAll = parts.every(p => kalNorm.includes(p));
     if (!kalHasAll) {
       const extra = parts.filter(p => !kalNorm.includes(p));
@@ -362,8 +362,8 @@ function nameScore(kalDistinct: string, pmDistinct: string): number {
   const p = canonicalize(pmDistinct);
   if (k === p) return 1;
   if (k.includes(p) || p.includes(k)) return 0.9;
-  // Word overlap — containment coefficient (overlap / smaller set size)
-  // Require ≥2 overlapping words to avoid single-word false positives
+  // Word overlap -- containment coefficient (overlap / smaller set size)
+  // Require >=2 overlapping words to avoid single-word false positives
   const kWords = new Set(k.split(" ").filter(w => w.length > 1));
   const pWords = new Set(p.split(" ").filter(w => w.length > 1));
   let overlap = 0;
@@ -383,7 +383,7 @@ interface MatchedOutcome {
   pmTokenId: string;
   edge: number | null; // 1 - kalNoAsk - pmAsk
   matchScore: number;
-  compoundWarning?: string; // set if PM covers superset → arb invalid
+  compoundWarning?: string; // set if PM covers superset -> arb invalid
 }
 
 function matchOutcomes(kal: KalOutcome[], pm: PmOutcome[]): MatchedOutcome[] {
@@ -403,7 +403,7 @@ function matchOutcomes(kal: KalOutcome[], pm: PmOutcome[]): MatchedOutcome[] {
       if (score > 0.4) scores.push({ ki, pj, score });
     }
   }
-  // Sort by score descending — best matches first, prevents greedy order issues
+  // Sort by score descending -- best matches first, prevents greedy order issues
   scores.sort((a, b) => b.score - a.score);
 
   for (const { ki, pj, score } of scores) {
@@ -469,7 +469,7 @@ function matchOutcomes(kal: KalOutcome[], pm: PmOutcome[]): MatchedOutcome[] {
   return matched;
 }
 
-// ─── Main ────────────────────────────────────────────────────────────────────
+// --- Main --------------------------------------------------------------------
 
 async function main() {
   const pairs = loadCsv();
@@ -479,7 +479,7 @@ async function main() {
   }
 
   console.log(`\n${"=".repeat(80)}`);
-  console.log(`MULTI-OUTCOME ARB SCANNER — ${pairs.length} pair(s)`);
+  console.log(`MULTI-OUTCOME ARB SCANNER -- ${pairs.length} pair(s)`);
   console.log(`${"=".repeat(80)}\n`);
 
   let totalArbs = 0;
@@ -488,10 +488,10 @@ async function main() {
     const kalEventTicker = extractLastPathSegment(pair.kalshiUrl);
     const pmSlug = extractLastPathSegment(pair.pmUrl);
 
-    console.log(`\n${"─".repeat(70)}`);
+    console.log(`\n${"-".repeat(70)}`);
     console.log(`KAL: ${kalEventTicker}`);
     console.log(`PM:  ${pmSlug}`);
-    console.log(`${"─".repeat(70)}`);
+    console.log(`${"-".repeat(70)}`);
 
     // Fetch both sides
     const [kalData, pmData] = await Promise.all([
@@ -502,8 +502,8 @@ async function main() {
     if (!kalData) { console.log("  [SKIP] Could not fetch Kalshi event"); continue; }
     if (!pmData) { console.log("  [SKIP] Could not fetch PM event"); continue; }
 
-    console.log(`  KAL: "${kalData.title}" — ${kalData.outcomes.length} outcomes`);
-    console.log(`  PM:  "${pmData.title}" — ${pmData.outcomes.length} outcomes`);
+    console.log(`  KAL: "${kalData.title}" -- ${kalData.outcomes.length} outcomes`);
+    console.log(`  PM:  "${pmData.title}" -- ${pmData.outcomes.length} outcomes`);
 
     // Match and display
     const matched = matchOutcomes(kalData.outcomes, pmData.outcomes);
@@ -518,13 +518,13 @@ async function main() {
       "EDGE".padStart(8) +
       "  MATCH"
     );
-    console.log("  " + "─".repeat(80));
+    console.log("  " + "-".repeat(80));
 
     for (const m of matched) {
       const label = (m.kalTitle !== "???" ? m.kalTitle : m.pmName).slice(0, 38);
-      const kalYes = m.kalYesAsk > 0 ? (m.kalYesAsk * 100).toFixed(0) + "¢" : "  --";
-      const kalNo = m.kalNoAsk > 0 ? (m.kalNoAsk * 100).toFixed(0) + "¢" : "  --";
-      const pmAsk = m.pmAsk !== null ? (m.pmAsk * 100).toFixed(0) + "¢" : "  --";
+      const kalYes = m.kalYesAsk > 0 ? (m.kalYesAsk * 100).toFixed(0) + "c" : "  --";
+      const kalNo = m.kalNoAsk > 0 ? (m.kalNoAsk * 100).toFixed(0) + "c" : "  --";
+      const pmAsk = m.pmAsk !== null ? (m.pmAsk * 100).toFixed(0) + "c" : "  --";
       const edgeStr = m.edge !== null ? (m.edge >= 0 ? "+" : "") + (m.edge * 100).toFixed(1) + "%" : "  --";
       const edgeColor = m.edge !== null && m.edge > 0 ? " ***" : "";
       const matchStr = m.matchScore >= 0.8 ? "OK" : m.matchScore > 0 ? `~${(m.matchScore * 100).toFixed(0)}%` : "MISS";
@@ -549,7 +549,7 @@ async function main() {
       console.log();
       console.log(`  >>> ${arbs.length} ARB(S) FOUND:`);
       for (const a of arbs) {
-        console.log(`      Buy KAL NO ${a.kalTicker} @${(a.kalNoAsk * 100).toFixed(0)}¢ + PM "${a.pmName}" @${(a.pmAsk! * 100).toFixed(0)}¢ → edge=${(a.edge! * 100).toFixed(2)}%`);
+        console.log(`      Buy KAL NO ${a.kalTicker} @${(a.kalNoAsk * 100).toFixed(0)}c + PM "${a.pmName}" @${(a.pmAsk! * 100).toFixed(0)}c -> edge=${(a.edge! * 100).toFixed(2)}%`);
       }
     } else {
       console.log(`\n  No arb opportunities.`);

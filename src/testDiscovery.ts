@@ -10,7 +10,7 @@ import { normCents, normDollarsOrCents } from "./utils.js";
 const KALSHI_BASE = "https://api.elections.kalshi.com/trade-api/v2";
 const GAMMA_BASE = "https://gamma-api.polymarket.com";
 
-// ── Helpers ──────────────────────────────────────────────────────────────────
+// -- Helpers ------------------------------------------------------------------
 
 function pickString(v: unknown): string {
   return typeof v === "string" ? v : "";
@@ -56,13 +56,13 @@ async function fetchJson<T>(url: string): Promise<T> {
   const resp = await fetch(url, {
     headers: { "Accept": "application/json", "User-Agent": "discovery-test/1.0" },
   });
-  if (!resp.ok) throw new Error(`${resp.status} ${resp.statusText} — ${url}`);
+  if (!resp.ok) throw new Error(`${resp.status} ${resp.statusText} -- ${url}`);
   return resp.json() as Promise<T>;
 }
 
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
 
-// ── Types ────────────────────────────────────────────────────────────────────
+// -- Types --------------------------------------------------------------------
 
 type KalMarket = Record<string, any>;
 type KalEvent = { event_ticker?: string; ticker?: string; title?: string; name?: string;
@@ -83,7 +83,7 @@ type MatchResult = Candidate & {
   matchMethod: string; // "slug" | "prefetch-name" | "search" | "NOT FOUND"
 };
 
-// ── Constants ────────────────────────────────────────────────────────────────
+// -- Constants ----------------------------------------------------------------
 
 const SERIES_TO_PM_PREFIX: Record<string, string> = {
   KXATPMATCH: "atp", KXATPGAME: "atp",
@@ -110,7 +110,7 @@ function isNonMoneyline(slug: string, m: GammaMarket): boolean {
 }
 
 
-// ── Phase 1: Fetch Kalshi candidates ─────────────────────────────────────────
+// -- Phase 1: Fetch Kalshi candidates -----------------------------------------
 
 async function fetchKalshiCandidates(): Promise<Candidate[]> {
   const candidates: Candidate[] = [];
@@ -192,7 +192,7 @@ async function fetchKalshiCandidates(): Promise<Candidate[]> {
   return candidates;
 }
 
-// ── Phase 2: Fetch PM sports markets ─────────────────────────────────────────
+// -- Phase 2: Fetch PM sports markets -----------------------------------------
 
 async function fetchPmSportsMarkets(): Promise<GammaMarket[]> {
   const markets: GammaMarket[] = [];
@@ -231,7 +231,7 @@ async function fetchPmSportsMarkets(): Promise<GammaMarket[]> {
   return markets;
 }
 
-// ── Phase 3: Match ───────────────────────────────────────────────────────────
+// -- Phase 3: Match -----------------------------------------------------------
 
 async function matchAll(candidates: Candidate[], pmMarkets: GammaMarket[]): Promise<MatchResult[]> {
   const results: MatchResult[] = [];
@@ -321,7 +321,7 @@ async function matchAll(candidates: Candidate[], pmMarkets: GammaMarket[]): Prom
   return results;
 }
 
-// ── Main ─────────────────────────────────────────────────────────────────────
+// -- Main ---------------------------------------------------------------------
 
 async function main() {
   console.log("=== Discovery Test ===\n");
@@ -354,17 +354,17 @@ async function main() {
     matchedTotal += matched.length;
     notFoundTotal += notFound.length;
 
-    console.log(`\n── ${series} (${matched.length} matched, ${notFound.length} not found) ──`);
+    console.log(`\n-- ${series} (${matched.length} matched, ${notFound.length} not found) --`);
 
     for (const r of entries) {
-      const status = r.matchMethod !== "NOT FOUND" ? "✓" : "✗";
-      const kalPrices = `KAL: ${(r.kal1YesAsk*100).toFixed(0)}¢/${(r.kal2YesAsk*100).toFixed(0)}¢`;
+      const status = r.matchMethod !== "NOT FOUND" ? "[OK]" : "[X]";
+      const kalPrices = `KAL: ${(r.kal1YesAsk*100).toFixed(0)}c/${(r.kal2YesAsk*100).toFixed(0)}c`;
       const edge = Math.max(
         1 - r.kal1YesAsk - r.kal2YesAsk,  // combined overround gap
         0
       );
 
-      console.log(`  ${status} ${r.p1} vs ${r.p2}  [${r.date || "no-date"}]  ${kalPrices}  sum=${((r.kal1YesAsk+r.kal2YesAsk)*100).toFixed(0)}¢`);
+      console.log(`  ${status} ${r.p1} vs ${r.p2}  [${r.date || "no-date"}]  ${kalPrices}  sum=${((r.kal1YesAsk+r.kal2YesAsk)*100).toFixed(0)}c`);
       if (r.matchMethod !== "NOT FOUND") {
         console.log(`    PM: ${r.pmSlug}  outcomes=[${r.pmOutcome1}, ${r.pmOutcome2}]  via=${r.matchMethod}`);
       } else {

@@ -15,7 +15,7 @@ vi.mock("../polyChain.js", () => ({ getOnChainBalance: vi.fn() }));
 
 const { pmSafePrice, buildKalshiIOCOrder, deriveYesAsks, deriveNoAsks, sweepKalshiDepth } = await import("./ttPmOrders.js");
 
-// ─── pmSafePrice ────────────────────────────────────────────────────────────
+// --- pmSafePrice ------------------------------------------------------------
 
 describe("pmSafePrice", () => {
   it("returns original price for 0 shares", () => {
@@ -23,7 +23,7 @@ describe("pmSafePrice", () => {
   });
 
   it("floors cost to 2 decimal places", () => {
-    // 0.33 * 3 = 0.99 → floor(99) = 99 → 99/100/3 = 0.33
+    // 0.33 * 3 = 0.99 -> floor(99) = 99 -> 99/100/3 = 0.33
     const result = pmSafePrice(0.33, 3);
     expect(result * 3 * 100).toBeLessThanOrEqual(Math.floor(0.33 * 3 * 100) + 0.001);
   });
@@ -40,7 +40,7 @@ describe("pmSafePrice", () => {
   });
 });
 
-// ─── buildKalshiIOCOrder ────────────────────────────────────────────────────
+// --- buildKalshiIOCOrder ----------------------------------------------------
 
 describe("buildKalshiIOCOrder", () => {
   it("builds correct yes-side IOC order", () => {
@@ -78,13 +78,13 @@ describe("buildKalshiIOCOrder", () => {
   });
 });
 
-// ─── deriveYesAsks / deriveNoAsks ───────────────────────────────────────────
+// --- deriveYesAsks / deriveNoAsks -------------------------------------------
 
 describe("deriveYesAsks", () => {
   it("derives YES asks from NO bids", () => {
     const noBids: [number, number][] = [[60, 5], [55, 3]];
     const result = deriveYesAsks(noBids);
-    // 100-60=40, 100-55=45 → sorted ascending
+    // 100-60=40, 100-55=45 -> sorted ascending
     expect(result).toEqual([[40, 5], [45, 3]]);
   });
 
@@ -103,7 +103,7 @@ describe("deriveNoAsks", () => {
   it("derives NO asks from YES bids", () => {
     const yesBids: [number, number][] = [[70, 2], [50, 4]];
     const result = deriveNoAsks(yesBids);
-    // 100-70=30, 100-50=50 → sorted ascending
+    // 100-70=30, 100-50=50 -> sorted ascending
     expect(result).toEqual([[30, 2], [50, 4]]);
   });
 
@@ -112,7 +112,7 @@ describe("deriveNoAsks", () => {
   });
 });
 
-// ─── sweepKalshiDepth ───────────────────────────────────────────────────────
+// --- sweepKalshiDepth -------------------------------------------------------
 
 describe("sweepKalshiDepth", () => {
   it("sweeps depth up to minContracts", () => {

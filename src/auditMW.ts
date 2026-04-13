@@ -9,7 +9,7 @@ import { fetchAllKalshiFills, fetchAllKalshiSettlements } from "./kalshiTrade.js
 async function main() {
   console.log("=== METANOIA WOLVES FULL AUDIT ===\n");
 
-  // ── 1. Kalshi fills ──
+  // -- 1. Kalshi fills --
   console.log("--- KALSHI FILLS ---");
   const allKalFills = await fetchAllKalshiFills();
   const mwKalFills = allKalFills.filter(f =>
@@ -24,7 +24,7 @@ async function main() {
   let kalTotalFees = 0;
   for (const f of mwKalFills) {
     const cost = (f as any).count * (f as any).price / 100; // cents to dollars
-    console.log(`  ${f.ticker} | ${f.action} ${f.side} x${(f as any).count} @ ${(f as any).price}¢ | cost=$${((f as any).count * (f as any).price / 100).toFixed(2)} | fee=$${f.feeCost?.toFixed(2)} | ${(f as any).created_time || (f as any).ts}`);
+    console.log(`  ${f.ticker} | ${f.action} ${f.side} x${(f as any).count} @ ${(f as any).price}c | cost=$${((f as any).count * (f as any).price / 100).toFixed(2)} | fee=$${f.feeCost?.toFixed(2)} | ${(f as any).created_time || (f as any).ts}`);
     if (f.action === "buy") {
       kalTotalSpent += (f as any).count * (f as any).price / 100;
       kalTotalFees += f.feeCost || 0;
@@ -32,7 +32,7 @@ async function main() {
   }
   console.log(`Kalshi total spent: $${kalTotalSpent.toFixed(2)}, total fees: $${kalTotalFees.toFixed(2)}\n`);
 
-  // ── 2. Kalshi settlements ──
+  // -- 2. Kalshi settlements --
   console.log("--- KALSHI SETTLEMENTS ---");
   const allSettlements = await fetchAllKalshiSettlements();
   const mwSettlements = allSettlements.filter((s: any) =>
@@ -47,7 +47,7 @@ async function main() {
   }
   console.log("");
 
-  // ── 3. PM CLOB fills ──
+  // -- 3. PM CLOB fills --
   console.log("--- PM CLOB FILLS ---");
   const pk = process.env.POLY_WALLET_PRIVATE_KEY!;
   const host = process.env.POLY_CLOB_URL ?? "https://clob.polymarket.com";
@@ -110,7 +110,7 @@ async function main() {
     console.log(`    ${inKnown} | ${Number(f.size)} @ $${Number(f.price).toFixed(3)} = $${(Number(f.size)*Number(f.price)).toFixed(2)} | token=${f.asset_id?.slice(0,20)}... | ${f.match_time || f.created_at}`);
   }
 
-  // ── 4. Compare with trade records ──
+  // -- 4. Compare with trade records --
   console.log("\n\n--- TRADE RECORD COMPARISON ---");
   const trades = JSON.parse(fs.readFileSync("data/arb_trades.json", "utf8"));
   const mwTrades = trades.filter((t: any) => JSON.stringify(t).toUpperCase().includes("METANOIA"));
@@ -126,8 +126,8 @@ async function main() {
       const kCost = kf.reduce((s: number, f: any) => s + f.count * f.price / 100, 0);
       const kFees = kf.reduce((s: number, f: any) => s + (f.feeCost || 0), 0);
       console.log(`  Kalshi ACTUAL: ${kShares} shares, cost $${kCost.toFixed(2)}, fees $${kFees.toFixed(2)}, total $${(kCost + kFees).toFixed(2)}`);
-      if (kShares !== t.shares) console.log(`  ⚠ SHARE MISMATCH: record=${t.shares} actual=${kShares}`);
-      if (Math.abs(kCost + kFees - t.kalCost) > 0.02) console.log(`  ⚠ COST MISMATCH: record=$${t.kalCost} actual=$${(kCost + kFees).toFixed(2)}`);
+      if (kShares !== t.shares) console.log(`  [!] SHARE MISMATCH: record=${t.shares} actual=${kShares}`);
+      if (Math.abs(kCost + kFees - t.kalCost) > 0.02) console.log(`  [!] COST MISMATCH: record=$${t.kalCost} actual=$${(kCost + kFees).toFixed(2)}`);
     }
 
     // Find matching PM fills
@@ -136,12 +136,12 @@ async function main() {
       const pShares = pf.reduce((s: number, f: any) => s + Number(f.size), 0);
       const pCost = pf.reduce((s: number, f: any) => s + Number(f.size) * Number(f.price), 0);
       console.log(`  PM ACTUAL: ${pShares} shares, cost $${pCost.toFixed(2)}`);
-      if (pShares !== t.shares) console.log(`  ⚠ PM SHARE MISMATCH: record=${t.shares} actual=${pShares}`);
-      if (Math.abs(pCost - t.pmCost) > 0.02) console.log(`  ⚠ PM COST MISMATCH: record=$${t.pmCost} actual=$${pCost.toFixed(2)}`);
+      if (pShares !== t.shares) console.log(`  [!] PM SHARE MISMATCH: record=${t.shares} actual=${pShares}`);
+      if (Math.abs(pCost - t.pmCost) > 0.02) console.log(`  [!] PM COST MISMATCH: record=$${t.pmCost} actual=$${pCost.toFixed(2)}`);
     }
   }
 
-  // ── 5. Check PM open orders for current trade ──
+  // -- 5. Check PM open orders for current trade --
   console.log("\n\n--- PM OPEN ORDERS ---");
   try {
     const openOrders = await (client as any).getOpenOrders();

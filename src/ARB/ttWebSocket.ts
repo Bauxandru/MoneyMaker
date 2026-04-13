@@ -1,12 +1,12 @@
 /**
- * ttWebSocket.ts — Live WebSocket orderbook feeds for Kalshi and Polymarket.
+ * ttWebSocket.ts -- Live WebSocket orderbook feeds for Kalshi and Polymarket.
  * Maintains real-time orderbook state in Maps, read synchronously by scan/exec.
  *
  * Module-level mutable state:
- *   wsKalBooks / wsPmBooks       — live orderbook Maps
- *   _kalWs / _pmWs               — WebSocket instances
- *   _priceHistory / _lastSampleTs — momentum tracking buffers
- *   pmServiceDown*                — PM 425 backoff state
+ *   wsKalBooks / wsPmBooks       -- live orderbook Maps
+ *   _kalWs / _pmWs               -- WebSocket instances
+ *   _priceHistory / _lastSampleTs -- momentum tracking buffers
+ *   pmServiceDown*                -- PM 425 backoff state
  */
 
 import crypto from "crypto";
@@ -14,8 +14,10 @@ import fs from "fs";
 import WebSocket from "ws";
 import { KAL_WS_STALE_MS, PM_WS_STALE_MS } from "./ttConfig.js";
 import type { WsBookSide, WsLiveBook, WsPmBook } from "./ttTypes.js";
+import { audit } from "./ttAuditLog.js";
+import { readPolyApiCredsFromEnv } from "../polyAuth.js";
 
-// ─── Kalshi WS auth ──────────────────────────────────────────────────────────
+// --- Kalshi WS auth ----------------------------------------------------------
 
 function _loadKalshiPK(): string {
   if (process.env.KALSHI_PRIVATE_KEY) return process.env.KALSHI_PRIVATE_KEY.replace(/\\n/g, "\n");
@@ -34,7 +36,7 @@ function _kalshiWsSign(ts: string): string {
   return signer.sign({ key: _kalshiPK, padding: crypto.constants.RSA_PKCS1_PSS_PADDING, saltLength: 32 }, "base64");
 }
 
-// ─── In-memory live orderbook state ──────────────────────────────────────────
+// --- In-memory live orderbook state ------------------------------------------
 
 export const wsKalBooks = new Map<string, WsLiveBook>();
 export const wsPmBooks = new Map<string, WsPmBook>();
@@ -45,14 +47,128 @@ let _kalWsSubId = 0;
 const _kalWsSubs = new Set<string>();
 let _kalWsPingIv: ReturnType<typeof setInterval> | null = null;
 
+// --- Kalshi fill, order, and market lifecycle channels -----------------------
+
+export type KalFillEvent = {
+  trade_id: string;
+  order_id: string;
+  market_ticker: string;
+  is_taker: boolean;
+  side: "yes" | "no";
+  yes_price_dollars: string;
+  count_fp: string;
+  fee_cost: string;
+  action: string;
+  ts: number;
+  purchased_side: string;
+};
+
+export type KalOrderEvent = {
+  order_id: string;
+  ticker: string;
+  status: "resting" | "executed" | "canceled";
+  side: string;
+  is_yes: boolean;
+  yes_price_dollars: string;
+  fill_count_fp: string;
+  remaining_count_fp: string;
+  initial_count_fp: string;
+  taker_fill_cost_dollars: string;
+  maker_fill_cost_dollars: string;
+  taker_fees_dollars: string;
+  maker_fees_dollars: string;
+  created_time: string;
+  last_update_time: string;
+};
+
+export type KalMarketLifecycleEvent = {
+  event_type: "created" | "activated" | "deactivated" | "determined" | "settled" | "close_date_updated";
+  market_ticker: string;
+  result?: string;           // "YES" or "NO" on determined
+  settlement_value?: string; // "1.0000" or "0.0000" on determined
+  determination_ts?: number;
+  settled_ts?: number;
+};
+
+// Kalshi fill waiters: orderId -> resolve callback
+const _kalFillWaiters = new Map<string, (evt: KalFillEvent) => void>();
+
+// Kalshi order status waiters: orderId -> resolve callback
+const _kalOrderWaiters = new Map<string, (evt: KalOrderEvent) => void>();
+
+// Market settlement cache: ticker -> { result, settlementValue }
+const _kalSettledMarkets = new Map<string, { result: string; settlementValue: number; ts: number }>();
+
+// --- Persistent KAL fill listeners (for hedge GTC orders) ---
+// Unlike one-shot waiters, these stay registered until explicitly removed.
+// Multiple fills on the same order trigger the callback each time.
+const _kalPersistentFillListeners = new Map<string, (evt: KalFillEvent) => void>();
+const _kalPersistentOrderListeners = new Map<string, (evt: KalOrderEvent) => void>();
+
+/** Register a persistent listener for fills on a Kalshi order. Stays active until unregistered. */
+export function registerKalFillListener(orderId: string, callback: (evt: KalFillEvent) => void): void {
+  _kalPersistentFillListeners.set(orderId, callback);
+}
+
+/** Register a persistent listener for order status changes. */
+export function registerKalOrderListener(orderId: string, callback: (evt: KalOrderEvent) => void): void {
+  _kalPersistentOrderListeners.set(orderId, callback);
+}
+
+/** Unregister persistent listeners for an order. */
+export function unregisterKalListeners(orderId: string): void {
+  _kalPersistentFillListeners.delete(orderId);
+  _kalPersistentOrderListeners.delete(orderId);
+}
+
+/** Register a one-shot waiter for a Kalshi fill. Returns fill event or null on timeout. */
+export function waitForKalFillWs(orderId: string, timeoutMs = 15_000): Promise<KalFillEvent | null> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      _kalFillWaiters.delete(orderId);
+      resolve(null);
+    }, timeoutMs);
+    _kalFillWaiters.set(orderId, (evt) => {
+      clearTimeout(timer);
+      _kalFillWaiters.delete(orderId);
+      resolve(evt);
+    });
+  });
+}
+
+/** Register a one-shot waiter for a Kalshi order status change. */
+export function waitForKalOrderWs(orderId: string, timeoutMs = 15_000): Promise<KalOrderEvent | null> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      _kalOrderWaiters.delete(orderId);
+      resolve(null);
+    }, timeoutMs);
+    _kalOrderWaiters.set(orderId, (evt) => {
+      clearTimeout(timer);
+      _kalOrderWaiters.delete(orderId);
+      resolve(evt);
+    });
+  });
+}
+
+/** Check if a market has settled (from WS lifecycle events). */
+export function getKalSettlement(ticker: string): { result: string; settlementValue: number } | null {
+  return _kalSettledMarkets.get(ticker) ?? null;
+}
+
+/** Check if a market has settled as YES or NO. */
+export function isKalMarketSettled(ticker: string): boolean {
+  return _kalSettledMarkets.has(ticker);
+}
+
 let _pmWs: WebSocket | null = null;
 let _pmWsReady = false;
 let _pmPingInterval: ReturnType<typeof setInterval> | null = null;
 const _pmWsSubs = new Set<string>();
 
-// ─── Book accessor helpers ───────────────────────────────────────────────────
+// --- Book accessor helpers ---------------------------------------------------
 
-/** Convert WsBookSide Map → sorted [price, size][] array. */
+/** Convert WsBookSide Map -> sorted [price, size][] array. */
 export function wsBookToArray(m: WsBookSide): [number, number][] {
   const arr: [number, number][] = [];
   for (const [price, size] of m) {
@@ -68,7 +184,7 @@ export function getWsKalBook(ticker: string): { yes: [number, number][]; no: [nu
   return { yes: wsBookToArray(book.yes), no: wsBookToArray(book.no) };
 }
 
-/** Get PM ask depth from WS cache (null if stale/missing). Cents → decimal. */
+/** Get PM ask depth from WS cache (null if stale/missing). Cents -> decimal. */
 export function getWsPmAsks(tokenId: string): [number, number][] | null {
   const book = wsPmBooks.get(tokenId);
   if (!book || Date.now() - book.ts > PM_WS_STALE_MS) return null;
@@ -124,7 +240,7 @@ export function getWsPmBids(tokenId: string): [number, number][] | null {
   return arr.sort((a, b) => b[0] - a[0]);
 }
 
-// ─── Rolling Price Buffer (momentum detection) ──────────────────────────────
+// --- Rolling Price Buffer (momentum detection) ------------------------------
 
 const MOMENTUM_WINDOW_MS = 60_000;
 const MOMENTUM_SAMPLE_INTERVAL_MS = 500;
@@ -171,7 +287,7 @@ export function getMomentum(key: string, windowMs: number = 10_000): number {
   return latest.ask - oldest.ask;
 }
 
-// ─── Kalshi WebSocket ────────────────────────────────────────────────────────
+// --- Kalshi WebSocket --------------------------------------------------------
 
 export function connectKalshiWs(): void {
   const keyId = process.env.KALSHI_API_KEY_ID;
@@ -191,6 +307,12 @@ export function connectKalshiWs(): void {
   _kalWs.on("open", () => {
     console.log("[WS] Kalshi connected");
     _kalWsReady = true;
+
+    // Subscribe to user-level channels (no ticker needed — receives ALL fills/orders)
+    _kalWsSubId++;
+    _kalWs!.send(JSON.stringify({ id: _kalWsSubId, cmd: "subscribe", params: { channels: ["fill", "user_orders"] } }));
+
+    // Subscribe to per-ticker channels
     for (const ticker of _kalWsSubs) _kalWsSubscribe(ticker);
     if (_kalWsPingIv) clearInterval(_kalWsPingIv);
     _kalWsPingIv = setInterval(() => { _kalWs?.ping(); }, 30000);
@@ -226,6 +348,48 @@ export function connectKalshiWs(): void {
         book.ts = Date.now();
         { const ya = getWsKalBestAsk(ticker, "yes"); if (ya !== null) recordPrice(`kal:${ticker}:yes`, ya); }
         { const na = getWsKalBestAsk(ticker, "no"); if (na !== null) recordPrice(`kal:${ticker}:no`, na); }
+
+      // --- Kalshi fill channel ---
+      } else if (msg.type === "fill") {
+        const fill = msg.msg as KalFillEvent;
+        const oid = fill?.order_id;
+        if (oid) {
+          // One-shot waiter
+          if (_kalFillWaiters.has(oid)) _kalFillWaiters.get(oid)!(fill);
+          // Persistent listener (hedge GTC tracking)
+          if (_kalPersistentFillListeners.has(oid)) _kalPersistentFillListeners.get(oid)!(fill);
+        }
+
+      // --- Kalshi user_orders channel ---
+      } else if (msg.type === "user_order") {
+        const order = msg.msg as KalOrderEvent;
+        const oid = order?.order_id;
+        if (oid) {
+          // One-shot waiter
+          if (_kalOrderWaiters.has(oid)) _kalOrderWaiters.get(oid)!(order);
+          // Persistent listener (hedge GTC tracking)
+          if (_kalPersistentOrderListeners.has(oid)) _kalPersistentOrderListeners.get(oid)!(order);
+        }
+
+      // --- Kalshi market lifecycle channel ---
+      } else if (msg.type === "market_lifecycle_v2") {
+        const evt = msg.msg as KalMarketLifecycleEvent;
+        if (evt.event_type === "determined" && evt.market_ticker) {
+          const result = (evt.result ?? "").toUpperCase();
+          const sv = Number(evt.settlement_value ?? (result === "YES" ? 1 : 0));
+          _kalSettledMarkets.set(evt.market_ticker, { result, settlementValue: sv, ts: Date.now() });
+          // Only log for our watched markets — suppress crypto/forex/unrelated noise
+          if (_kalWsSubs.has(evt.market_ticker)) {
+            console.log(`[KAL-WS] Market determined: ${evt.market_ticker} result=${result} sv=${sv}`);
+          }
+        } else if (evt.event_type === "settled" && evt.market_ticker) {
+          if (!_kalSettledMarkets.has(evt.market_ticker)) {
+            _kalSettledMarkets.set(evt.market_ticker, { result: "unknown", settlementValue: 0, ts: Date.now() });
+          }
+          if (_kalWsSubs.has(evt.market_ticker)) {
+            console.log(`[KAL-WS] Market settled: ${evt.market_ticker}`);
+          }
+        }
       }
     } catch (err) { console.error("[WS] Kalshi message parse error:", (err as Error).message); }
   });
@@ -243,10 +407,10 @@ export function _kalWsSubscribe(ticker: string): void {
   _kalWsSubs.add(ticker);
   if (!_kalWsReady || !_kalWs) return;
   _kalWsSubId++;
-  _kalWs.send(JSON.stringify({ id: _kalWsSubId, cmd: "subscribe", params: { channels: ["orderbook_delta"], market_ticker: ticker } }));
+  _kalWs.send(JSON.stringify({ id: _kalWsSubId, cmd: "subscribe", params: { channels: ["orderbook_delta", "market_lifecycle_v2"], market_ticker: ticker } }));
 }
 
-// ─── Polymarket WebSocket ────────────────────────────────────────────────────
+// --- Polymarket WebSocket ----------------------------------------------------
 
 export function connectPmWs(): void {
   _pmWs = new WebSocket("wss://ws-subscriptions-clob.polymarket.com/ws/market");
@@ -312,7 +476,217 @@ export function connectPmWs(): void {
 }
 
 export function _pmWsSubscribe(tokenId: string): void {
+  const isNew = !_pmWsSubs.has(tokenId);
   _pmWsSubs.add(tokenId);
+  // Send subscription message immediately if WS is connected and this is a new token.
+  // Previously, tokens added after initial subscribeWatchlist() were never subscribed
+  // until the next WS reconnect, causing stale/missing book data.
+  if (isNew && _pmWsReady && _pmWs?.readyState === WebSocket.OPEN) {
+    _pmWs.send(JSON.stringify({ assets_ids: [tokenId], type: "market" }));
+  }
+}
+
+// --- Polymarket User WebSocket (fill confirmations) --------------------------
+
+let _pmUserWs: WebSocket | null = null;
+let _pmUserWsReady = false;
+let _pmUserPingIv: ReturnType<typeof setInterval> | null = null;
+
+export type PmTradeEvent = {
+  asset_id: string;
+  event_type: "trade";
+  id: string;          // trade id
+  price: string;
+  size: string;
+  side: string;        // "BUY" | "SELL"
+  status: string;      // "MATCHED" | "MINED" | "CONFIRMED" | "RETRYING" | "FAILED"
+  taker_order_id: string;
+  timestamp: string;
+  maker_orders?: { order_id: string; matched_amount: string; price: string }[];
+};
+
+// Pending fill waiters: orderId -> waiter state
+type PmFillWaiter = {
+  resolve: (evt: PmTradeEvent | null) => void;
+  timer: ReturnType<typeof setTimeout>;
+  matchedEvt: PmTradeEvent | null;   // stored MATCHED event (not yet on-chain)
+  requireMined: boolean;              // if true, only resolve on CONFIRMED/MINED
+};
+const _pmFillWaiters = new Map<string, PmFillWaiter>();
+
+// Ghost fill handler: called when a WS trade event is a verified ghost fill.
+// Set by runARB.ts to route to handleGhostFill.
+let _pmGhostFillHandler: ((tokenId: string, shares: number, tradeId: string) => void) | null = null;
+
+// Ghost fill verification: checks pending fills to confirm this is a real ghost.
+// Set by runARB.ts (provides access to pending fills without circular imports).
+let _pmGhostVerifier: ((tokenId: string) => { isGhost: boolean; pendingFillId: string } | null) | null = null;
+
+/** Register the ghost fill handler and verifier (called once at startup from runARB.ts). */
+export function setPmGhostFillHandler(
+  handler: (tokenId: string, shares: number, tradeId: string) => void,
+  verifier: (tokenId: string) => { isGhost: boolean; pendingFillId: string } | null,
+): void {
+  _pmGhostFillHandler = handler;
+  _pmGhostVerifier = verifier;
+}
+
+/** Register a one-shot waiter for a specific order fill. Returns a promise that
+ *  resolves with the trade event when the order is confirmed on-chain, or null on timeout.
+ *
+ *  When requireMined=true (default), MATCHED events are stored but the waiter keeps
+ *  waiting for CONFIRMED/MINED (on-chain proof). On timeout, resolves with the stored
+ *  MATCHED event if one arrived (caller can check status to know it's unconfirmed).
+ *
+ *  When requireMined=false, resolves immediately on any status (MATCHED/CONFIRMED/MINED).
+ *  Use this only for non-critical checks where speed matters more than on-chain certainty. */
+export function waitForPmFillWs(orderId: string, timeoutMs = 15_000, requireMined = true): Promise<PmTradeEvent | null> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      const w = _pmFillWaiters.get(orderId);
+      const storedEvt = w?.matchedEvt ?? null;
+      _pmFillWaiters.delete(orderId);
+      resolve(storedEvt); // resolve with MATCHED event if we have one, else null
+    }, timeoutMs);
+
+    _pmFillWaiters.set(orderId, { resolve, timer, matchedEvt: null, requireMined });
+  });
+}
+
+/** Extract actual fill cost from a PM trade event's maker_orders breakdown.
+ *  Returns { totalCost, totalShares, avgPrice } or null if no breakdown available.
+ *  For binary markets, CLOB may report the complementary price (maker's perspective).
+ *  The caller should validate: if avgPrice > 0.50 and combined cost > $1/share, use 1 - avgPrice. */
+export function extractPmFillCost(evt: PmTradeEvent): { totalCost: number; totalShares: number; avgPrice: number } | null {
+  // Prefer top-level price/size — this is from the taker's perspective (our side)
+  const topP = Number(evt.price), topS = Number(evt.size);
+  if (topP > 0 && topS > 0) {
+    return { totalCost: topP * topS, totalShares: topS, avgPrice: topP };
+  }
+  // Fallback to maker_orders breakdown
+  if (!evt.maker_orders || evt.maker_orders.length === 0) return null;
+  let totalCost = 0, totalShares = 0;
+  for (const mo of evt.maker_orders) {
+    const price = Number(mo.price);
+    const qty = Number(mo.matched_amount);
+    if (price > 0 && qty > 0) {
+      totalCost += price * qty;
+      totalShares += qty;
+    }
+  }
+  if (totalShares === 0) return null;
+  return { totalCost, totalShares, avgPrice: totalCost / totalShares };
+}
+
+/** Route a WS trade event to a waiter. Returns true if the waiter was resolved or matched. */
+function _resolveWaiterIfReady(w: PmFillWaiter, orderId: string, evt: PmTradeEvent, isOnChain: boolean): boolean {
+  if (isOnChain || !w.requireMined) {
+    // CONFIRMED/MINED or waiter doesn't require on-chain → resolve immediately
+    clearTimeout(w.timer);
+    _pmFillWaiters.delete(orderId);
+    w.resolve(evt);
+    return true;
+  }
+  // MATCHED but waiter requires on-chain confirmation → store event, keep waiting
+  w.matchedEvt = evt;
+  return true; // still "matched" for ghost fill suppression (we know about this order)
+}
+
+/** Check if PM User WS is connected and ready. */
+export function isPmUserWsReady(): boolean { return _pmUserWsReady; }
+
+export function connectPmUserWs(): void {
+  const creds = readPolyApiCredsFromEnv();
+  if (!creds) {
+    console.log("[PM-USER-WS] API credentials not configured, User WS disabled");
+    return;
+  }
+
+  _pmUserWs = new WebSocket("wss://ws-subscriptions-clob.polymarket.com/ws/user");
+
+  _pmUserWs.on("open", () => {
+    console.log("[PM-USER-WS] Connected, sending auth...");
+
+    // Auth + subscribe via message body (not HTTP headers)
+    _pmUserWs!.send(JSON.stringify({
+      auth: {
+        apiKey: creds.key,
+        secret: creds.secret,
+        passphrase: creds.passphrase,
+      },
+      type: "user",
+    }));
+
+    // Mark ready after auth sent. The old approach (wait for first trade event)
+    // caused a race: if no trades happened before the first execution,
+    // isPmUserWsReady() returned false and all WS verification was skipped.
+    // The WS is usable as soon as auth is sent — incoming trade events will
+    // be processed regardless of _pmUserWsReady state.
+    _pmUserWsReady = true;
+    console.log("[PM-USER-WS] Ready (auth sent)");
+
+    if (_pmUserPingIv) clearInterval(_pmUserPingIv);
+    _pmUserPingIv = setInterval(() => {
+      if (_pmUserWs?.readyState === WebSocket.OPEN) _pmUserWs.send("PING");
+    }, 10_000);
+  });
+
+  _pmUserWs.on("message", (raw) => {
+    try {
+      const str = raw.toString();
+      if (str === "PONG") return;
+
+      // Log first trade event for confirmation (auth already marked ready on connect)
+      if (!_pmUserWsReady) {
+        _pmUserWsReady = true; // safety: ensure ready if somehow missed
+      }
+
+      const msgs = JSON.parse(str);
+      const events: PmTradeEvent[] = Array.isArray(msgs) ? msgs : [msgs];
+
+      for (const evt of events) {
+        if (evt.event_type !== "trade") continue;
+        const status = evt.status?.toUpperCase();
+        if (status !== "MATCHED" && status !== "CONFIRMED" && status !== "MINED") continue;
+
+        // Resolve any waiter for this taker order
+        let matched = false;
+        const isOnChain = status === "CONFIRMED" || status === "MINED";
+        const takerId = evt.taker_order_id;
+        if (takerId && _pmFillWaiters.has(takerId)) {
+          matched = _resolveWaiterIfReady(_pmFillWaiters.get(takerId)!, takerId, evt, isOnChain);
+        }
+        // Also check maker orders (in case our order was the resting side)
+        if (evt.maker_orders) {
+          for (const mo of evt.maker_orders) {
+            if (mo.order_id && _pmFillWaiters.has(mo.order_id)) {
+              matched = _resolveWaiterIfReady(_pmFillWaiters.get(mo.order_id)!, mo.order_id, evt, isOnChain) || matched;
+            }
+          }
+        }
+        // No waiter matched — verify if this is a ghost fill
+        if (!matched && _pmGhostVerifier && _pmGhostFillHandler) {
+          const tokenId = evt.asset_id;
+          const result = _pmGhostVerifier(tokenId);
+          if (result && result.isGhost) {
+            const shares = Math.round(Number(evt.size) || 0);
+            if (shares > 0) {
+              console.log(`[PM-USER-WS] Verified ghost fill: ${shares} shares token=...${tokenId.slice(-12)} pendingFill=${result.pendingFillId}`);
+              audit({ module: "ws", fn: "pmUserWsHandler", action: "ws-ghost-fill-verified", shares, trigger: "pm-user-ws-trade-event", context: { tokenId, pendingFillId: result.pendingFillId, evtId: evt.id, evtStatus: evt.status, evtSize: evt.size, evtPrice: evt.price } });
+              _pmGhostFillHandler(tokenId, shares, evt.id || "ws-ghost");
+            }
+          }
+        }
+      }
+    } catch (err) { console.error("[PM-USER-WS] Parse error:", (err as Error).message); }
+  });
+
+  _pmUserWs.on("close", () => {
+    console.log("[PM-USER-WS] Disconnected, reconnecting in 3s...");
+    _pmUserWsReady = false;
+    setTimeout(connectPmUserWs, 3000);
+  });
+  _pmUserWs.on("error", (err) => { console.error("[PM-USER-WS] Error:", (err as Error).message); });
 }
 
 /** Subscribe all watchlist entries to WS feeds. */
@@ -334,7 +708,7 @@ export function subscribeWatchlist(watchlist: { kal1: { ticker: string }; kal2: 
   console.log(`[WS] Subscribed to ${_kalWsSubs.size} Kalshi tickers + ${_pmWsSubs.size} PM tokens`);
 }
 
-// ─── PM service-down backoff ─────────────────────────────────────────────────
+// --- PM service-down backoff -------------------------------------------------
 
 let pmServiceDownUntil = 0;
 let pmConsecutive425 = 0;
@@ -349,7 +723,7 @@ export function markPmDown(): void {
   pmConsecutive425++;
   const delay = Math.min(PM_BACKOFF_MAX_MS, PM_BACKOFF_BASE_MS * Math.pow(2, pmConsecutive425 - 1));
   pmServiceDownUntil = Date.now() + delay;
-  console.warn(`[PM] Service down — backing off ${(delay / 1000).toFixed(0)}s (failure #${pmConsecutive425})`);
+  console.warn(`[PM] Service down -- backing off ${(delay / 1000).toFixed(0)}s (failure #${pmConsecutive425})`);
 }
 
 export function markPmUp(): void {

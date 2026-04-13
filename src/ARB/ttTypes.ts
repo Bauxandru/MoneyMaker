@@ -1,6 +1,6 @@
 /**
- * ttTypes.ts — All internal types used by the tradeTennis arb bot.
- * Pure type definitions — no runtime code, no state, no side effects.
+ * ttTypes.ts -- All internal types used by the tradeTennis arb bot.
+ * Pure type definitions -- no runtime code, no state, no side effects.
  */
 
 import { type ArbTradeRecord, type ExecMetric } from "../types.js";
@@ -8,9 +8,9 @@ import { type ArbTradeRecord, type ExecMetric } from "../types.js";
 // Re-export shared types so consumers only need one import
 export type { ArbTradeRecord, ExecMetric };
 
-// ─── WebSocket book types ─────────────────────────────────────────────────────
+// --- WebSocket book types -----------------------------------------------------
 
-export type WsBookSide = Map<number, number>; // priceCents → size
+export type WsBookSide = Map<number, number>; // priceCents -> size
 
 export interface WsLiveBook {
   yes: WsBookSide;
@@ -20,9 +20,9 @@ export interface WsLiveBook {
 
 export type WsPmBook = { bids: WsBookSide; asks: WsBookSide; ts: number };
 
-// ─── API response types ──────────────────────────────────────────────────────
+// --- API response types ------------------------------------------------------
 // Lightweight interfaces covering the fields we actually read from each API.
-// All fields optional — external APIs may omit any field at any time.
+// All fields optional -- external APIs may omit any field at any time.
 
 /** Kalshi market object (from /markets/{ticker} or nested inside events). */
 export type KalshiMarket = {
@@ -69,18 +69,18 @@ export type KalshiOrder = {
   orderId?: string;
   status?: string;
   fill_count?: number;
-  fill_count_fp?: string;    // "13.00" — newer API format
+  fill_count_fp?: string;    // "13.00" -- newer API format
   filled_count?: number;
   filled_contracts?: number;
   filled?: number;
   remaining_count?: number;
   taker_fees?: number;
   maker_fees?: number;
-  taker_fees_dollars?: string;   // "0.1234" — newer API format
+  taker_fees_dollars?: string;   // "0.1234" -- newer API format
   maker_fees_dollars?: string;
   taker_fill_cost?: number;       // actual fill cost in cents (taker)
   maker_fill_cost?: number;       // actual fill cost in cents (maker)
-  taker_fill_cost_dollars?: string; // "11.18" — newer API format
+  taker_fill_cost_dollars?: string; // "11.18" -- newer API format
   maker_fill_cost_dollars?: string;
   order?: KalshiOrder;
 };
@@ -97,7 +97,7 @@ export type GammaMarket = {
   active?: boolean;
   closed?: boolean;
   sportsMarketType?: string;
-  _eventSlug?: string;  // transient — set by discovery code
+  _eventSlug?: string;  // transient -- set by discovery code
   [key: string]: unknown; // allow arbitrary fields for forward compat
 };
 
@@ -139,7 +139,7 @@ export type PmOrderResponse = {
 /** CLOB orderbook entry (could be array [price, size] or object). */
 export type ClobBookEntry = { price?: number; size?: number } | [number, number];
 
-// ─── Trading leg types ────────────────────────────────────────────────────────
+// --- Trading leg types --------------------------------------------------------
 
 export type KalshiLeg = {
   ticker: string;
@@ -175,11 +175,11 @@ export type WatchEntry = {
   isBinary?: boolean;
 };
 
-// ─── Arb direction type ───────────────────────────────────────────────────────
+// --- Arb direction type -------------------------------------------------------
 
 export type ArbDir = "A" | "B" | "C" | "D" | "E" | "F" | "G" | "H" | "I" | "J" | "K" | "L";
 
-// ─── Hedge mode types ─────────────────────────────────────────────────────────
+// --- Hedge mode types ---------------------------------------------------------
 
 export type UnhedgedPosition = {
   tradeId: string;              // links back to ArbTradeRecord.id for precise resolution
@@ -198,6 +198,8 @@ export type UnhedgedPosition = {
   hedgeFillCostPm: number;      // portion of hedgeFillCost spent on Polymarket
   kalFees: number;              // accumulated Kalshi fees (initial + hedge fills)
   initialKalFees: number;       // Kalshi fees from initial fill only (for accurate resolve)
+  pmPreBalance?: number;        // on-chain PM token balance before hedge started (for fill verification)
+  pmFillPendingVerify?: number; // shares reported by CLOB but not yet verified on-chain
 };
 
 // Resting GTC order placed in the book (complete = buy missing leg, exit = sell existing)
@@ -209,7 +211,7 @@ export type HedgeOrder = {
   shares: number;               // original size
   filledSoFar: number;          // cumulative fills seen so far (for delta tracking)
   fetchFailures: number;        // consecutive status-check errors; order removed after 3
-  placedAt: number;             // Date.now() when placed — used for timeout rotation
+  placedAt: number;             // Date.now() when placed -- used for timeout rotation
   _lastFeeSeen?: number;        // cumulative Kalshi fees from last poll (for delta calc)
   _feeDelta?: number;           // fee increment since last poll
   _lastLogKey?: string;         // dedup key for status logging
@@ -217,10 +219,13 @@ export type HedgeOrder = {
 
 export type HedgeState = {
   position: UnhedgedPosition;
-  activeOrders: Map<string, HedgeOrder>; // orderId → HedgeOrder
+  activeOrders: Map<string, HedgeOrder>; // orderId -> HedgeOrder
   kalNextRetryAt: number;               // timestamp: don't retry Kalshi until after this
+  pmNextRetryAt?: number;               // timestamp: don't place PM orders until after this (prevents double-fill from delayed settlement)
   lastCompleteExchange?: "pm" | "kal";  // for sequential hedge rotation
   pmOnlyCycles: number;                 // consecutive cycles with no PM fill
+  _pendingTradeRecord?: ArbTradeRecord; // set by detection functions; caller logs only for non-duplicate positions
+  _hedgeStartTs?: number;               // timestamp: when hedge mode started (for KAL window timeout)
 };
 
 export type PersistedHedgeEntry = {
@@ -231,7 +236,7 @@ export type PersistedHedgeEntry = {
   pmOnlyCycles?: number;
 };
 
-// ─── Persistence types ────────────────────────────────────────────────────────
+// --- Persistence types --------------------------------------------------------
 
 export interface PendingFill {
   id: string;           // unique key, e.g. "pf-1710412800000"
@@ -272,8 +277,8 @@ export interface DepthOpportunity {
   pmAvgPrice: number;
   // Combined
   maxProfitableShares: number; // min(kalTotal, pmTotal)
-  maxInvestableUsd: number;    // shares × (kalAvg + pmAvg)
-  projectedPnlUsd: number;    // shares × edge (approx)
+  maxInvestableUsd: number;    // shares x (kalAvg + pmAvg)
+  projectedPnlUsd: number;    // shares x edge (approx)
   budgetShares: number;        // what we actually trade with our budget
 }
 
@@ -303,7 +308,7 @@ export interface BookTrack {
   samples: BookSample[];
 }
 
-// ─── Open position (for cancellation monitor) ────────────────────────────────
+// --- Open position (for cancellation monitor) --------------------------------
 
 export type OpenPosition = {
   kalTicker: string;

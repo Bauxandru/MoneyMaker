@@ -27,13 +27,13 @@ dotenv.config();
 
 type AnyRecord = Record<string, unknown>;
 
-// ─── Rate-limited fetch helpers ───────────────────────────────────────────────
+// --- Rate-limited fetch helpers -----------------------------------------------
 
 const retryOpts = { timeoutMs: 15000, maxRetries: 4, baseDelayMs: 700, maxDelayMs: 10000, jitterMs: 300 };
 const kalFetch = createRateLimitedFetcher(Number(process.env.KALSHI_REQUEST_INTERVAL_MS ?? 120), retryOpts);
 const polyFetch = createRateLimitedFetcher(Number(process.env.POLY_REQUEST_INTERVAL_MS ?? 150), retryOpts);
 
-// ─── Player name helpers ──────────────────────────────────────────────────────
+// --- Player name helpers ------------------------------------------------------
 
 /**
  * Extract the player's full name from a Kalshi KXATPMATCH market title.
@@ -58,9 +58,9 @@ function extractKalshiMatchTitle(title: string): string {
 
 /**
  * Polymarket slug token: first 7 chars of the last word of a player name, lowercased.
- * "Valentin Vacherot" → "vachero"  (7 of "Vacherot")
- * "Carreno Busta" → "busta"        (last word)
- * "Mpetshi Perricard" → "perrica"  (7 of "Perricard")
+ * "Valentin Vacherot" -> "vachero"  (7 of "Vacherot")
+ * "Carreno Busta" -> "busta"        (last word)
+ * "Mpetshi Perricard" -> "perrica"  (7 of "Perricard")
  */
 function pmSlugToken(fullName: string): string {
   const last = fullName.trim().split(/\s+/).pop() ?? fullName;
@@ -69,8 +69,8 @@ function pmSlugToken(fullName: string): string {
 
 /**
  * Parse a date-like code from a Kalshi ticker.
- * "KXATPMATCH-26FEB25VACMON-VAC" → "26FEB25" → "2026-02-25"
- * "KXATPMATCH-26FEB24UGOHAN-UGO" → "26FEB24" → "2026-02-24"
+ * "KXATPMATCH-26FEB25VACMON-VAC" -> "26FEB25" -> "2026-02-25"
+ * "KXATPMATCH-26FEB24UGOHAN-UGO" -> "26FEB24" -> "2026-02-24"
  */
 const MONTHS: Record<string, string> = {
   JAN: "01", FEB: "02", MAR: "03", APR: "04", MAY: "05", JUN: "06",
@@ -88,13 +88,13 @@ function parseDateFromTicker(ticker: string): string {
 
 /**
  * Extract the match code prefix from a ticker.
- * "KXATPMATCH-26FEB25VACMON-VAC" → "KXATPMATCH-26FEB25VACMON"
+ * "KXATPMATCH-26FEB25VACMON-VAC" -> "KXATPMATCH-26FEB25VACMON"
  */
 function matchCode(ticker: string): string {
   return ticker.replace(/-[^-]+$/, "");
 }
 
-// ─── Types ────────────────────────────────────────────────────────────────────
+// --- Types --------------------------------------------------------------------
 
 type KalshiPlayerMarket = {
   ticker: string;
@@ -134,7 +134,7 @@ type ArbOpportunity = {
   edgeB: number;
 };
 
-// ─── Kalshi: Fetch and group KXATPMATCH markets ───────────────────────────────
+// --- Kalshi: Fetch and group KXATPMATCH markets -------------------------------
 
 async function fetchKalshiMatchGroups(): Promise<KalshiMatchGroup[]> {
   const base =
@@ -198,7 +198,7 @@ async function fetchKalshiMatchGroups(): Promise<KalshiMatchGroup[]> {
 
   if (!gotAny) {
     // Fallback: iterate /events and filter by series_ticker field
-    process.stderr.write("\r[Kalshi] /markets empty → falling back to /events scan…\n");
+    process.stderr.write("\r[Kalshi] /markets empty -> falling back to /events scan…\n");
     cursor = "";
     pages = 0;
 
@@ -273,7 +273,7 @@ async function fetchKalshiMatchGroups(): Promise<KalshiMatchGroup[]> {
   return groups;
 }
 
-// ─── Polymarket: Fetch ATP categorical market by slug ─────────────────────────
+// --- Polymarket: Fetch ATP categorical market by slug -------------------------
 
 async function fetchPolyMatchMarket(slug: string): Promise<PolyMatchMarket | null> {
   const gammaBase = process.env.POLY_GAMMA_URL ?? "https://gamma-api.polymarket.com";
@@ -321,7 +321,7 @@ async function findPolyMatch(
   return null;
 }
 
-// ─── Fetch Polymarket CLOB ask prices for each outcome token ─────────────────
+// --- Fetch Polymarket CLOB ask prices for each outcome token -----------------
 
 async function fetchPolyOutcomePrices(
   market: PolyMatchMarket,
@@ -344,7 +344,7 @@ async function fetchPolyOutcomePrices(
   return priceMap;
 }
 
-// ─── Formatting helpers ───────────────────────────────────────────────────────
+// --- Formatting helpers -------------------------------------------------------
 
 function fmtPct(v: number, d = 1): string {
   return (v * 100).toFixed(d) + "%";
@@ -358,7 +358,7 @@ function padLeft(s: string, n: number): string {
   return s.length >= n ? s.slice(0, n) : " ".repeat(n - s.length) + s;
 }
 
-// ─── Main ─────────────────────────────────────────────────────────────────────
+// --- Main ---------------------------------------------------------------------
 
 async function main() {
   console.log(
@@ -395,7 +395,7 @@ async function main() {
     // Fetch CLOB prices for each outcome
     const pmPrices = await fetchPolyOutcomePrices(pmMarket, clobBase);
 
-    // Match Kalshi player → PM outcome by surname
+    // Match Kalshi player -> PM outcome by surname
     function findPmAsk(kalSurname: string): { outcome: string; ask: number } | null {
       for (const [outcome, ask] of pmPrices) {
         const outcomeNorm = outcome.toLowerCase();
@@ -422,7 +422,7 @@ async function main() {
       continue;
     }
 
-    // Arb A: KAL P1_YES + PM P2_token → pays $1 if P1 wins (KAL) or P2 wins (PM)
+    // Arb A: KAL P1_YES + PM P2_token -> pays $1 if P1 wins (KAL) or P2 wins (PM)
     //         combined pays $1 in ALL scenarios
     const edgeA = 1 - kalP1.yesAsk - pm2.ask;
     // Arb B: KAL P2_YES + PM P1_token
@@ -464,7 +464,7 @@ async function main() {
     return;
   }
 
-  // ── Print table ─────────────────────────────────────────────────────────────
+  // -- Print table -------------------------------------------------------------
 
   const header = [
     padLeft("#", 3),
@@ -477,7 +477,7 @@ async function main() {
     "Match",
   ].join("  ");
   console.log(header);
-  console.log("─".repeat(header.length));
+  console.log("-".repeat(header.length));
 
   for (let i = 0; i < arbs.length; i++) {
     const a = arbs[i];

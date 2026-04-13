@@ -11,7 +11,7 @@ dotenv.config();
 
 type AnyRecord = Record<string, unknown>;
 
-// ── Kalshi auth ──
+// -- Kalshi auth --
 function loadPrivateKey(): string {
   if (process.env.KALSHI_PRIVATE_KEY) return process.env.KALSHI_PRIVATE_KEY.replace(/\\n/g, "\n");
   const p = process.env.KALSHI_PRIVATE_KEY_PATH;
@@ -49,7 +49,7 @@ async function kalshiGet(apiPath: string): Promise<AnyRecord> {
   }) as Promise<AnyRecord>;
 }
 
-// ── PM fetch (no auth needed for public book) ──
+// -- PM fetch (no auth needed for public book) --
 async function pmGet(tokenId: string): Promise<AnyRecord> {
   return fetchJson(`https://clob.polymarket.com/book?token_id=${tokenId}`) as Promise<AnyRecord>;
 }
@@ -168,9 +168,9 @@ async function main() {
   console.log("SUMMARY");
   console.log("=".repeat(50));
   if (kalRL === 0 && pmRL === 0) {
-    console.log(`✓ No rate limiting at ${INTERVAL_MS}ms intervals. Safe to use.`);
+    console.log(`[OK] No rate limiting at ${INTERVAL_MS}ms intervals. Safe to use.`);
   } else {
-    console.log(`✗ Rate limited: Kalshi=${kalRL}, PM=${pmRL}. Need longer intervals.`);
+    console.log(`[X] Rate limited: Kalshi=${kalRL}, PM=${pmRL}. Need longer intervals.`);
   }
 }
 

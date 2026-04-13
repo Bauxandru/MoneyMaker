@@ -1,5 +1,5 @@
 /**
- * scanAll.ts — Universal cross-platform arb scanner
+ * scanAll.ts -- Universal cross-platform arb scanner
  *
  * Scans ALL sports with game-level binary markets on both Kalshi and Polymarket:
  *
@@ -10,7 +10,7 @@
  * Esports:    CS2, Valorant, LoL, COD
  * Fighting:   UFC, Boxing
  *
- * Soccer/Football group (separate command — 3-way arb math):
+ * Soccer/Football group (separate command -- 3-way arb math):
  *   EPL, La Liga, Ligue 1, Serie A, Bundesliga, MLS, EFL Championship,
  *   La Liga 2, Eredivisie, Danish Superliga, A-League, Brasileirão,
  *   Colombian Primera, UCL, Europa League, Conference League,
@@ -52,7 +52,7 @@ const KALSHI_BASE = process.env.KALSHI_BASE_URL ?? "https://api.elections.kalshi
 const GAMMA_BASE = process.env.POLY_GAMMA_URL ?? "https://gamma-api.polymarket.com";
 const CLOB_BASE = process.env.POLY_CLOB_URL ?? "https://clob.polymarket.com";
 
-// ─── Sport configs ───────────────────────────────────────────────────────────
+// --- Sport configs -----------------------------------------------------------
 
 type MatchMode = "slug" | "bulk";
 
@@ -65,15 +65,15 @@ interface SportConfig {
   pmSlugPrefix?: string;
   // bulk mode: fetch PM events by tag, fuzzy-match
   pmTag?: string;
-  // For Kalshi team name → PM nickname mapping (slug mode only)
+  // For Kalshi team name -> PM nickname mapping (slug mode only)
   teamMap?: Record<string, string>;
   // How to extract team/player name from Kalshi market
   nameExtract: "sub_title" | "title_will_win";
-  // 3-way markets (home/away/draw) — soccer, AFL
+  // 3-way markets (home/away/draw) -- soccer, AFL
   is3Way?: boolean;
 }
 
-// ─── Team maps for slug-mode sports ──────────────────────────────────────────
+// --- Team maps for slug-mode sports ------------------------------------------
 
 const NBA_MAP: Record<string, string> = {
   "Atlanta":"Hawks","Boston":"Celtics","Brooklyn":"Nets","Charlotte":"Hornets",
@@ -110,7 +110,7 @@ const MLB_MAP: Record<string, string> = {
   "Tampa Bay":"Rays","Texas":"Rangers","Toronto":"Blue Jays","Washington":"Nationals",
 };
 
-// ─── All sport definitions ───────────────────────────────────────────────────
+// --- All sport definitions ---------------------------------------------------
 
 const ALL_SPORTS: SportConfig[] = [
   // Slug-mode sports (clean PM slug patterns)
@@ -140,7 +140,7 @@ const ALL_SPORTS: SportConfig[] = [
   { key: "aba", label: "ABA League", kalshiSeries: "KXABAGAME", mode: "bulk", pmTag: "aba-league", nameExtract: "sub_title" },
 ];
 
-// Soccer / football group — scanned separately via --soccer
+// Soccer / football group -- scanned separately via --soccer
 // All are 3-way (home/away/draw), Kalshi has 3 binary markets per event
 const SOCCER_SPORTS: SportConfig[] = [
   // Top 5 leagues
@@ -174,7 +174,7 @@ const SOCCER_SPORTS: SportConfig[] = [
   { key: "afl", label: "AFL", kalshiSeries: "KXAFLGAME", mode: "bulk", pmTag: "afl", nameExtract: "sub_title" },
 ];
 
-// ─── Types ────────────────────────────────────────────────────────────────────
+// --- Types --------------------------------------------------------------------
 
 interface KalshiTeam {
   ticker: string;
@@ -215,7 +215,7 @@ interface ArbOpp3Way {
   bestEdge: number;
 }
 
-// ─── Date parsing ────────────────────────────────────────────────────────────
+// --- Date parsing ------------------------------------------------------------
 
 const MONTHS: Record<string, string> = {
   JAN:"01",FEB:"02",MAR:"03",APR:"04",MAY:"05",JUN:"06",
@@ -233,7 +233,7 @@ function extractNameFromTitle(title: string): string {
   return m ? m[1].trim() : "";
 }
 
-// ─── Kalshi: Fetch all game markets for a series ─────────────────────────────
+// --- Kalshi: Fetch all game markets for a series -----------------------------
 
 async function fetchKalshiGames(sport: SportConfig): Promise<KalshiGame[]> {
   const allMarkets: R[] = [];
@@ -309,7 +309,7 @@ async function fetchKalshiGames(sport: SportConfig): Promise<KalshiGame[]> {
   return games;
 }
 
-// ─── PM: Slug-mode matching (NBA, NHL, MLB) ─────────────────────────────────
+// --- PM: Slug-mode matching (NBA, NHL, MLB) ---------------------------------
 
 async function findPmBySlug(
   game: KalshiGame
@@ -334,7 +334,7 @@ async function findPmBySlug(
   return null;
 }
 
-// ─── PM: Bulk-mode matching (esports, intl basketball, tennis, fighting) ────
+// --- PM: Bulk-mode matching (esports, intl basketball, tennis, fighting) ----
 
 // Cache PM events per tag so we don't re-fetch
 const pmEventCache = new Map<string, R[]>();
@@ -411,7 +411,7 @@ async function findPmByBulk(
   return null;
 }
 
-// ─── PM: Fetch CLOB prices ──────────────────────────────────────────────────
+// --- PM: Fetch CLOB prices --------------------------------------------------
 
 async function fetchPmPrices(tokenIds: string[], outcomes: string[]): Promise<Map<string, number>> {
   const prices = new Map<string, number>();
@@ -420,7 +420,7 @@ async function fetchPmPrices(tokenIds: string[], outcomes: string[]): Promise<Ma
       const book = await polyFetch<R>(`${CLOB_BASE}/book?token_id=${encodeURIComponent(tokenIds[i])}`);
       const asks = Array.isArray(book.asks) ? (book.asks as R[]) : [];
       if (asks.length > 0) {
-        // Asks sorted DESCENDING — cheapest (best) is LAST
+        // Asks sorted DESCENDING -- cheapest (best) is LAST
         const bestAsk = Number(asks[asks.length - 1].price || 0);
         if (bestAsk > 0) prices.set(outcomes[i], bestAsk);
       }
@@ -429,7 +429,7 @@ async function fetchPmPrices(tokenIds: string[], outcomes: string[]): Promise<Ma
   return prices;
 }
 
-// ─── Match Kalshi team → PM outcome ──────────────────────────────────────────
+// --- Match Kalshi team -> PM outcome ------------------------------------------
 
 function matchTeamToOutcome(
   team: KalshiTeam,
@@ -455,13 +455,13 @@ function matchTeamToOutcome(
   return null;
 }
 
-// ─── Formatting ──────────────────────────────────────────────────────────────
+// --- Formatting --------------------------------------------------------------
 
 function fmtPct(v: number, d = 1): string { return (v * 100).toFixed(d) + "%"; }
 function pad(s: string, n: number): string { return s.length >= n ? s.slice(0, n) : s + " ".repeat(n - s.length); }
 function padL(s: string, n: number): string { return s.length >= n ? s.slice(0, n) : " ".repeat(n - s.length) + s; }
 
-// ─── Main ─────────────────────────────────────────────────────────────────────
+// --- Main ---------------------------------------------------------------------
 
 async function main() {
   const args = process.argv.slice(2).map(a => a.replace("--", ""));
@@ -508,7 +508,7 @@ async function main() {
       const pmPrices = await fetchPmPrices(pmMarket.tokenIds, pmMarket.outcomes);
 
       if (sport.is3Way && game.teams.length === 3) {
-        // ── 3-way arb (soccer) ──
+        // -- 3-way arb (soccer) --
         // Match all 3 Kalshi teams to PM outcomes
         const pmMatches = game.teams.map(t => matchTeamToOutcome(t, pmPrices, sport.teamMap));
         // Also try matching "Draw"/"Tie" directly for the draw market
@@ -555,7 +555,7 @@ async function main() {
           bestEdge: Math.max(...dirs.map(d => d.edge)),
         });
       } else {
-        // ── Binary arb (2-outcome) ──
+        // -- Binary arb (2-outcome) --
         const [t1, t2] = game.teams;
         const pm1 = matchTeamToOutcome(t1, pmPrices, sport.teamMap);
         const pm2 = matchTeamToOutcome(t2, pmPrices, sport.teamMap);
@@ -582,7 +582,7 @@ async function main() {
     `${totalMatched} PM matched | ${totalNotFound} not found | ${totalPriceMiss} price missing\n`
   );
 
-  // ── Print binary arbs ──
+  // -- Print binary arbs --
   if (allArbs.length > 0) {
     allArbs.sort((a, b) => Math.max(b.edgeA, b.edgeB) - Math.max(a.edgeA, a.edgeB));
 
@@ -591,7 +591,7 @@ async function main() {
       pad("KAL ticker", 40), pad("KAL ask", 8), pad("PM outcome", 22), pad("PM ask", 8), "Match",
     ].join("  ");
     console.log(hdr);
-    console.log("─".repeat(hdr.length));
+    console.log("-".repeat(hdr.length));
 
     for (let i = 0; i < allArbs.length; i++) {
       const a = allArbs[i];
@@ -637,11 +637,11 @@ async function main() {
     }
   }
 
-  // ── Print 3-way arbs ──
+  // -- Print 3-way arbs --
   if (all3WayArbs.length > 0) {
     all3WayArbs.sort((a, b) => b.bestEdge - a.bestEdge);
 
-    console.log(`\n${"═".repeat(100)}`);
+    console.log(`\n${"=".repeat(100)}`);
     console.log(`[SOCCER 3-WAY] ${all3WayArbs.length} matches with complete prices\n`);
 
     const hdr3 = [
@@ -649,7 +649,7 @@ async function main() {
       pad("KAL ask", 8), pad("+ PM 1", 16), pad("PM ask1", 8), pad("+ PM 2", 16), pad("PM ask2", 8), "Match",
     ].join("  ");
     console.log(hdr3);
-    console.log("─".repeat(hdr3.length));
+    console.log("-".repeat(hdr3.length));
 
     for (let i = 0; i < all3WayArbs.length; i++) {
       const a = all3WayArbs[i];

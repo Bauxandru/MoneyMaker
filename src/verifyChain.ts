@@ -1,5 +1,5 @@
 /**
- * verifyChain.ts — Cross-reference arb_trades.json PM data against Polygon blockchain.
+ * verifyChain.ts -- Cross-reference arb_trades.json PM data against Polygon blockchain.
  *
  * Scans ALL CTF TransferSingle events to/from our wallet, then compares
  * on-chain transfer data with the trade log to find discrepancies.
@@ -115,7 +115,7 @@ async function main() {
   const latestHex = (await rpcCall("eth_blockNumber", [])) as string;
   const latest = parseInt(latestHex, 16);
   const startBlock = latest - BLOCKS_PER_DAY * DAYS_BACK;
-  console.log(`Block range: ${startBlock} → ${latest} (${latest - startBlock} blocks)\n`);
+  console.log(`Block range: ${startBlock} -> ${latest} (${latest - startBlock} blocks)\n`);
 
   // Step 2: Scan all transfers
   const allTransfers: OnChainTransfer[] = [];
@@ -155,7 +155,7 @@ async function main() {
   const tradesWithPm = trades.filter(t => t.pmCost > 0 || t.pmFillPrice > 0 || t.pmSlug);
   console.log(`Trades with PM involvement: ${tradesWithPm.length}\n`);
 
-  // Build tokenId → trade mapping for trades that have pmTokenId
+  // Build tokenId -> trade mapping for trades that have pmTokenId
   const tokenToTrade = new Map<string, ArbTrade[]>();
   for (const t of trades) {
     if (t.pmTokenId) {
@@ -185,24 +185,24 @@ async function main() {
 
         if (hasPmCost && chainShares > 0) {
           if (Math.abs(chainShares - loggedShares) <= 1) {
-            console.log(`  ✓ MATCH: ${trade.match} (${trade.dir}) — log=${loggedShares} chain=${chainShares} pmCost=$${trade.pmCost.toFixed(2)}`);
+            console.log(`  [OK] MATCH: ${trade.match} (${trade.dir}) -- log=${loggedShares} chain=${chainShares} pmCost=$${trade.pmCost.toFixed(2)}`);
             matched++;
           } else {
-            console.log(`  ✗ MISMATCH: ${trade.match} (${trade.dir}) — log=${loggedShares} chain=${chainShares} pmCost=$${trade.pmCost.toFixed(2)}`);
+            console.log(`  [X] MISMATCH: ${trade.match} (${trade.dir}) -- log=${loggedShares} chain=${chainShares} pmCost=$${trade.pmCost.toFixed(2)}`);
             mismatches++;
           }
         } else if (!hasPmCost && chainShares > 0) {
-          console.log(`  ⚠ ON-CHAIN BUT NOT LOGGED: ${trade.match} (${trade.dir}) — chain=${chainShares} shares, log shows pmCost=$0`);
+          console.log(`  [!] ON-CHAIN BUT NOT LOGGED: ${trade.match} (${trade.dir}) -- chain=${chainShares} shares, log shows pmCost=$0`);
           onChainButNotLogged++;
         } else if (hasPmCost && chainShares === 0) {
-          console.log(`  ⚠ LOGGED BUT NOT ON-CHAIN: ${trade.match} (${trade.dir}) — log=${loggedShares} pmCost=$${trade.pmCost.toFixed(2)} but 0 on chain`);
+          console.log(`  [!] LOGGED BUT NOT ON-CHAIN: ${trade.match} (${trade.dir}) -- log=${loggedShares} pmCost=$${trade.pmCost.toFixed(2)} but 0 on chain`);
           loggedButNotOnChain++;
         }
       }
     }
   }
 
-  // Check trades with PM slug but no tokenId — resolve via gamma API
+  // Check trades with PM slug but no tokenId -- resolve via gamma API
   console.log("\n--- Resolving trades without pmTokenId via Gamma API ---\n");
   const tradesNeedingLookup = tradesWithPm.filter(t => !t.pmTokenId && t.pmSlug);
   for (const trade of tradesNeedingLookup) {
@@ -221,14 +221,14 @@ async function main() {
             const hasPmCost = trade.pmCost > 0 || trade.pmFillPrice > 0;
             if (hasPmCost) {
               if (Math.abs(chainShares - trade.shares) <= 1) {
-                console.log(`  ✓ MATCH (via slug): ${trade.match} (${trade.dir}) — log=${trade.shares} chain=${chainShares} pmCost=$${trade.pmCost.toFixed(2)}`);
+                console.log(`  [OK] MATCH (via slug): ${trade.match} (${trade.dir}) -- log=${trade.shares} chain=${chainShares} pmCost=$${trade.pmCost.toFixed(2)}`);
                 matched++;
               } else {
-                console.log(`  ✗ MISMATCH (via slug): ${trade.match} (${trade.dir}) — log=${trade.shares} chain=${chainShares} pmCost=$${trade.pmCost.toFixed(2)}`);
+                console.log(`  [X] MISMATCH (via slug): ${trade.match} (${trade.dir}) -- log=${trade.shares} chain=${chainShares} pmCost=$${trade.pmCost.toFixed(2)}`);
                 mismatches++;
               }
             } else {
-              console.log(`  ⚠ ON-CHAIN (via slug): ${trade.match} (${trade.dir}) — chain=${chainShares} shares but pmCost=$0 in log`);
+              console.log(`  [!] ON-CHAIN (via slug): ${trade.match} (${trade.dir}) -- chain=${chainShares} shares but pmCost=$0 in log`);
               onChainButNotLogged++;
             }
             foundOnChain = true;
@@ -236,10 +236,10 @@ async function main() {
           }
         }
         if (!foundOnChain && (trade.pmCost > 0 || trade.pmFillPrice > 0)) {
-          console.log(`  ⚠ NOT ON-CHAIN: ${trade.match} (${trade.dir}) — pmCost=$${trade.pmCost.toFixed(2)} but no chain transfer found`);
+          console.log(`  [!] NOT ON-CHAIN: ${trade.match} (${trade.dir}) -- pmCost=$${trade.pmCost.toFixed(2)} but no chain transfer found`);
           loggedButNotOnChain++;
         } else if (!foundOnChain && !trade.pmCost && !trade.pmFillPrice) {
-          // No PM cost and no on-chain — consistent, skip
+          // No PM cost and no on-chain -- consistent, skip
         }
       }
       await new Promise(r => setTimeout(r, 300)); // rate limit gamma API
@@ -261,7 +261,7 @@ async function main() {
       // Look up market name
       const marketName = await lookupMarket(tokenId);
       if (marketName) {
-        console.log(`  ? UNTRACKED: ${Math.round(chainData.inQty)} shares IN — ${marketName}`);
+        console.log(`  ? UNTRACKED: ${Math.round(chainData.inQty)} shares IN -- ${marketName}`);
         console.log(`    token=...${tokenId.slice(-15)} (${chainData.transfers.length} transfers)`);
         unmatchedCount++;
       }
@@ -277,10 +277,10 @@ async function main() {
   console.log(`  On-chain transfers scanned: ${allTransfers.length}`);
   console.log(`  Unique tokens: ${byToken.size}`);
   console.log(`  Trades with PM: ${tradesWithPm.length}`);
-  console.log(`  ✓ Matched (shares agree): ${matched}`);
-  console.log(`  ✗ Mismatches (shares differ): ${mismatches}`);
-  console.log(`  ⚠ On-chain but not logged (pmCost=0): ${onChainButNotLogged}`);
-  console.log(`  ⚠ Logged but not on-chain: ${loggedButNotOnChain}`);
+  console.log(`  [OK] Matched (shares agree): ${matched}`);
+  console.log(`  [X] Mismatches (shares differ): ${mismatches}`);
+  console.log(`  [!] On-chain but not logged (pmCost=0): ${onChainButNotLogged}`);
+  console.log(`  [!] Logged but not on-chain: ${loggedButNotOnChain}`);
   console.log(`  ? Untracked on-chain tokens: ${unmatchedCount}`);
 }
 

@@ -1,9 +1,35 @@
 /**
- * ttNameMatch.ts — Player/team name matching, sport abbreviation tables, and series classification.
- * Pure functions — no mutable state, no I/O, no side effects.
+ * ttNameMatch.ts -- Player/team name matching, sport abbreviation tables, and series classification.
+ * Pure functions -- no mutable state, no I/O, no side effects.
  */
 
-// ─── Entity name extraction from market titles ───────────────────────────────
+// --- Date extraction from PM slugs -------------------------------------------
+
+/** Extract YYYY-MM-DD date from a Polymarket slug.
+ *  Handles both "mlb-min-kc-2026-03-30" and "cs2-vit-navi-2026-03-29-game2". */
+export function parseDateFromPmSlug(slug: string): string {
+  const m = slug.match(/(\d{4}-\d{2}-\d{2})(?:-|$)/);
+  return m ? m[1] : "";
+}
+
+/** Check if two date strings refer to the same calendar day. Empty strings don't match. */
+export function datesMatch(kalDate: string, pmDate: string): boolean {
+  if (!kalDate || !pmDate) return false;
+  return kalDate === pmDate;
+}
+
+/** Check if two dates are within ±1 day. For tennis, Kalshi uses tournament-day dates
+ *  while PM uses ET calendar dates, causing consistent 1-day offsets for non-US events. */
+export function datesMatchTennis(kalDate: string, pmDate: string): boolean {
+  if (!kalDate || !pmDate) return false;
+  if (kalDate === pmDate) return true;
+  const kalMs = new Date(kalDate + "T12:00:00Z").getTime();
+  const pmMs = new Date(pmDate + "T12:00:00Z").getTime();
+  if (isNaN(kalMs) || isNaN(pmMs)) return false;
+  return Math.abs(kalMs - pmMs) <= 86_400_000; // ±1 day
+}
+
+// --- Entity name extraction from market titles -------------------------------
 
 export function extractEntityName(title: string): string {
   const mWin = title.match(/^Will\s+(.+?)\s+win\b/i);
@@ -24,7 +50,7 @@ export function pmSlugToken(fullName: string): string {
   return last.toLowerCase().slice(0, 7);
 }
 
-// ─── Date parsing from tickers and titles ────────────────────────────────────
+// --- Date parsing from tickers and titles ------------------------------------
 
 export const MONTHS: Record<string, string> = {
   JAN: "01", FEB: "02", MAR: "03", APR: "04", MAY: "05", JUN: "06",
@@ -35,6 +61,27 @@ export function parseDateFromTicker(ticker: string): string {
   const m = ticker.match(/-(\d{2})(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)(\d{2})/i);
   if (!m) return "";
   return `20${m[1]}-${MONTHS[m[2].toUpperCase()] ?? "01"}-${m[3].padStart(2, "0")}`;
+}
+
+/** Parse full start datetime (UTC) from Kalshi ticker.
+ *  Tickers encode date + optional time: KXCS2GAME-26APR031330HEROBB → Apr 3 13:30 UTC
+ *  Format: -YY{MON}{DD}{HHMM?}{teams}- where HHMM is optional 4-digit time.
+ *  Returns epoch ms, or 0 if not parseable. */
+export function parseStartTimeFromTicker(ticker: string): number {
+  // Match: YY + MON + DD + optional 4-digit time (HHMM) followed by non-digit (team names)
+  const m = ticker.match(/-(\d{2})(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)(\d{2})(\d{4})?/i);
+  if (!m) return 0;
+  const year = 2000 + parseInt(m[1], 10);
+  const month = MONTHS[m[2].toUpperCase()] ?? "01";
+  const day = m[3].padStart(2, "0");
+  if (m[4]) {
+    // Has time: HHMM
+    const hh = m[4].slice(0, 2);
+    const mm = m[4].slice(2, 4);
+    return new Date(`${year}-${month}-${day}T${hh}:${mm}:00Z`).getTime();
+  }
+  // Date only — return midnight UTC (we can't tell if match started without time)
+  return 0;
 }
 
 export function matchCodePrefix(ticker: string): string {
@@ -50,7 +97,7 @@ export function parseDateFromEventTitle(title: string): string {
   return `${year}-${month}-${m[2].padStart(2, "0")}`;
 }
 
-// ─── Series → PM slug prefix mapping ─────────────────────────────────────────
+// --- Series -> PM slug prefix mapping -----------------------------------------
 
 export const SERIES_TO_PM_PREFIX: Record<string, string> = {
   // Esports
@@ -86,18 +133,18 @@ export const SERIES_TO_PM_PREFIX: Record<string, string> = {
   // College basketball
   KXNCAAMBGAME: "cbb",   KXNCAAMBSPREAD: "cbb",
   KXNCAAWBGAME: "cwbb",
-  // Soccer — Top 5 leagues
+  // Soccer -- Top 5 leagues
   KXEPLGAME: "epl",         KXEPLSPREAD: "epl",         KXEPLTOTAL: "epl",
   KXLALIGAGAME: "lal",      KXLALIGASPREAD: "lal",      KXLALIGATOTAL: "lal",
   KXBUNDESLIGAGAME: "bun",  KXBUNDESLIGASPREAD: "bun",  KXBUNDESLIGATOTAL: "bun",
   KXSERIEAGAME: "sea",      KXSERIEASPREAD: "sea",      KXSERIEATOTAL: "sea",
   KXLIGUE1GAME: "fl1",      KXLIGUE1SPREAD: "fl1",      KXLIGUE1TOTAL: "fl1",
-  // Soccer — MLS
+  // Soccer -- MLS
   KXMLSGAME: "mls",         KXMLSSPREAD: "mls",         KXMLSTOTAL: "mls",
-  // Soccer — European cups
+  // Soccer -- European cups
   KXUCLGAME: "ucl",         KXUCLSPREAD: "ucl",         KXUCLTOTAL: "ucl",
   KXUELGAME: "uel",         KXUELSPREAD: "uel",         KXUELTOTAL: "uel",
-  // Soccer — Other European
+  // Soccer -- Other European
   KXEFLCHAMPIONSHIPGAME: "elc",
   KXSCOTTISHPREMGAME: "scop",
   KXEREDIVISIEGAME: "ere",
@@ -109,11 +156,11 @@ export const SERIES_TO_PM_PREFIX: Record<string, string> = {
   KXSWISSLEAGUEGAME: "swi",
   KXDENSUPERLIGAGAME: "den",
   KXHNLGAME: "cro",
-  // Soccer — Second divisions
+  // Soccer -- Second divisions
   KXBUNDESLIGA2GAME: "bl2",
   KXLALIGA2GAME: "es2",
   KXSERIEBGAME: "itsb",
-  // Soccer — Americas
+  // Soccer -- Americas
   KXLIGAMXGAME: "mex",
   KXBRASILEIROGAME: "bra",     KXBRASILEIROSPREAD: "bra",   KXBRASILEIROTOTAL: "bra",
   KXARGPREMDIVGAME: "arg",
@@ -126,7 +173,7 @@ export const SERIES_TO_PM_PREFIX: Record<string, string> = {
   KXUSLGAME: "usl",
   KXNWSLGAME: "nwsl",
   KXCONCACAFCCUPGAME: "conc",
-  // Soccer — Asia / Middle East / Other
+  // Soccer -- Asia / Middle East / Other
   KXSAUDIPLGAME: "spl",       KXSAUDIPLSPREAD: "spl",     KXSAUDIPLTOTAL: "spl",
   KXKLEAGUEGAME: "kor",
   KXJLEAGUEGAME: "j1-100",
@@ -134,17 +181,17 @@ export const SERIES_TO_PM_PREFIX: Record<string, string> = {
   KXCHNSLGAME: "chi",
   KXTHAIL1GAME: "tha",
   KXAFCCLGAME: "afc",
-  // Soccer — International
+  // Soccer -- International
   KXINTLFRIENDLYGAME: "fif",
   KXFIFAGAME: "uef",
-  // Soccer — Cups
+  // Soccer -- Cups
   KXFACUPGAME: "efa",
   KXEFLCUPGAME: "efl",
-  // Soccer — Women
+  // Soccer -- Women
   KXEWSLGAME: "ewsl",
 };
 
-// ─── Series classification Sets ──────────────────────────────────────────────
+// --- Series classification Sets ----------------------------------------------
 
 export const TENNIS_SERIES = new Set(["KXATPMATCH", "KXWTAMATCH", "KXATPCHALLENGERMATCH", "KXWTACHALLENGERMATCH"]);
 export const NBA_SERIES = new Set(["KXNBAGAME"]);
@@ -201,7 +248,7 @@ export const SOCCER_SERIES = new Set([
   "KXSAUDIPLSPREAD", "KXSAUDIPLTOTAL",
 ]);
 
-// ─── Team abbreviation tables ────────────────────────────────────────────────
+// --- Team abbreviation tables ------------------------------------------------
 
 export const NHL_TEAM_ABBRS: Record<string, string> = {
   "anaheim ducks": "ana", "arizona coyotes": "ari", "boston bruins": "bos",
@@ -323,7 +370,7 @@ export const MLB_TEAM_ABBRS: Record<string, string> = {
   "washington nationals": "wsh", "nationals": "wsh",
 };
 
-// ─── CBB name aliases ────────────────────────────────────────────────────────
+// --- CBB name aliases --------------------------------------------------------
 
 export const CBB_NAME_ALIASES: Record<string, string> = {
   "uconn": "connecticut",
@@ -343,7 +390,7 @@ export const CBB_NAME_ALIASES: Record<string, string> = {
   "utsa": "texas san antonio",
 };
 
-// ─── Name matching functions ─────────────────────────────────────────────────
+// --- Name matching functions -------------------------------------------------
 
 export function normalizeName(name: string): string {
   return name.toLowerCase().replace(/[^a-z0-9 ]/g, "").replace(/\s+/g, " ").trim();
@@ -385,7 +432,7 @@ export function fuzzyIntlNamesMatch(kalName: string, pmName: string): boolean {
   return false;
 }
 
-// ─── CBB name matching ───────────────────────────────────────────────────────
+// --- CBB name matching -------------------------------------------------------
 
 export function cbbExpandName(name: string): string {
   const n = name.toLowerCase().trim();
@@ -401,7 +448,7 @@ export function cbbNamesMatch(kalName: string, pmOutcome: string): boolean {
   return false;
 }
 
-// ─── Sport-specific abbreviation lookups ─────────────────────────────────────
+// --- Sport-specific abbreviation lookups -------------------------------------
 
 export function soccerNameToAbbr(entityName: string): string {
   const norm = entityName.toLowerCase().trim().replace(/^the\s+/, "");

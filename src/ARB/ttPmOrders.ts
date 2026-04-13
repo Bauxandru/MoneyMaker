@@ -1,9 +1,9 @@
 /**
- * ttPmOrders.ts — Polymarket CLOB client, PM order placement functions,
+ * ttPmOrders.ts -- Polymarket CLOB client, PM order placement functions,
  * Kalshi IOC order builder, depth sweep, and PM order status polling.
  *
  * Module-level mutable state:
- *   _pmClientCache — cached ClobClient instance (30min TTL)
+ *   _pmClientCache -- cached ClobClient instance (30min TTL)
  */
 
 import { ClobClient, OrderType, Side } from "@polymarket/clob-client";
@@ -11,7 +11,8 @@ import { Wallet } from "@ethersproject/wallet";
 import { resolvePolyApiCreds } from "../polyAuth.js";
 import { fetchJsonWithRetry } from "../http.js";
 import { sleep, normCents, normDollarsOrCents, bestAskFromSide, bestBidFromSide, pickString } from "../utils.js";
-import { getOnChainBalance } from "../polyChain.js";
+import { getOnChainBalance, getUsdcBalance } from "../polyChain.js";
+import { waitForPmFillWs, isPmUserWsReady } from "./ttWebSocket.js";
 import {
   kalFetch, polyClobFetch, retryOpts,
   PM_ORDER_TYPE, PM_MARKETABLE_MIN_VALUE,
@@ -20,7 +21,7 @@ import type {
   KalshiMarket, PmOrderResponse, ClobBookEntry, WatchEntry,
 } from "./ttTypes.js";
 
-// ─── PM client factory ────────────────────────────────────────────────────────
+// --- PM client factory --------------------------------------------------------
 
 let _pmClientCache: { client: ClobClient; createdAt: number } | null = null;
 const PM_CLIENT_TTL = 30 * 60_000;
@@ -41,7 +42,7 @@ export async function createPmClient(): Promise<{ client: ClobClient; createdAt:
   return _pmClientCache;
 }
 
-// ─── PM safe price (2dp cost constraint) ──────────────────────────────────────
+// --- PM safe price (2dp cost constraint) --------------------------------------
 
 export function pmSafePrice(price: number, shares: number): number {
   if (shares <= 0) return price;
@@ -49,20 +50,36 @@ export function pmSafePrice(price: number, shares: number): number {
   return costCents / 100 / shares;
 }
 
-// ─── PM order functions ──────────────────────────────────────────────────────
+// --- PM order timeout wrapper ------------------------------------------------
+
+const PM_ORDER_TIMEOUT_MS = 30_000; // 30s max for any PM CLOB order call
+
+function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  return Promise.race([
+    promise,
+    new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms)
+    ),
+  ]);
+}
+
+// --- PM order functions ------------------------------------------------------
 
 export async function placePmOrder(
   tokenId: string, price: number, shares: number,
   tickSize: number, negRisk: boolean, dryRun: boolean
 ): Promise<unknown> {
-  if (dryRun) return { dryRun: true, tokenId: tokenId.slice(0, 12) + "...", price, shares };
+  if (dryRun) return { dryRun: true, tokenId: tokenId.slice(0, 12) + "...", price, shares, type: "FAK" };
   const { client } = await createPmClient();
+  // Use FAK (Fill And Kill): fills as much as possible, cancels remainder.
+  // FOK rejects the entire order if the book can't fill 100% — causes unnecessary failures
+  // when the book has slight shortfall (e.g., 10.75 of 11 shares available).
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  return (client.createAndPostOrder as any)(
+  return withTimeout((client.createAndPostOrder as any)(
     { tokenID: tokenId, price: pmSafePrice(price, shares), size: shares, side: Side.BUY },
     { tickSize: tickSize.toString(), negRisk },
-    PM_ORDER_TYPE
-  );
+    OrderType.FAK
+  ), PM_ORDER_TIMEOUT_MS, "placePmOrder");
 }
 
 export async function placePmGTCAsk(
@@ -72,11 +89,11 @@ export async function placePmGTCAsk(
   if (dryRun) return { dryRun: true, tokenId: tokenId.slice(0, 12) + "...", price, shares, side: "SELL", type: "GTC" };
   const { client } = await createPmClient();
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  return (client.createAndPostOrder as any)(
+  return withTimeout((client.createAndPostOrder as any)(
     { tokenID: tokenId, price: pmSafePrice(price, shares), size: shares, side: Side.SELL },
     { tickSize: tickSize.toString(), negRisk },
     OrderType.GTC
-  );
+  ), PM_ORDER_TIMEOUT_MS, "placePmGTCAsk");
 }
 
 export async function placePmGTCBid(
@@ -86,45 +103,51 @@ export async function placePmGTCBid(
   if (dryRun) return { dryRun: true, tokenId: tokenId.slice(0, 12) + "...", price, shares, side: "BUY", type: "GTC" };
   const { client } = await createPmClient();
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  return (client.createAndPostOrder as any)(
+  return withTimeout((client.createAndPostOrder as any)(
     { tokenID: tokenId, price: pmSafePrice(price, shares), size: shares, side: Side.BUY },
     { tickSize: tickSize.toString(), negRisk },
     OrderType.GTC
-  );
+  ), PM_ORDER_TIMEOUT_MS, "placePmGTCBid");
 }
 
 export async function placePmFOK(
   tokenId: string, price: number, shares: number,
   tickSize: number, negRisk: boolean, dryRun: boolean
 ): Promise<unknown> {
-  if (dryRun) return { dryRun: true, tokenId: tokenId.slice(0, 12) + "...", price, shares, type: "FOK" };
+  // FAK (Fill And Kill): fills as much as possible, cancels remainder.
+  // Better than FOK which kills the ENTIRE order if not 100% fillable.
+  // Avoids pm-delayed-zero failures when book has 10.75 of 11 shares.
+  if (dryRun) return { dryRun: true, tokenId: tokenId.slice(0, 12) + "...", price, shares, type: "FAK" };
   const { client } = await createPmClient();
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  return (client.createAndPostOrder as any)(
+  return withTimeout((client.createAndPostOrder as any)(
     { tokenID: tokenId, price: pmSafePrice(price, shares), size: shares, side: Side.BUY },
     { tickSize: tickSize.toString(), negRisk },
-    OrderType.FOK
-  );
+    OrderType.FAK
+  ), PM_ORDER_TIMEOUT_MS, "placePmFOK");
 }
 
 export async function placePmFOKSell(
   tokenId: string, price: number, shares: number,
   tickSize: number, negRisk: boolean, dryRun: boolean
 ): Promise<unknown> {
-  if (dryRun) return { dryRun: true, tokenId: tokenId.slice(0, 12) + "...", price, shares, side: "SELL", type: "FOK" };
+  if (dryRun) return { dryRun: true, tokenId: tokenId.slice(0, 12) + "...", price, shares, side: "SELL", type: "FAK" };
   const { client } = await createPmClient();
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  return (client.createAndPostOrder as any)(
+  return withTimeout((client.createAndPostOrder as any)(
     { tokenID: tokenId, price: pmSafePrice(price, shares), size: shares, side: Side.SELL },
     { tickSize: tickSize.toString(), negRisk },
-    OrderType.FOK
-  );
+    OrderType.FAK
+  ), PM_ORDER_TIMEOUT_MS, "placePmFOKSell");
 }
 
 export async function cancelPmOrder(orderId: string, dryRun: boolean): Promise<void> {
   if (dryRun) { console.log(`  [DRY] cancelPmOrder ${orderId}`); return; }
   const { client } = await createPmClient();
-  await (client as unknown as { cancelOrder(p: { orderID: string }): Promise<unknown> }).cancelOrder({ orderID: orderId });
+  await withTimeout(
+    (client as unknown as { cancelOrder(p: { orderID: string }): Promise<unknown> }).cancelOrder({ orderID: orderId }),
+    PM_ORDER_TIMEOUT_MS, "cancelPmOrder"
+  );
 }
 
 export async function cancelAllPmOrdersForToken(tokenId: string): Promise<number> {
@@ -144,9 +167,128 @@ export async function cancelAllPmOrdersForToken(tokenId: string): Promise<number
   return cancelled;
 }
 
+/**
+ * Get actual PM fill cost from CLOB getTrades() API.
+ * Returns exact per-fill prices from the exchange — no WS inversion issues.
+ * Falls back to USDC balance delta if CLOB fails.
+ *
+ * @param tokenId - PM token that was bought
+ * @param orderId - order ID to match against (optional, improves accuracy)
+ * @param expectedShares - how many shares we ordered
+ * @param preUsdcBalance - USDC balance before the order (for fallback)
+ * @param limitPrice - the limit price we placed the order at (for fallback)
+ * @returns { avgPrice, totalCost, totalShares } or null if all methods fail
+ */
+export async function getActualPmFillCost(
+  tokenId: string,
+  orderId: string | null,
+  expectedShares: number,
+  preUsdcBalance: number,
+  limitPrice: number,
+): Promise<{ avgPrice: number; totalCost: number; totalShares: number } | null> {
+  // -- Primary: CLOB getTrades() API --
+  // Fetches all recent trades and filters to our token + BUY side + CONFIRMED status.
+  // Matches by order_id if available, otherwise by token + timestamp proximity.
+  try {
+    const { client } = await createPmClient();
+    const allTrades = await withTimeout(
+      (client.getTrades() as Promise<unknown>),
+      10_000, "getActualPmFillCost"
+    ) as Array<{
+      asset_id: string; size: string; price: string; fee_rate_bps: string;
+      side: string; status: string; taker_order_id?: string; order_id?: string;
+    }>;
+
+    if (allTrades && allTrades.length > 0) {
+      // Filter to our token, BUY side, CONFIRMED status
+      let fills = allTrades.filter(t =>
+        t.asset_id === tokenId && t.side === "BUY" &&
+        (t.status === "CONFIRMED" || t.status === "MATCHED" || t.status === "MINED")
+      );
+
+      // If we have an order ID, filter to that specific order
+      if (orderId && fills.length > 0) {
+        const orderFills = fills.filter(t =>
+          t.taker_order_id === orderId || t.order_id === orderId
+        );
+        if (orderFills.length > 0) fills = orderFills;
+      }
+
+      if (fills.length > 0) {
+        // Sum up actual fill cost
+        let totalCost = 0;
+        let totalShares = 0;
+        for (const f of fills) {
+          const price = Number(f.price);
+          const size = Number(f.size);
+          if (price > 0 && size > 0) {
+            totalCost += price * size;
+            totalShares += size;
+          }
+        }
+        if (totalShares > 0) {
+          const avgPrice = totalCost / totalShares;
+          // Sanity: avg price should be within 20% of limit
+          if (Math.abs(avgPrice - limitPrice) < 0.20) {
+            console.log(`  [PM COST] CLOB getTrades: ${totalShares.toFixed(2)} shares @ avg ${(avgPrice * 100).toFixed(1)}c = $${totalCost.toFixed(2)} (${fills.length} fills)`);
+            return {
+              avgPrice: Math.round(avgPrice * 10000) / 10000,
+              totalCost: Math.round(totalCost * 100) / 100,
+              totalShares: Math.round(totalShares),
+            };
+          }
+          // Price might be from complement side — try inverting
+          const invAvg = 1 - avgPrice;
+          if (Math.abs(invAvg - limitPrice) < 0.20) {
+            const invCost = invAvg * totalShares;
+            console.log(`  [PM COST] CLOB getTrades (inverted): ${totalShares.toFixed(2)} shares @ avg ${(invAvg * 100).toFixed(1)}c = $${invCost.toFixed(2)}`);
+            return {
+              avgPrice: Math.round(invAvg * 10000) / 10000,
+              totalCost: Math.round(invCost * 100) / 100,
+              totalShares: Math.round(totalShares),
+            };
+          }
+          console.warn(`  [PM COST] CLOB price ${(avgPrice * 100).toFixed(1)}c too far from limit ${(limitPrice * 100).toFixed(1)}c — skipping CLOB data`);
+        }
+      }
+    }
+  } catch (e) {
+    console.warn(`  [PM COST] CLOB getTrades failed: ${(e as Error).message}`);
+  }
+
+  // -- Fallback: USDC balance delta --
+  // Compare USDC balance before and after to get exact dollars spent.
+  if (preUsdcBalance > 0) {
+    try {
+      const postBalance = await getUsdcBalance();
+      if (postBalance >= 0) {
+        const usdcSpent = preUsdcBalance - postBalance;
+        if (usdcSpent > 0 && usdcSpent < expectedShares * 2) { // sanity: not more than $2/share
+          const avgPrice = usdcSpent / expectedShares;
+          console.log(`  [PM COST] USDC delta: spent $${usdcSpent.toFixed(2)} on ${expectedShares} shares = avg ${(avgPrice * 100).toFixed(1)}c`);
+          return {
+            avgPrice: Math.round(avgPrice * 10000) / 10000,
+            totalCost: Math.round(usdcSpent * 100) / 100,
+            totalShares: expectedShares,
+          };
+        }
+        console.warn(`  [PM COST] USDC delta unreliable: spent=$${usdcSpent.toFixed(2)} for ${expectedShares} shares`);
+      }
+    } catch (e) {
+      console.warn(`  [PM COST] USDC balance check failed: ${(e as Error).message}`);
+    }
+  }
+
+  console.warn(`  [PM COST] All methods failed — falling back to limit price ${(limitPrice * 100).toFixed(1)}c`);
+  return null; // caller will use limit price
+}
+
 export async function getPmOrderFills(orderId: string): Promise<{ filledShares: number; status: string }> {
   const { client } = await createPmClient();
-  const order = await (client as unknown as { getOrder(id: string): Promise<PmOrderResponse & { size_matched?: number; filled?: number }> }).getOrder(orderId);
+  const order = await withTimeout(
+    (client as unknown as { getOrder(id: string): Promise<PmOrderResponse & { size_matched?: number; filled?: number }> }).getOrder(orderId),
+    PM_ORDER_TIMEOUT_MS, "getPmOrderFills"
+  );
   const filledShares = Number(order.size_matched ?? order.filled ?? 0);
   const status = String(order.status ?? "unknown");
   return { filledShares, status };
@@ -172,43 +314,50 @@ export async function postPreSignedPmOrder(signedOrder: unknown): Promise<unknow
   return (client as any).postOrder(signedOrder, PM_ORDER_TYPE);
 }
 
-// ─── PM order status polling ──────────────────────────────────────────────────
+// --- PM order status polling --------------------------------------------------
 
 export async function waitForPmOrderFill(
   orderId: string,
-  timeoutMs = 12_000,
-  tokenId?: string,
-  preBalance = 0
+  timeoutMs = 15_000,
+  _tokenId?: string,
+  _preBalance = 0
 ): Promise<"matched" | "cancelled" | "timeout"> {
-  const deadline = Date.now() + timeoutMs;
-  const pollInterval = 500;
-
-  while (Date.now() < deadline) {
-    await sleep(pollInterval);
-    if (tokenId) {
-      try {
-        const bal = await getOnChainBalance(tokenId);
-        if (bal > preBalance) {
-          console.log(`  [PM FILL] On-chain balance confirms fill: ${bal} shares (was ${preBalance} before order)`);
-          return "matched";
-        }
-      } catch { /* fall through to CLOB API */ }
+  // Primary: wait for fill via PM User WebSocket — require on-chain confirmation.
+  // MATCHED means CLOB accepted but on-chain not yet settled.
+  // CONFIRMED/MINED means on-chain settled.
+  if (isPmUserWsReady()) {
+    const evt = await waitForPmFillWs(orderId, timeoutMs); // requireMined=true (default)
+    if (evt) {
+      const status = evt.status?.toUpperCase();
+      if (status === "CONFIRMED" || status === "MINED") {
+        console.log(`  [PM FILL] WS on-chain confirmed: ${evt.size} shares @ ${evt.price} (status=${status})`);
+        return "matched";
+      }
+      if (status === "MATCHED") {
+        console.log(`  [PM FILL] WS MATCHED but not on-chain (${evt.size} shares @ ${evt.price}) — treating as unconfirmed`);
+        // Fall through to REST check — CLOB says matched but on-chain unconfirmed
+      }
+      if (status === "FAILED") return "cancelled";
     }
-    try {
-      const { client } = await createPmClient();
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const raw = await (client as any).getOrder(orderId);
-      const resp = raw as PmOrderResponse;
-      const order = resp?.order ?? resp;
-      const status = String(order?.status ?? order?.order_status ?? "");
-      if (status === "matched") return "matched";
-      if (status === "cancelled" || status === "unmatched" || status === "rejected") return "cancelled";
-    } catch { /* retry */ }
+    // WS timed out -- fall through to one REST check
   }
+
+  // Fallback: single REST check (not a polling loop)
+  try {
+    const { client } = await createPmClient();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const raw = await (client as any).getOrder(orderId);
+    const resp = raw as PmOrderResponse;
+    const order = resp?.order ?? resp;
+    const status = String(order?.status ?? order?.order_status ?? "");
+    if (status === "matched") return "matched";
+    if (status === "cancelled" || status === "unmatched" || status === "rejected") return "cancelled";
+  } catch { /* best effort */ }
+
   return "timeout";
 }
 
-// ─── Kalshi IOC order builder ─────────────────────────────────────────────────
+// --- Kalshi IOC order builder -------------------------------------------------
 
 export type KalshiOrderRequest = {
   ticker: string;
@@ -220,13 +369,15 @@ export type KalshiOrderRequest = {
   no_price?: number;
   count: number;
   count_fp: string;
-  buy_max_cost: number;
+  buy_max_cost?: number;
   client_order_id?: string;
 };
 
 export function buildKalshiIOCOrder(ticker: string, limitPriceDec: number, count: number, side: "yes" | "no" = "yes"): KalshiOrderRequest {
   const cents = Math.max(1, Math.min(99, Math.round(limitPriceDec * 100)));
-  const maxCost = Math.round(count * cents);
+  // Do NOT set buy_max_cost — Kalshi forces FOK behavior when max_cost is present,
+  // rejecting the entire order if it can't fill 100%. Without it, true IOC behavior:
+  // fills what's available, cancels the rest.
   return {
     ticker,
     side,
@@ -237,11 +388,10 @@ export function buildKalshiIOCOrder(ticker: string, limitPriceDec: number, count
     no_price: side === "no" ? cents : undefined,
     count,
     count_fp: `${count}.00`,
-    buy_max_cost: maxCost,
   };
 }
 
-// ─── Orderbook depth helpers ──────────────────────────────────────────────────
+// --- Orderbook depth helpers --------------------------------------------------
 
 export function deriveYesAsks(noBids: [number, number][]): [number, number][] {
   return noBids
@@ -290,7 +440,7 @@ export function sweepPmDepth(
   return { totalQty, avgPrice: totalQty > 0 ? totalCost / totalQty : 0 };
 }
 
-// ─── PM / Kalshi fetch helpers ───────────────────────────────────────────────
+// --- PM / Kalshi fetch helpers -----------------------------------------------
 
 export async function fetchPmAsk(tokenId: string, clobBase: string): Promise<number | null> {
   try {

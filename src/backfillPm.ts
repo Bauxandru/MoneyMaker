@@ -2,7 +2,7 @@
  * Backfill untracked PM fills into arb_trades.json.
  * - Resolves each token to a market via Gamma API
  * - Checks settlement outcome (resolved_at, winner)
- * - Calculates P&L: won → shares - cost, lost → -cost
+ * - Calculates P&L: won -> shares - cost, lost -> -cost
  * - Creates "pm-backfill" trade records
  */
 import dotenv from "dotenv";
@@ -193,11 +193,11 @@ async function main() {
     const fillTs =
       data.fills[0]?.match_time || data.fills[0]?.created_at || "0";
 
-    const sym = won === true ? "✓ WON" : won === false ? "✗ LOST" : "? OPEN";
+    const sym = won === true ? "[OK] WON" : won === false ? "[X] LOST" : "? OPEN";
     const pnlStr =
       pnl >= 0 ? `+$${pnl.toFixed(2)}` : `-$${Math.abs(pnl).toFixed(2)}`;
     console.log(
-      `  ${sym.padEnd(7)} ${shares.toString().padStart(4)} shares @ $${price.toFixed(2)} = $${cost.toFixed(2).padStart(7)} → ${pnlStr.padStart(8)} | ${ourOutcome.padEnd(20).slice(0, 20)} | ${question.slice(0, 60)}`
+      `  ${sym.padEnd(7)} ${shares.toString().padStart(4)} shares @ $${price.toFixed(2)} = $${cost.toFixed(2).padStart(7)} -> ${pnlStr.padStart(8)} | ${ourOutcome.padEnd(20).slice(0, 20)} | ${question.slice(0, 60)}`
     );
 
     if (won !== null) {
@@ -226,13 +226,13 @@ async function main() {
       resolutionMethod: resMethod,
       tradeTs: fillTs,
       resolvedTs: isResolved ? String(Math.floor(Date.now() / 1000)) : undefined,
-      _backfillNote: "Auto-created from untracked PM CLOB fills — no Kalshi counterpart found",
+      _backfillNote: "Auto-created from untracked PM CLOB fills -- no Kalshi counterpart found",
     };
 
     newTrades.push(trade);
   }
 
-  console.log(`\n${"═".repeat(80)}`);
+  console.log(`\n${"=".repeat(80)}`);
   console.log(`Resolved: ${resolved} | Unresolved: ${unresolved} | Skipped (non-esports): ${skippedNonEsports}`);
   console.log(`Total P&L from backfilled trades: $${totalPnl.toFixed(2)}`);
   console.log(`New trade records to add: ${newTrades.length}`);

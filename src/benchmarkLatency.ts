@@ -14,7 +14,7 @@ dotenv.config();
 
 type AnyRecord = Record<string, unknown>;
 
-// ─── Kalshi auth (inline, same as kalshiTrade.ts) ────────────────────────────
+// --- Kalshi auth (inline, same as kalshiTrade.ts) ----------------------------
 
 function loadPrivateKey(): string {
   if (process.env.KALSHI_PRIVATE_KEY) {
@@ -55,7 +55,7 @@ async function kalshiSignedGet(apiPath: string): Promise<AnyRecord> {
   }) as Promise<AnyRecord>;
 }
 
-// ─── Helpers ─────────────────────────────────────────────────────────────────
+// --- Helpers -----------------------------------------------------------------
 
 const MONTHS: Record<string, string> = {
   JAN: "01", FEB: "02", MAR: "03", APR: "04", MAY: "05", JUN: "06",
@@ -78,7 +78,7 @@ function pmSlugToken(fullName: string): string {
   return last.toLowerCase().slice(0, 7);
 }
 
-// ─── Benchmark framework ─────────────────────────────────────────────────────
+// --- Benchmark framework -----------------------------------------------------
 
 type BenchResult = {
   label: string;
@@ -115,7 +115,7 @@ async function benchmark(
 function printTable(results: BenchResult[]) {
   const hdr = `${"Endpoint".padEnd(50)} ${"Min".padStart(8)} ${"Avg".padStart(8)} ${"Max".padStart(8)} ${"P95".padStart(8)} ${"N".padStart(4)}`;
   console.log(hdr);
-  console.log("─".repeat(hdr.length));
+  console.log("-".repeat(hdr.length));
   for (const r of results) {
     console.log(
       `${r.label.padEnd(50)} ${fmt(r.min)} ${fmt(r.avg)} ${fmt(r.max)} ${fmt(r.p95)} ${String(r.samples.length).padStart(4)}`
@@ -127,12 +127,12 @@ function fmt(ms: number): string {
   return `${ms.toFixed(1)}ms`.padStart(8);
 }
 
-// ─── Main ────────────────────────────────────────────────────────────────────
+// --- Main --------------------------------------------------------------------
 
 async function main() {
   console.log("=== API Latency Benchmark ===\n");
 
-  // ── Discovery: find a real open Kalshi match for testing ──
+  // -- Discovery: find a real open Kalshi match for testing --
   console.log("Finding a live market for testing...\n");
 
   let kalTicker = "";
@@ -178,7 +178,7 @@ async function main() {
             }
           }
         } catch {
-          console.log("  PM slug lookup failed — will skip PM book benchmark.");
+          console.log("  PM slug lookup failed -- will skip PM book benchmark.");
         }
         break;
       }
@@ -195,7 +195,7 @@ async function main() {
   const results: BenchResult[] = [];
   const iters = 5;
 
-  // ── 1) Kalshi batch market scan ──
+  // -- 1) Kalshi batch market scan --
   console.log(`\nBenchmarking (${iters} iterations each)...\n`);
 
   const seriesUsed = kalTicker.split("-")[0];
@@ -205,21 +205,21 @@ async function main() {
     iters
   ));
 
-  // ── 2) Kalshi individual market ──
+  // -- 2) Kalshi individual market --
   results.push(await benchmark(
     `KAL GET /markets/${kalTicker.slice(0, 25)}...`,
     () => fetchJsonWithRetry(`${BASE}/markets/${kalTicker}`),
     iters
   ));
 
-  // ── 3) Kalshi orderbook (authenticated) ──
+  // -- 3) Kalshi orderbook (authenticated) --
   results.push(await benchmark(
     `KAL GET /markets/{ticker}/orderbook (auth)`,
     () => kalshiSignedGet(`/markets/${kalTicker}/orderbook`),
     iters
   ));
 
-  // ── 4) PM CLOB book ──
+  // -- 4) PM CLOB book --
   if (pmTokenId) {
     results.push(await benchmark(
       `PM GET /book?token_id=...`,
@@ -230,7 +230,7 @@ async function main() {
     console.log("  Skipping PM book (no token ID found)\n");
   }
 
-  // ── 5) PM positions (data API) ──
+  // -- 5) PM positions (data API) --
   try {
     const w = new Wallet(process.env.POLY_WALLET_PRIVATE_KEY ?? "");
     const funder = process.env.POLY_FUNDER || w.address;
@@ -247,7 +247,7 @@ async function main() {
     console.log("  Skipping PM positions (no wallet key)\n");
   }
 
-  // ── 6) RSA-SHA256 signature (CPU only) ──
+  // -- 6) RSA-SHA256 signature (CPU only) --
   const pk = loadPrivateKey();
   results.push(await benchmark(
     `RSA-SHA256 signRequest (CPU only)`,
@@ -255,11 +255,11 @@ async function main() {
     100
   ));
 
-  // ── Results ──
+  // -- Results --
   console.log("\n=== Results ===\n");
   printTable(results);
 
-  // ── Critical path estimates ──
+  // -- Critical path estimates --
   const kalBook = results.find(r => r.label.includes("orderbook"))?.avg ?? 0;
   const kalOrder = results.find(r => r.label.includes("orderbook"))?.avg ?? 0; // proxy: same server
   const kalVerify = results.find(r => r.label.includes("orderbook"))?.avg ?? 0; // proxy
