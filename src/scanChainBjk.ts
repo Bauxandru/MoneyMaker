@@ -3,7 +3,7 @@
  */
 const RPC = "https://polygon.drpc.org";
 const CTF = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045";
-const WALLET = "0xba27693a36f959e5ad3a6b3819660f1a75523f88";
+const WALLET = process.env.POLY_FUNDER || "";
 const WALLET_PADDED = "0x" + "0".repeat(24) + WALLET.replace("0x", "");
 const TOPIC0 = "0xc3d58168c5ae7397731d063d5bbf3d657854427343f4c083240f7aacaa2d0f62";
 

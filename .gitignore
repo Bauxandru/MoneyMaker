@@ -4,6 +4,7 @@ dist/
 # Secrets — never push these
 .env
 .env.*
+.env.derived
 secrets/
 settings.csv
 certs/

@@ -40,9 +40,16 @@ async function main() {
     }
   }
 
-  console.log("POLY_API_KEY=" + creds.key);
-  console.log("POLY_API_SECRET=" + creds.secret);
-  console.log("POLY_PASSPHRASE=" + creds.passphrase);
+  const mask = (s: string) => s.slice(0, 4) + "****" + s.slice(-4);
+  console.log("POLY_API_KEY=" + mask(creds.key));
+  console.log("POLY_API_SECRET=" + mask(creds.secret));
+  console.log("POLY_PASSPHRASE=" + mask(creds.passphrase));
+  console.log("\n[!] Values masked for safety. Full credentials written to .env.derived");
+  const fs = await import("fs");
+  fs.writeFileSync(".env.derived",
+    `POLY_API_KEY=${creds.key}\nPOLY_API_SECRET=${creds.secret}\nPOLY_PASSPHRASE=${creds.passphrase}\n`,
+    { mode: 0o600 });
+  console.log("[OK] Saved to .env.derived (owner-read only)");
 }
 
 main().catch((err) => {
