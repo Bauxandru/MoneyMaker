@@ -326,10 +326,12 @@ export function connectKalshiWs(): void {
         if (!ticker) return;
         const book: WsLiveBook = { yes: new Map(), no: new Map(), ts: Date.now() };
         for (const [p, s] of (msg.msg.yes_dollars_fp || msg.msg.yes || [])) {
-          book.yes.set(Math.round(Number(p) * 100), Number(s));
+          const pc = Math.round(Number(p) * 100), sz = Number(s);
+          if (Number.isFinite(pc) && pc > 0 && pc < 100 && Number.isFinite(sz) && sz > 0) book.yes.set(pc, sz);
         }
         for (const [p, s] of (msg.msg.no_dollars_fp || msg.msg.no || [])) {
-          book.no.set(Math.round(Number(p) * 100), Number(s));
+          const pc = Math.round(Number(p) * 100), sz = Number(s);
+          if (Number.isFinite(pc) && pc > 0 && pc < 100 && Number.isFinite(sz) && sz > 0) book.no.set(pc, sz);
         }
         wsKalBooks.set(ticker, book);
         { const ya = getWsKalBestAsk(ticker, "yes"); if (ya !== null) recordPrice(`kal:${ticker}:yes`, ya); }
@@ -342,6 +344,7 @@ export function connectKalshiWs(): void {
         const side = msg.msg.side === "no" ? book.no : book.yes;
         const cents = Math.round(Number(msg.msg.price_dollars || msg.msg.price || 0) * 100);
         const delta = Number(msg.msg.delta_fp || msg.msg.delta || 0);
+        if (!Number.isFinite(cents) || cents <= 0 || cents >= 100 || !Number.isFinite(delta)) { book.ts = Date.now(); return; }
         const cur = side.get(cents) || 0;
         const newSize = cur + delta;
         if (newSize <= 0) side.delete(cents); else side.set(cents, newSize);
@@ -468,8 +471,9 @@ export function connectPmWs(): void {
   });
 
   _pmWs.on("close", () => {
-    console.log("[WS] Polymarket disconnected, reconnecting in 3s...");
+    console.log("[WS] Polymarket disconnected, clearing books, reconnecting in 3s...");
     _pmWsReady = false;
+    wsPmBooks.clear(); // Prevent stale PM prices from being used during reconnect gap
     setTimeout(connectPmWs, 3000);
   });
   _pmWs.on("error", (err) => { console.error("[WS] Polymarket error:", (err as Error).message); });

@@ -341,7 +341,7 @@ export async function executeArb(
 
   if (shares < effectivePmMin) {
     const minCost = effectivePmMin * costPerShare;
-    if (effectivePmMin > MAX_CONTRACTS || minCost > TRADE_USD * 2) {
+    if (effectivePmMin > MAX_CONTRACTS || minCost > TRADE_USD * 1.1) {
       console.warn(
         `  [SKIP] PM effective min=${effectivePmMin} (minSize=${pmLeg.minSize})` +
         ` cost=$${minCost.toFixed(2)} exceeds budget $${TRADE_USD}. PM ask too low.`
@@ -927,7 +927,7 @@ export async function executeArb(
         const postCancelOrder = await getKalshiOrder(kalOrderId);
         const postCancelFilled = Number(
           postCancelOrder.fill_count ?? postCancelOrder.filled_count ??
-          (postCancelOrder.fill_count_fp != null ? Math.round(Number(postCancelOrder.fill_count_fp)) : kalFilled)
+          (postCancelOrder.fill_count_fp != null ? Math.round(Number(postCancelOrder.fill_count_fp)) : 0)
         );
         if (postCancelFilled > kalFilled) {
           console.log(`  [KAL LEG] Post-cancel check: actual fills=${postCancelFilled} (was ${kalFilled}). GTC filled more before cancel.`);
@@ -1301,7 +1301,7 @@ export async function executeArb(
           }
 
           if (makerMeta.filled > 0) {
-            console.log(`  [KAL LEG] MAKER: Got ${makerMeta.filled}/${kalIOCCount} fills after ${(Date.now() + KAL_MAKER_WAIT_MS - pollDeadline + KAL_MAKER_WAIT_MS).toFixed(0)}ms`);
+            console.log(`  [KAL LEG] MAKER: Got ${makerMeta.filled}/${kalIOCCount} fills after ${(Date.now() - (pollDeadline - KAL_MAKER_WAIT_MS)).toFixed(0)}ms`);
             kalFilledViaMaker = true;
             // Cancel remaining if partial
             if (makerMeta.filled < kalIOCCount && makerOrderId) {
@@ -1537,7 +1537,7 @@ export async function executeArb(
             // Count PM shares already claimed by other active/resolved trades for this token
             const existingTrades = loadArbTrades();
             const claimedPmShares = existingTrades
-              .filter(t => t.pmTokenId === pmLeg.tokenId && t.pmCost > 0)
+              .filter(t => t.pmTokenId === pmLeg.tokenId && (t.pmCost > 0 || t.status === "hedging"))
               .reduce((s, t) => s + t.shares, 0);
             const unclaimedPm = totalPmBal - claimedPmShares;
             if (unclaimedPm >= pmShares) {
@@ -2645,7 +2645,7 @@ export async function monitorLoop(watchlist: WatchEntry[]): Promise<void> {
               console.warn(`[HEDGE] runHedgeCycle timeout (90s) for ${hs.position.kalLeg.ticker}`);
               resolve();
             }, 90_000)),
-          ]);
+          ]).catch(err => console.error(`[HEDGE] cycle error for ${hs.position.kalLeg.ticker}: ${(err as Error).message}`));
         }
 
         // Remove resolved positions
@@ -2665,7 +2665,7 @@ export async function monitorLoop(watchlist: WatchEntry[]): Promise<void> {
               // kalCost = only initial KAL cost. hedgeCost is tracked independently.
               // totalCost = kalCost + pmCost (the two initial legs, no double-counting).
               const kalCostR = isPmInitial
-                ? Math.round((p.hedgeFillCostKal + p.kalFees) * 100) / 100
+                ? Math.round((p.hedgeFillCostKal + hedgeKalFees) * 100) / 100
                 : Math.round((p.initialCost + p.hedgeFillCostKal + hedgeKalFees) * 100) / 100;
               const pmCostR = isPmInitial
                 ? Math.round(p.initialCost * 100) / 100

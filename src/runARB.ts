@@ -22,7 +22,7 @@ import {
   // Persistence
   loadArbTrades, loadHedgeStates, saveHedgeStates, loadMetrics,
   setAllHedgeStates, setReconcileRecoveredTrades,
-  getIncompletePendingFills, getActivePendingFillId,
+  getIncompletePendingFills, getActivePendingFillId, expireStalePendingFills,
 
   // WebSocket
   connectKalshiWs, connectPmWs, connectPmUserWs, setPmGhostFillHandler, subscribeWatchlist,
@@ -45,6 +45,8 @@ import {
 
   // Event log
   appendEvent,
+  // Audit
+  audit,
 
   // Types
   type WatchEntry, type HedgeState, type PmLeg, type KalshiLeg,
@@ -193,29 +195,37 @@ async function main() {
     console.warn(`[STARTUP] Balance check failed: ${(err as Error).message}`);
   }
 
+  // -- Reconciliation state (shared by hourly + settlement triggers) --
+  let settlementReconcileTimer: ReturnType<typeof setTimeout> | null = null;
+  let reconcileRunning = false;
+  let lastReconcileEndTs = 0;
+  const SETTLEMENT_RECONCILE_DELAY_MS = 30_000; // wait 30s after last settlement before reconciling
+  const RECONCILE_COOLDOWN_MS = 120_000; // minimum 2 min between reconciliations
+
+  // -- Expire stale pending fills --
+  const expiredCount = expireStalePendingFills();
+  if (expiredCount > 0) console.log(`[STARTUP] Expired ${expiredCount} stale pending fill(s).`);
+
   // -- Startup reconciliation --
   console.log("[STARTUP] Running position reconciliation (non-blocking)...");
   reconcilePositions("startup").catch(err =>
     console.error(`[RECONCILE] Startup reconciliation failed: ${(err as Error).message}`)
   );
 
-  // Schedule hourly reconciliation
+  // Schedule hourly reconciliation (with overlap guard)
   setInterval(() => {
-    reconcilePositions("hourly").catch(err =>
-      console.error(`[RECONCILE] Hourly reconciliation error: ${(err as Error).message}`)
-    );
+    if (reconcileRunning) {
+      console.log("[RECONCILE] Hourly reconciliation skipped — already running.");
+      return;
+    }
+    reconcileRunning = true;
+    reconcilePositions("hourly")
+      .catch(err => console.error(`[RECONCILE] Hourly reconciliation error: ${(err as Error).message}`))
+      .finally(() => { reconcileRunning = false; lastReconcileEndTs = Date.now(); });
   }, 60 * 60 * 1000);
 
   // -- Build conditionId index for settlement filtering --
   const { conditionIds: watchedConditions, conditionToSlug } = await buildConditionIdIndex(watchlist);
-
-  // Debounce settlement-triggered reconciliation: batch rapid settlements into one reconcile call.
-  // Uses a lock to prevent reconciliation from overlapping with scan cycles.
-  let settlementReconcileTimer: ReturnType<typeof setTimeout> | null = null;
-  let reconcileRunning = false;
-  let lastReconcileEndTs = 0;
-  const SETTLEMENT_RECONCILE_DELAY_MS = 30_000; // wait 30s after last settlement before reconciling
-  const RECONCILE_COOLDOWN_MS = 120_000; // minimum 2 min between reconciliations
 
   // -- On-chain subscriptions --
   try {
@@ -318,8 +328,41 @@ async function main() {
   await monitorLoop(watchlist);
 }
 
-// --- Boot -------��-----------------------------------------------------------
+// --- Graceful shutdown -------------------------------------------------------
 
+let _shutdownInProgress = false;
+
+function setupGracefulShutdown(): void {
+  const handler = async (signal: string) => {
+    if (_shutdownInProgress) return; // prevent double-trigger
+    _shutdownInProgress = true;
+    console.log(`\n[SHUTDOWN] ${signal} received. Saving state and exiting...`);
+
+    try {
+      // Save current hedge states so they survive restart
+      const hedgeStates = loadHedgeStates();
+      if (hedgeStates.length > 0) {
+        saveHedgeStates(hedgeStates);
+        console.log(`[SHUTDOWN] Saved ${hedgeStates.length} hedge state(s).`);
+      }
+      console.log("[SHUTDOWN] State saved. Open exchange orders are NOT cancelled (hedge cycle will resume on restart).");
+      console.log("[SHUTDOWN] If you need to cancel open orders, run: npm run hedge");
+    } catch (e) {
+      console.error("[SHUTDOWN] Error saving state:", (e as Error).message);
+    }
+
+    // Give a moment for any in-flight writes to flush
+    await sleep(500);
+    process.exit(0);
+  };
+
+  process.on("SIGINT", () => handler("SIGINT"));
+  process.on("SIGTERM", () => handler("SIGTERM"));
+}
+
+// --- Boot --------------------------------------------------------------------
+
+setupGracefulShutdown();
 console.log("[BOOT] Starting ARB bot (audited modules)...");
 main().catch((err) => {
   console.error("[ARB TRADER] Fatal:", (err as Error).message ?? err);

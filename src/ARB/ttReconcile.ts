@@ -1115,7 +1115,7 @@ export async function reconcilePositions(trigger: string = "startup"): Promise<v
       const kalSide = kalSideForDir(trade.dir);
       const kalKey = `${trade.kalTicker}:${kalSide}`;
       const matched = matchKalFillsForTrade(kalKey, trade.ts, trade.shares);
-      if (matched) {
+      if (matched && matched.shares > 0) {
         const avgPrice = Math.round(matched.costCents / matched.shares) / 100;
         const kalCostWithFees = Math.round((matched.costCents / 100 + matched.fees) * 100) / 100;
 

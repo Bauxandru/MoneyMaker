@@ -64,6 +64,35 @@ let _arbTradesCache: ArbTradeRecord[] | null = null;
 let _arbTradesCacheTs = 0;
 const ARB_CACHE_TTL = 2000; // 2s -- covers a full poll cycle
 
+// --- Mutex for arb trades read-modify-write cycles --------------------------
+// Prevents concurrent async operations (execution + reconciliation) from
+// interleaving load→modify→save and losing each other's changes.
+let _arbTradesMutexQueue: (() => void)[] = [];
+let _arbTradesMutexLocked = false;
+
+async function acquireArbTradesMutex(): Promise<void> {
+  if (!_arbTradesMutexLocked) { _arbTradesMutexLocked = true; return; }
+  return new Promise<void>(resolve => { _arbTradesMutexQueue.push(resolve); });
+}
+
+function releaseArbTradesMutex(): void {
+  const next = _arbTradesMutexQueue.shift();
+  if (next) { next(); } else { _arbTradesMutexLocked = false; }
+}
+
+/** Run a read-modify-write cycle on arb trades with mutex protection.
+ *  The callback receives the current trades array, mutates it, and the
+ *  result is saved atomically. Returns the callback's return value. */
+export async function withArbTrades<T>(fn: (trades: ArbTradeRecord[]) => T): Promise<T> {
+  await acquireArbTradesMutex();
+  try {
+    const trades = loadArbTrades();
+    const result = fn(trades);
+    saveArbTrades(trades);
+    return result;
+  } finally { releaseArbTradesMutex(); }
+}
+
 // --- Hedge state persistence -------------------------------------------------
 
 /** Compatibility wrapper: saves the full _allHedgeStates array. */
@@ -230,8 +259,29 @@ export function completePendingFill(id: string): void {
   }
 }
 
+const PENDING_FILL_TTL_MS = 15 * 60 * 1000; // 15 minutes
+
 export function getIncompletePendingFills(): PendingFill[] {
   return loadPendingFills().filter(f => !f.completed);
+}
+
+/** Expire stale pending fills older than 15 minutes. Called at startup. */
+export function expireStalePendingFills(): number {
+  const fills = loadPendingFills();
+  const now = Date.now();
+  let expired = 0;
+  for (const f of fills) {
+    if (f.completed) continue;
+    const age = now - new Date(f.ts).getTime();
+    if (age > PENDING_FILL_TTL_MS) {
+      f.completed = true;
+      expired++;
+      console.warn(`[PENDING] Expired stale pending fill ${f.id} (age=${Math.round(age / 60_000)}min): ${f.match}`);
+      audit({ module: "persist", fn: "expireStalePendingFills", action: "pending-fill-expired", tradeId: f.id, kalTicker: f.kalTicker, pmSlug: f.pmSlug, shares: f.shares, context: { ageMs: age } });
+    }
+  }
+  if (expired > 0) savePendingFills(fills);
+  return expired;
 }
 
 // --- Arb trade persistence (with in-memory cache) ----------------------------
@@ -287,6 +337,18 @@ export function resolveArbTrade(kalTicker: string, updates: Partial<ArbTradeReco
     }
   }
   if (idx === -1) return;
+
+  // Idempotency guard: skip re-resolution of already-resolved trades unless
+  // the caller is explicitly updating a non-status field (e.g. cost repair).
+  const trade = trades[idx];
+  if (trade.status === "resolved" && updates.status === "resolved" && trade.resolvedTs) {
+    const secsSinceResolved = (Date.now() - new Date(trade.resolvedTs).getTime()) / 1000;
+    if (secsSinceResolved < 300) { // within 5 minutes — likely a duplicate call
+      console.warn(`[P&L] Skipping duplicate resolution for ${trade.match} (resolved ${secsSinceResolved.toFixed(0)}s ago)`);
+      return;
+    }
+  }
+
   Object.assign(trades[idx], updates);
   saveArbTrades(trades);
   const rpnl = updates.realizedPnl != null ? ` P&L=$${updates.realizedPnl.toFixed(2)}` : "";
