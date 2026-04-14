@@ -160,14 +160,17 @@ function validateTrade(t: ArbTrade): string[] {
   //    Only add hedgeCost when it's NOT already baked into the primary cost field.
   const isPmHedged = t.kalCost === 0 && t.initialExchange === "pm" && (t.hedgeCost ?? 0) > 0;
   const isKalHedged = t.pmCost === 0 && t.initialExchange === "kal" && (t.hedgeCost ?? 0) > 0;
-  // kalCost already includes kalFees (fees are baked into fill cost).
-  // Don't add kalFees again — that would double-count.
-  const baseCost = t.kalCost + t.pmCost;
+  // Historical inconsistency: some trades have kalFees baked into kalCost,
+  // others track kalFees separately. Accept both patterns.
+  const sumWithFees = t.kalCost + (t.kalFees ?? 0) + t.pmCost;
+  const sumWithoutFees = t.kalCost + t.pmCost;
   const feeTolerance = 0.05;
+  const matchesWithFees = Math.abs(sumWithFees - t.totalCost) <= feeTolerance;
+  const matchesWithout = Math.abs(sumWithoutFees - t.totalCost) <= feeTolerance;
   // For pm/kal-hedged: hedgeCost is already in pmCost/kalCost — don't add it
-  if (!isPmHedged && !isKalHedged && Math.abs(baseCost - t.totalCost) > feeTolerance) {
+  if (!isPmHedged && !isKalHedged && !matchesWithFees && !matchesWithout) {
     w.push("cost-sum-mismatch: kalCost+pmCost != totalCost (off by $" +
-      Math.abs(baseCost - t.totalCost).toFixed(2) + ")");
+      Math.min(Math.abs(sumWithFees - t.totalCost), Math.abs(sumWithoutFees - t.totalCost)).toFixed(2) + ")");
   }
   // 2. Hedge-complete P&L check
   if (t.resolutionMethod === "hedge-complete" && t.realizedPnl != null) {
