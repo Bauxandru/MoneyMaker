@@ -6,8 +6,8 @@ import { readFileSync } from "fs";
 import { join, dirname } from "path";
 import { fileURLToPath } from "url";
 
-const __filename_lc = fileURLToPath(import.meta.url);
-const __dirname_lc = dirname(__filename_lc);
+const __filename_lc = typeof import.meta?.url === "string" ? fileURLToPath(import.meta.url) : __filename ?? process.argv[1] ?? "";
+const __dirname_lc = __filename_lc ? dirname(__filename_lc) : process.cwd();
 
 function getLocalVersion(): string {
   try {

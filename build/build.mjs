@@ -31,7 +31,7 @@ console.log("=== Step 1/5: Bundle with esbuild ===");
 try {
   execSync(
     [
-      "npx esbuild src/tradeTennis.ts",
+      "npx esbuild src/runARB.ts",
       "--bundle",
       "--platform=node",
       "--target=node20",
