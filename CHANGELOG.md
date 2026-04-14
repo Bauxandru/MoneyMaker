@@ -29,3 +29,4 @@ Categories: `FEATURE`, `FIX`, `REFACTOR`, `CONFIG`, `SAFETY`, `HEDGE`, `RECONCIL
   - MEDIUM: Added hourly reconciliation overlap guard (runARB.ts)
   - MEDIUM: Added pending fill expiration (15-min TTL) with startup cleanup (ttPersistence.ts, runARB.ts)
   - FIX: Added missing audit import and ttAuditLog re-export (runARB.ts, index.ts)
+[2026-04-14] FIX: Fixed hedge cycle deadlock — Promise.race timeout was not releasing _hedgeCycleLocks, causing all subsequent hedge cycles to skip forever. Added releaseHedgeCycleLock() export from ttHedge.ts. Timeout increased from 90s to 150s to accommodate max sequential await chain (waitForPmOrderFill 60s + verifyPmFill 60s = 120s). (ttExecution.ts, ttHedge.ts)

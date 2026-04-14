@@ -830,6 +830,11 @@ async function verifyPmFillPrice(
 // Per-position lock to prevent concurrent hedge cycles placing duplicate orders
 const _hedgeCycleLocks = new Set<string>();
 
+/** Force-release a hedge cycle lock (used by timeout handler in ttExecution.ts). */
+export function releaseHedgeCycleLock(tradeId: string): void {
+  _hedgeCycleLocks.delete(tradeId);
+}
+
 export async function runHedgeCycle(state: HedgeState, clobBase: string): Promise<void> {
   const { position: pos, activeOrders } = state;
   const kalBase = process.env.KALSHI_BASE_URL ?? "https://api.elections.kalshi.com/trade-api/v2";

@@ -71,7 +71,8 @@ import {
 } from "./ttReconcile.js";
 
 import {
-  runHedgeCycle, detectUnhedgedPmPositions, detectUnhedgedKalPositions,
+  runHedgeCycle, releaseHedgeCycleLock,
+  detectUnhedgedPmPositions, detectUnhedgedKalPositions,
   recheckAndCancelAll, collectOpenPositions, runCancellationMonitor,
   extractEventDateKey, isScalarSettlement, fetchPmBestBid,
   _hedgeLogCounter,
@@ -2640,15 +2641,23 @@ export async function monitorLoop(watchlist: WatchEntry[]): Promise<void> {
       const hedgeCheckInterval = allOrdersPlaced ? 25 : 1; // 25 cycles ≈ 10s once orders are placed
 
       if (cycle % hedgeCheckInterval === 0) {
-        // Run all hedge cycles in parallel, non-blocking. Each has 90s timeout.
+        // Run all hedge cycles in parallel, non-blocking. Each has 150s timeout.
+        // Timeout must exceed the max sequential await chain inside runHedgeCycle
+        // (waitForPmOrderFill 60s + verifyPmFill 60s = 120s worst case).
         for (const hs of hedgeStates) {
+          const ticker = hs.position.kalLeg.ticker;
+          const tradeId = hs.position.tradeId;
           Promise.race([
             runHedgeCycle(hs, clobBase),
             new Promise<void>(resolve => setTimeout(() => {
-              console.warn(`[HEDGE] runHedgeCycle timeout (90s) for ${hs.position.kalLeg.ticker}`);
+              console.warn(`[HEDGE] runHedgeCycle timeout (150s) for ${ticker}`);
+              // Force-release the lock so the next cycle can acquire it.
+              // The timed-out runHedgeCycle may still be running in background;
+              // its finally block will call delete() again (harmless no-op).
+              releaseHedgeCycleLock(tradeId);
               resolve();
-            }, 90_000)),
-          ]).catch(err => console.error(`[HEDGE] cycle error for ${hs.position.kalLeg.ticker}: ${(err as Error).message}`));
+            }, 150_000)),
+          ]).catch(err => console.error(`[HEDGE] cycle error for ${ticker}: ${(err as Error).message}`));
         }
 
         // Remove resolved positions
