@@ -87,18 +87,17 @@ export function createRateLimitedFetcher(
   intervalMs: number,
   retryOpts: RetryOptions = {}
 ): <T>(url: string) => Promise<T> {
-  let queue: Promise<unknown> = Promise.resolve();
-  let lastRequest = 0;
+  let nextAllowedAt = 0;
 
-  return function rateLimitedFetch<T>(url: string): Promise<T> {
-    const task = queue.then(async () => {
-      const wait = Math.max(0, lastRequest + intervalMs - Date.now());
-      if (wait > 0) await sleep(wait);
-      lastRequest = Date.now();
-      const res = await fetchJsonWithRetry<T>(url, {}, retryOpts);
-      return res;
-    });
-    queue = task.catch(() => {});
-    return task as Promise<T>;
+  return async function rateLimitedFetch<T>(url: string): Promise<T> {
+    // Reserve a slot: each request gets its own time slot, spaced by intervalMs.
+    // Does NOT wait for previous requests to complete — only for the time window.
+    // This prevents a slow/hanging request from blocking the entire queue.
+    const now = Date.now();
+    const mySlot = Math.max(now, nextAllowedAt);
+    nextAllowedAt = mySlot + intervalMs;
+    const wait = mySlot - now;
+    if (wait > 0) await sleep(wait);
+    return fetchJsonWithRetry<T>(url, {}, retryOpts);
   };
 }

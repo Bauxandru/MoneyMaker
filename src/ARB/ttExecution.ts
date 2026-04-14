@@ -2902,7 +2902,14 @@ export async function monitorLoop(watchlist: WatchEntry[]): Promise<void> {
     const kalRefreshDue = Date.now() - _lastKalRestRefreshMs > KAL_REST_REFRESH_INTERVAL_MS;
     if (kalWsCoverage < 0.5 || kalRefreshDue) {
       _lastKalRestRefreshMs = Date.now();
-      await refreshKalshiPrices(watchlist);
+      try {
+        await Promise.race([
+          refreshKalshiPrices(watchlist),
+          new Promise<never>((_, rej) => setTimeout(() => rej(new Error("kal-prices-timeout-30s")), 30_000)),
+        ]);
+      } catch (e) {
+        console.warn(`[KAL-PRICES] refresh timed out: ${(e as Error).message} — using WS data only`);
+      }
       // Re-overlay WS on top of REST (WS is more current)
       for (const e of watchlist) {
         const ws1Yes = getWsKalBestAsk(e.kal1.ticker, "yes");
