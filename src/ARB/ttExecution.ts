@@ -2247,12 +2247,62 @@ export async function monitorLoop(watchlist: WatchEntry[]): Promise<void> {
         }
         covered = Math.min(pos.sharesHeld, covered);
 
-        // Always cancel stale orders from previous session — they may have expired,
-        // been cancelled, or partially filled on the exchange. The hedge cycle will
-        // place fresh orders with up-to-date prices.
+        // Verify resting orders from previous session — keep live ones to preserve
+        // queue position (breakeven price doesn't change). Remove dead ones.
         if (hs.activeOrders.size > 0) {
-          await cancelAllHedgeOrders(hs.activeOrders);
-          hs.activeOrders.clear();
+          const deadOrders: string[] = [];
+          for (const [oid, ho] of hs.activeOrders) {
+            try {
+              if (ho.exchange === "pm") {
+                const { filledShares, status } = await Promise.race([
+                  getPmOrderFills(oid),
+                  new Promise<never>((_, rej) => setTimeout(() => rej(new Error("verify-timeout")), 5_000)),
+                ]);
+                if (status === "matched" || status === "cancelled" || status === "expired") {
+                  // Order is done — credit any fills, then remove
+                  if (filledShares > ho.filledSoFar) {
+                    ho.filledSoFar = filledShares;
+                    pos.sharesHeld = Math.max(0, pos.sharesHeld - (filledShares - ho.filledSoFar));
+                    console.log(`[HEDGE RESUME] PM order ${oid.slice(0, 16)}... filled ${filledShares} shares while offline.`);
+                  }
+                  deadOrders.push(oid);
+                  console.log(`[HEDGE RESUME] PM order ${oid.slice(0, 16)}... status=${status} — removing.`);
+                } else {
+                  // Order is still live (open/active) — keep it, preserve queue position
+                  if (filledShares > ho.filledSoFar) {
+                    ho.filledSoFar = filledShares;
+                    console.log(`[HEDGE RESUME] PM order ${oid.slice(0, 16)}... partial fill: ${filledShares} shares. Keeping order.`);
+                  } else {
+                    console.log(`[HEDGE RESUME] PM order ${oid.slice(0, 16)}... still live (${status}). Keeping order, preserving queue position.`);
+                  }
+                }
+              } else {
+                // Kalshi orders — check via API
+                try {
+                  const kalOrder = await Promise.race([
+                    getKalshiOrder(oid),
+                    new Promise<never>((_, rej) => setTimeout(() => rej(new Error("verify-timeout")), 5_000)),
+                  ]);
+                  const kalStatus = String(kalOrder.status ?? "").toLowerCase();
+                  if (kalStatus === "filled" || kalStatus === "cancelled" || kalStatus === "expired") {
+                    deadOrders.push(oid);
+                    console.log(`[HEDGE RESUME] KAL order ${oid.slice(0, 16)}... status=${kalStatus} — removing.`);
+                  } else {
+                    console.log(`[HEDGE RESUME] KAL order ${oid.slice(0, 16)}... still live (${kalStatus}). Keeping order.`);
+                  }
+                } catch {
+                  // Can't verify — assume dead, hedge cycle will re-place
+                  deadOrders.push(oid);
+                  console.warn(`[HEDGE RESUME] KAL order ${oid.slice(0, 16)}... verify failed — removing (hedge cycle will re-place).`);
+                }
+              }
+            } catch {
+              // PM verify timed out or failed — assume order is dead
+              deadOrders.push(oid);
+              console.warn(`[HEDGE RESUME] Order ${oid.slice(0, 16)}... verify failed/timeout — removing (hedge cycle will re-place).`);
+            }
+          }
+          for (const oid of deadOrders) hs.activeOrders.delete(oid);
         }
 
         if (covered >= pos.sharesHeld) {
