@@ -21,8 +21,8 @@ import { Wallet } from "@ethersproject/wallet";
 import { resolvePolyApiCreds } from "./polyAuth.js";
 
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = dirname(__filename);
+const __filename = typeof import.meta?.url === "string" ? fileURLToPath(import.meta.url) : __filename ?? process.argv[1] ?? "";
+const __dirname = __filename ? dirname(__filename) : process.cwd();
 const ROOT = join(__dirname, "..");
 
 const PORT = parseInt(process.env.DASHBOARD_PORT || "3456", 10);
