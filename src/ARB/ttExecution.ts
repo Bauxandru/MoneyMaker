@@ -2113,6 +2113,9 @@ const KAL_REST_REFRESH_INTERVAL_MS = 300_000; // 5 min
 export async function monitorLoop(watchlist: WatchEntry[]): Promise<void> {
   const clobBase = process.env.POLY_CLOB_URL ?? "https://clob.polymarket.com";
 
+  // Track in-flight hedge cycles to prevent spam when runHedgeCycle hangs >150s
+  const _hedgeInflight = new Set<string>();
+
   // cooldownMap: matchCode → timestamp of last trade ATTEMPT (success or fail)
   const cooldownMap = new Map<string, number>();
   // kalTickerCooldown: kalTicker → timestamp — prevents firing the same Kalshi market
@@ -2644,20 +2647,23 @@ export async function monitorLoop(watchlist: WatchEntry[]): Promise<void> {
         // Run all hedge cycles in parallel, non-blocking. Each has 150s timeout.
         // Timeout must exceed the max sequential await chain inside runHedgeCycle
         // (waitForPmOrderFill 60s + verifyPmFill 60s = 120s worst case).
+        // Track in-flight hedge cycles to prevent spam: don't start a new one
+        // if the previous is still running (even after lock release).
         for (const hs of hedgeStates) {
           const ticker = hs.position.kalLeg.ticker;
           const tradeId = hs.position.tradeId;
+          if (_hedgeInflight.has(tradeId)) continue; // previous cycle still running
+          _hedgeInflight.add(tradeId);
           Promise.race([
             runHedgeCycle(hs, clobBase),
             new Promise<void>(resolve => setTimeout(() => {
               console.warn(`[HEDGE] runHedgeCycle timeout (150s) for ${ticker}`);
-              // Force-release the lock so the next cycle can acquire it.
-              // The timed-out runHedgeCycle may still be running in background;
-              // its finally block will call delete() again (harmless no-op).
               releaseHedgeCycleLock(tradeId);
               resolve();
             }, 150_000)),
-          ]).catch(err => console.error(`[HEDGE] cycle error for ${ticker}: ${(err as Error).message}`));
+          ])
+          .catch(err => console.error(`[HEDGE] cycle error for ${ticker}: ${(err as Error).message}`))
+          .finally(() => _hedgeInflight.delete(tradeId));
         }
 
         // Remove resolved positions
