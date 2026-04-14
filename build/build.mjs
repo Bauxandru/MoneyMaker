@@ -25,10 +25,53 @@ const DIST = join(ROOT, "dist");
 
 if (!existsSync(DIST)) mkdirSync(DIST, { recursive: true });
 
+// ── Step 0: Read .env and secrets for embedding ────────────────────────────
+
+console.log("=== Step 0: Embedding config from .env ===");
+const envOverrides = {};
+const envPath = join(ROOT, ".env");
+if (existsSync(envPath)) {
+  const lines = readFileSync(envPath, "utf8").split("\n");
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) continue;
+    const eqIdx = trimmed.indexOf("=");
+    if (eqIdx === -1) continue;
+    const key = trimmed.slice(0, eqIdx).trim();
+    const val = trimmed.slice(eqIdx + 1).trim();
+    envOverrides[key] = val;
+  }
+}
+// Override SERVER_ID for VPS build
+// For exe builds (VPS deployment), always override SERVER_ID
+envOverrides["SERVER_ID"] = "toronto-vps";
+
+// Embed Kalshi private key if referenced by path
+const pemPath = envOverrides["KALSHI_PRIVATE_KEY_PATH"];
+if (pemPath) {
+  const fullPem = join(ROOT, pemPath);
+  if (existsSync(fullPem)) {
+    const pemContents = readFileSync(fullPem, "utf8").trim();
+    envOverrides["KALSHI_PRIVATE_KEY"] = pemContents;
+    delete envOverrides["KALSHI_PRIVATE_KEY_PATH"]; // use inline key instead of file path
+    console.log("  Embedded Kalshi PEM key inline");
+  }
+}
+console.log(`  ${Object.keys(envOverrides).length} env vars embedded`);
+
+// Build the banner JS that sets process.env before anything else runs
+const envBanner = `(function(){${Object.entries(envOverrides).map(
+  ([k, v]) => `process.env[${JSON.stringify(k)}]=process.env[${JSON.stringify(k)}]||${JSON.stringify(v)};`
+).join("")}})();`;
+
 // ── Step 1: esbuild bundle ─────────────────────────────────────────────────
 
-console.log("=== Step 1/5: Bundle with esbuild ===");
+console.log("\n=== Step 1/5: Bundle with esbuild ===");
 try {
+  // Write banner to temp file (avoid shell escaping issues)
+  const bannerPath = join(DIST, "_env_banner.js");
+  writeFileSync(bannerPath, envBanner);
+
   execSync(
     [
       "npx esbuild src/runARB.ts",
@@ -81,16 +124,21 @@ console.log("\n=== Step 2/5: Skipping obfuscation (minified bundle is sufficient
 
 // ── Step 3: Use minified JS as loader ─────────────────────────────────────
 
-console.log("\n=== Step 3/5: Prepare loader ===");
+console.log("\n=== Step 3/5: Prepare loader (with embedded config) ===");
 {
   const bundlePath = join(DIST, "bot.cjs");
   if (!existsSync(bundlePath)) {
     console.error("No bundled file found. Build failed.");
     process.exit(1);
   }
-  copyFileSync(bundlePath, join(DIST, "loader.cjs"));
+  // Prepend env vars so they're set before dotenv.config() runs
+  // dotenv won't overwrite existing process.env values, so embedded values win
+  const bundle = readFileSync(bundlePath, "utf8");
+  const loader = envBanner + "\n" + bundle;
+  writeFileSync(join(DIST, "loader.cjs"), loader);
   try { unlinkSync(bundlePath); } catch {}
-  console.log("Loader ready (minified JS in SEA binary)");
+  try { unlinkSync(join(DIST, "_env_banner.js")); } catch {}
+  console.log("Loader ready (config embedded + minified JS)");
 }
 
 // ── Step 4: Generate SEA blob ──────────────────────────────────────────────
