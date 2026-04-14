@@ -364,6 +364,13 @@ export async function postResolutionFillAudit(kalTicker: string, tradeId: string
     // never reduce kalCost based on incomplete exchange data.
     if (totalExchangeCost < totalTrackedCost) return;
 
+    // Safety cap: if exchange shows more fills than the trade's shares, other trades
+    // (possibly from another server) are sharing this ticker. Don't inflate costs.
+    if (actualBuyCount > trade.shares * 1.5) {
+      console.log(`[AUDIT] Ticker ${kalTicker}: exchange has ${actualBuyCount} fills but trade has ${trade.shares} shares — likely multi-server. Skipping.`);
+      return;
+    }
+
     // Check if another trade shares this ticker (shared ticker = don't audit)
     const sharedCount = trades.filter(t => t.kalTicker === kalTicker).length;
     if (sharedCount > 1) {
