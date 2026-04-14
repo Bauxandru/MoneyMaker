@@ -44,6 +44,7 @@ import {
   recordPrice, getMomentum,
   isPmServiceDown, markPmDown, markPmUp, isPm425,
   getPmServiceDownUntil, getPmWsReady, getPmWsSubs,
+  isKalMarketSettled, getKalSettlement,
 } from "./ttWebSocket.js";
 
 import {
@@ -307,27 +308,54 @@ export async function executeArb(
     return { sessionSkip: true, unhedged: null };
   }
   if (!DRY_RUN) {
-    const _tPre0 = performance.now();
-    try {
-      const preflightMkt = await fetchKalshiMarket(kalLeg.ticker);
-      tPreflight = performance.now() - _tPre0;
-      const preflightStatus = pickString(preflightMkt.status ?? preflightMkt.state ?? "").toLowerCase();
-      const preflightResult = pickString(preflightMkt.result ?? "").toLowerCase();
-      if (preflightStatus !== "active" && preflightStatus !== "open") {
-        console.error(
-          `\n[SAFETY ABORT] Kalshi market ${kalLeg.ticker} is ${preflightStatus} (result=${preflightResult || "none"}).` +
-          ` Cannot trade a non-active market.\n`
-        );
-        if (preflightResult === "scalar") {
-          _cancelledTickers.add(kalLeg.ticker);
-          _cancelledEventKeys.add(extractEventDateKey(kalLeg.ticker));
-        }
-        saveExecMetric("abort-safety", `market-${preflightStatus}`);
-        return { sessionSkip: true, unhedged: null };
+    // Skip REST preflight if WS confirms market is active (saves ~300ms).
+    // WS orderbook data within staleness window = market is active.
+    // WS settlement cache = market is closed/settled.
+    const wsBook = getWsKalBook(kalLeg.ticker);
+    const wsSettled = isKalMarketSettled(kalLeg.ticker);
+
+    if (wsSettled) {
+      // WS says market settled — abort immediately, no REST call needed
+      const settlement = getKalSettlement(kalLeg.ticker);
+      console.error(
+        `\n[SAFETY ABORT] Kalshi market ${kalLeg.ticker} settled (WS: result=${settlement?.result || "?"}).` +
+        ` Cannot trade a settled market.\n`
+      );
+      if (settlement?.result?.toLowerCase() === "scalar") {
+        _cancelledTickers.add(kalLeg.ticker);
+        _cancelledEventKeys.add(extractEventDateKey(kalLeg.ticker));
       }
-    } catch {
-      tPreflight = performance.now() - _tPre0;
-      // If we can't verify, proceed cautiously — the order will fail anyway if market is closed
+      saveExecMetric("abort-safety", "market-settled-ws");
+      return { sessionSkip: true, unhedged: null };
+    }
+
+    if (wsBook) {
+      // WS has fresh orderbook data — market is active, skip REST preflight
+      tPreflight = 0;
+    } else {
+      // WS data is stale or missing — fall back to REST preflight check
+      const _tPre0 = performance.now();
+      try {
+        const preflightMkt = await fetchKalshiMarket(kalLeg.ticker);
+        tPreflight = performance.now() - _tPre0;
+        const preflightStatus = pickString(preflightMkt.status ?? preflightMkt.state ?? "").toLowerCase();
+        const preflightResult = pickString(preflightMkt.result ?? "").toLowerCase();
+        if (preflightStatus !== "active" && preflightStatus !== "open") {
+          console.error(
+            `\n[SAFETY ABORT] Kalshi market ${kalLeg.ticker} is ${preflightStatus} (result=${preflightResult || "none"}).` +
+            ` Cannot trade a non-active market.\n`
+          );
+          if (preflightResult === "scalar") {
+            _cancelledTickers.add(kalLeg.ticker);
+            _cancelledEventKeys.add(extractEventDateKey(kalLeg.ticker));
+          }
+          saveExecMetric("abort-safety", `market-${preflightStatus}`);
+          return { sessionSkip: true, unhedged: null };
+        }
+      } catch {
+        tPreflight = performance.now() - _tPre0;
+        // If we can't verify, proceed cautiously — the order will fail anyway if market is closed
+      }
     }
   }
 
