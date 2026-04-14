@@ -430,7 +430,10 @@ export async function repairPmCostsFromClob(trades: ArbTradeRecord[]): Promise<{
   // incorrectly assign them to this trade, inflating totalCost and turning profits into losses.
   const needRepair = trades.filter(t =>
     t.pmTokenId && t.pmCost === 0 && t.pmFillPrice === 0 && !isResolvedPastDay(t) &&
-    !(t.initialExchange === "kal" && (t.resolutionMethod === "hedge-complete" || t.resolutionMethod === "settlement"))
+    !(t.initialExchange === "kal" && (t.resolutionMethod === "hedge-complete" || t.resolutionMethod === "settlement")) &&
+    // Skip trades still hedging — the hedge cycle will set pmCost when the GTC fills.
+    // Timestamp-matching here would assign fills from other trades/sessions, corrupting costs.
+    t.status !== "hedging"
   );
   if (needRepair.length === 0) return { repaired, changed };
 
