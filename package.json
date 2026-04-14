@@ -26,6 +26,7 @@
     "trade:tennis": "tsx src/tradeTennis.ts",
     "trade:arb": "tsx src/runARB.ts",
     "dashboard": "tsx src/dashboard.ts",
+    "dashboard:live": "tsx src/liveDashboard.ts",
     "sync": "tsx src/_reconcile.ts",
     "hedge": "tsx src/_hedge.ts",
     "scan:negrisk": "tsx src/scanNegRiskStrategy.ts",

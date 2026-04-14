@@ -8,7 +8,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 import {
-  DRY_RUN, SERVER_ID, TRADE_USD, MAX_CONTRACTS, MIN_EDGE,
+  DRY_RUN, SERVER_ID, PARALLEL_MODE, TRADE_USD, MAX_CONTRACTS, MIN_EDGE,
   POLL_INTERVAL_MS, TRADE_COOLDOWN_MS,
   HEDGE_TARGET, STRICT_HEDGE, PM_ONLY_MAX_CYCLES,
   FORCE_DISCOVER, MAX_CONSECUTIVE_ERRORS, MAX_HEDGE_POSITIONS,
@@ -1269,6 +1269,9 @@ export async function executeArb(
     // Two modes:
     //   KAL_MAKER_MODE=false (default): IOC at ask → taker fee (7%)
     //   KAL_MAKER_MODE=true:  GTC bid at ask-1¢ → maker fee (1.75%), fallback to IOC after timeout
+    // Hoisted here so PARALLEL_MODE can set pmFilled/pmFinalOrderId before sequential PM block
+    let pmFilled = false;
+    let pmFinalOrderId = "";
     let kalIOCCount = (kalSweepResult && kalSweepResult.totalQty < shares) ? kalSweepResult.totalQty : shares;
 
     // Enforce Kalshi minimum = PM minimum so partial fills can never undersize PM orders
@@ -1364,7 +1367,53 @@ export async function executeArb(
       console.log(`  [KAL LEG] Placing IOC: ticker=${kalLeg.ticker} side=${kalSide} limit=${kalLimitCents}¢ qty=${kalIOCCount}`);
 
       if (!DRY_RUN) {
-        if (!pmPreSigned) {
+        // ── PARALLEL_MODE: fire KAL IOC + PM FAK simultaneously ─────────────
+        // Safe because Kalshi IOC guarantees fill at limit price or better.
+        // Breakeven is calculated from KAL LIMIT (worst-case cost).
+        if (PARALLEL_MODE) {
+          // Calculate PM price from KAL LIMIT (worst case: fills at limit)
+          const kalLimitPerShare = kalLimitCents / 100;
+          const kalFeeReserve = KALSHI_FEE_RATE * kalLimitPerShare * (1 - kalLimitPerShare);
+          const worstKalCostPerShare = kalLimitPerShare + kalFeeReserve;
+          const parallelRawBudget = 1 - worstKalCostPerShare;
+          const parallelPmFee = PM_FEE_RATE * parallelRawBudget * (1 - parallelRawBudget);
+          const parallelPmBudget = parallelRawBudget - parallelPmFee;
+          const parallelPmPrice = Math.floor(parallelPmBudget / (pmLeg.tickSize || 0.01)) * (pmLeg.tickSize || 0.01);
+
+          if (parallelPmPrice > 0 && parallelPmPrice >= pmAsk) {
+            console.log(`  [PARALLEL] Firing KAL IOC + PM FAK in parallel. PM limit=${fmtPct(parallelPmPrice)} (KAL worst-case=${fmtPct(worstKalCostPerShare)})`);
+            const _tParallel = performance.now();
+            const [kalRes, pmRes] = await Promise.allSettled([
+              placeKalshiOrder(kalIOCOrder, false),
+              placePmFOK(pmLeg.tokenId, parallelPmPrice, shares, pmLeg.tickSize, pmLeg.negRisk, false),
+            ]);
+            const parallelMs = performance.now() - _tParallel;
+            console.log(`  [PARALLEL] Both legs returned in ${parallelMs.toFixed(0)}ms`);
+
+            if (kalRes.status === "fulfilled") { kalResult = kalRes.value; } else { kalResult = kalRes.reason; kalFailed = true; }
+
+            // Check PM result: did it fill?
+            if (pmRes.status === "fulfilled") {
+              const earlyFokMeta = extractPmMeta(pmRes.value);
+              if (earlyFokMeta.status === "matched" || earlyFokMeta.status === "delayed") {
+                pmFilled = true;
+                pmFinalOrderId = earlyFokMeta.orderId ? String(earlyFokMeta.orderId) : "";
+                // Store for later status check
+                (globalThis as Record<string, unknown>)._parallelPmResult = pmRes.value;
+                console.log(`  [PARALLEL] PM FAK status=${earlyFokMeta.status}`);
+              } else {
+                console.log(`  [PARALLEL] PM FAK did not match (status=${earlyFokMeta.status}) — will retry sequentially after KAL fill check`);
+              }
+            } else {
+              console.warn(`  [PARALLEL] PM FAK failed: ${(pmRes.reason as Error).message}`);
+            }
+          } else {
+            // Breakeven too low — fall back to sequential (safer)
+            console.log(`  [PARALLEL] PM breakeven ${fmtPct(parallelPmPrice)} < ask ${fmtPct(pmAsk)} — falling back to sequential`);
+            try { kalResult = await placeKalshiOrder(kalIOCOrder, false); }
+            catch (kalErr) { kalResult = kalErr; kalFailed = true; }
+          }
+        } else if (!pmPreSigned) {
           // Pre-sign PM in parallel with IOC (if not already done in maker path)
           const [kalRes, pmSigned] = await Promise.allSettled([
             placeKalshiOrder(kalIOCOrder, false),
@@ -1494,8 +1543,6 @@ export async function executeArb(
     // Sends a Fill-or-Kill at pmOrderPrice. Subject to PM's ~3-second sports
     // delay but simpler and avoids the stale-GTC problem where liquidity
     // disappears during the 5-second poll window.
-    let pmFilled = false;
-    let pmFinalOrderId = "";
     const _tPm0 = performance.now();
 
     if (DRY_RUN) {
@@ -1504,6 +1551,9 @@ export async function executeArb(
       pmFilled = true;
       pmOrderIdForVerify = "";
       console.log(`  [PM LEG] [DRY] ${JSON.stringify(dryResult).slice(0, 200)}`);
+    } else if (pmFilled && PARALLEL_MODE) {
+      // Parallel mode already fired and confirmed PM — skip sending another order
+      console.log(`  [PM LEG] Already filled via parallel execution — skipping duplicate send.`);
     } else {
       console.log(`  [PM LEG] FOK at ${fmtPct(pmOrderPrice)} qty=${pmShares}`);
       let fokResult: unknown;
