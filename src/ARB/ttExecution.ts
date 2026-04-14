@@ -2645,10 +2645,15 @@ export async function monitorLoop(watchlist: WatchEntry[]): Promise<void> {
     cycle++;
     let _step = "start";
 
-    // Watchdog: log if cycle hangs for >60s
+    // Watchdog: log if cycle hangs for >60s, auto-exit if stuck for >5 minutes.
+    // The process wrapper (batch script / pm2) handles restart.
     const watchdog = setTimeout(() => {
       console.error(`[WATCHDOG] cycle=${cycle} STUCK at step="${_step}" for >60s!`);
     }, 60_000);
+    const watchdogKill = setTimeout(() => {
+      console.error(`[WATCHDOG] cycle=${cycle} STUCK at step="${_step}" for >5 MINUTES. Auto-restarting...`);
+      process.exit(1);
+    }, 5 * 60_000);
 
     try {
 
@@ -3439,6 +3444,7 @@ export async function monitorLoop(watchlist: WatchEntry[]): Promise<void> {
       await sleep(2000); // prevent tight error loop
     } finally {
       clearTimeout(watchdog);
+      clearTimeout(watchdogKill);
     }
   }
 }
