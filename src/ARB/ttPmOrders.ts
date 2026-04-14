@@ -55,12 +55,18 @@ export function pmSafePrice(price: number, shares: number): number {
 const PM_ORDER_TIMEOUT_MS = 30_000; // 30s max for any PM CLOB order call
 
 function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
-  return Promise.race([
-    promise,
-    new Promise<never>((_, reject) =>
-      setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms)
-    ),
-  ]);
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      // Force-invalidate the CLOB client cache so the next call creates a fresh
+      // connection instead of reusing the stalled one.
+      _pmClientCache = null;
+      reject(new Error(`${label} timed out after ${ms}ms`));
+    }, ms);
+    promise.then(
+      (val) => { clearTimeout(timer); resolve(val); },
+      (err) => { clearTimeout(timer); reject(err); },
+    );
+  });
 }
 
 // --- PM order functions ------------------------------------------------------

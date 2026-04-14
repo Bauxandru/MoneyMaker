@@ -453,7 +453,10 @@ export async function runCancellationMonitor(watchlist: WatchEntry[], hedgeState
         mkt = { status: "settled", result: wsSettle.result.toLowerCase(), settlement_value: wsSettle.settlementValue.toString() } as unknown as KalshiMarket;
         mktStatus = "settled";
       } else {
-        const mktRes = await kalFetch<{ market?: KalshiMarket }>(`${kalBase}/markets/${ticker}`);
+        const mktRes = await Promise.race([
+          kalFetch<{ market?: KalshiMarket }>(`${kalBase}/markets/${ticker}`),
+          new Promise<never>((_, rej) => setTimeout(() => rej(new Error("canc-mon-market-timeout")), 10_000)),
+        ]);
         mkt = mktRes.market ?? mktRes as unknown as KalshiMarket;
         mktStatus = pickString(mkt.status ?? mkt.state ?? "").toLowerCase();
       }
@@ -483,9 +486,16 @@ export async function runCancellationMonitor(watchlist: WatchEntry[], hedgeState
       _cancelledTickers.add(ticker);
       _cancelledEventKeys.add(extractEventDateKey(ticker));
 
-      // Process each affected trade
+      // Process each affected trade (with 30s timeout per position to prevent hangs)
       for (const pos of posGroup) {
-        await handleCancelledPosition(pos, mkt, hedgeStates, clobBase);
+        try {
+          await Promise.race([
+            handleCancelledPosition(pos, mkt, hedgeStates, clobBase),
+            new Promise<never>((_, rej) => setTimeout(() => rej(new Error("handleCancelledPosition-timeout-30s")), 30_000)),
+          ]);
+        } catch (e) {
+          console.warn(`[CANC-MON] handleCancelledPosition timed out for ${pos.pmOutcome}: ${(e as Error).message}`);
+        }
       }
     } catch (err) {
       // Transient fetch error -- will retry next cycle

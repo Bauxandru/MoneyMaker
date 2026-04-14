@@ -2866,7 +2866,10 @@ export async function monitorLoop(watchlist: WatchEntry[]): Promise<void> {
     // Runs every 60s. Checks Kalshi market status for all open positions.
     // If a market settled as "scalar" (cancelled/voided), immediately sells PM tokens.
     try {
-      await runCancellationMonitor(watchlist, hedgeStates, clobBase);
+      await Promise.race([
+        runCancellationMonitor(watchlist, hedgeStates, clobBase),
+        new Promise<never>((_, rej) => setTimeout(() => rej(new Error("canc-monitor-timeout-60s")), 60_000)),
+      ]);
     } catch (err) {
       console.warn(`[CANC-MON] Monitor error: ${(err as Error).message}`);
     }
