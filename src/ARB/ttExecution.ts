@@ -3295,7 +3295,16 @@ export async function monitorLoop(watchlist: WatchEntry[]): Promise<void> {
         }
       } catch (err) {
         consecutiveErrors++;
-        console.error(`[EXECUTE] Error (${consecutiveErrors}/${MAX_CONSECUTIVE_ERRORS}): ${(err as Error).message}`);
+        const msg = (err as Error).message ?? String(err);
+        console.error(`[EXECUTE] Error (${consecutiveErrors}/${MAX_CONSECUTIVE_ERRORS}): ${msg}`);
+        // If the 30s timeout fired, executeArb may still be running in background
+        // and could place orders. Session-skip the match to prevent a duplicate trade.
+        if (msg.includes("timeout")) {
+          sessionSkipSet.add(bestEntry.matchCode);
+          kalTickerCooldown.set(bestEntry.kal1.ticker, Date.now() + 300_000); // 5 min cooldown
+          kalTickerCooldown.set(bestEntry.kal2.ticker, Date.now() + 300_000);
+          console.warn(`[SESSION SKIP] ${bestEntry.kal1.surname} vs ${bestEntry.kal2.surname} — execution timeout, session-skipped to prevent duplicate.`);
+        }
       } finally {
         inflight.delete(bestEntry.matchCode);
         // Safety: ensure _activePendingFillId is cleared even if executeArb throws.
