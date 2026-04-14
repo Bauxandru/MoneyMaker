@@ -86,6 +86,7 @@ export type ArbTradeRecord = {
   kalYesFills?: number;                 // actual YES contracts bought on Kalshi for this ticker
   kalNoFills?: number;                  // actual NO contracts bought on Kalshi for this ticker
   kalMakerFill?: boolean;               // true if Kalshi leg filled via maker GTC (lower fees)
+  serverId?: string;                     // which server placed this trade (e.g. "ashburn-vps", "romania-local")
   // PM overfill tracking -- when PM fills more fractional shares than ordered
   pmActualShares?: number;              // actual shares received from PM (e.g., 11.55 when 11 ordered)
 };
@@ -132,4 +133,5 @@ export type ExecMetric = {
   postVerifyMs?: number;   // post-fill PM verification (on-chain + CLOB + data-api)
   dryRun?: boolean;
   kalMakerFill?: boolean;  // true if Kalshi leg filled via maker GTC (lower fees)
+  serverId?: string;       // which server placed this execution
 };

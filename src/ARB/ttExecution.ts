@@ -8,7 +8,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 import {
-  DRY_RUN, TRADE_USD, MAX_CONTRACTS, MIN_EDGE,
+  DRY_RUN, SERVER_ID, TRADE_USD, MAX_CONTRACTS, MIN_EDGE,
   POLL_INTERVAL_MS, TRADE_COOLDOWN_MS,
   HEDGE_TARGET, STRICT_HEDGE, PM_ONLY_MAX_CYCLES,
   FORCE_DISCOVER, MAX_CONSECUTIVE_ERRORS, MAX_HEDGE_POSITIONS,
@@ -186,6 +186,7 @@ export async function executeArb(
     metric.preflightMs = Math.round(tPreflight);
     metric.depthCheckMs = Math.round(tDepthCheck);
     metric.postVerifyMs = Math.round(tPmVerify);
+    if (SERVER_ID) metric.serverId = SERVER_ID;
     appendMetric(metric);
     // Clear pending fill on abort — no exposure was taken.
     // EXCEPTION: "pm-delayed-zero" means the PM order timed out but may still settle on-chain later.

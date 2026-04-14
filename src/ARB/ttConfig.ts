@@ -43,6 +43,7 @@ export function atomicWriteFileSync(filePath: string, data: string): void {
 
 // DRY_RUN defaults to TRUE for safety -- must set DRY_RUN=false explicitly
 export const DRY_RUN = boolEnv("DRY_RUN", true);
+export const SERVER_ID = strEnv("SERVER_ID", "");
 export const TRADE_USD = numEnv("TRADE_USD", 10);
 export const MAX_CONTRACTS = Math.max(1, Math.floor(numEnv("MAX_CONTRACTS", 999)));
 export const MIN_EDGE = numEnv("MIN_EDGE", 0.02);

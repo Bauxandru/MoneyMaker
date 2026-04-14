@@ -14,7 +14,7 @@
 import fs from "fs";
 import path from "path";
 import { audit } from "./ttAuditLog.js";
-import { atomicWriteFileSync, DRY_RUN } from "./ttConfig.js";
+import { atomicWriteFileSync, DRY_RUN, SERVER_ID } from "./ttConfig.js";
 import { kalSideForDir } from "../utils.js";
 import { pushTradeData } from "../dashboardPush.js";
 import type {
@@ -313,6 +313,8 @@ export function saveArbTrades(trades: ArbTradeRecord[]): void {
 
 export function logArbTrade(record: ArbTradeRecord): void {
   if (DRY_RUN) return; // Don't persist simulated trades to dashboard
+  // Tag trade with server identity for multi-server tracking
+  if (SERVER_ID && !record.serverId) record.serverId = SERVER_ID;
   const trades = loadArbTrades();
   trades.push(record);
   saveArbTrades(trades);

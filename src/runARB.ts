@@ -15,7 +15,7 @@ import path from "path";
 // --- ARB module imports (audited & fixed versions) --------------------------
 import {
   // Config
-  DRY_RUN, TRADE_USD, MAX_CONTRACTS, MIN_EDGE, MIN_DEPTH_MULT,
+  DRY_RUN, SERVER_ID, TRADE_USD, MAX_CONTRACTS, MIN_EDGE, MIN_DEPTH_MULT,
   FORCE_DISCOVER, KAL_MAKER_MODE, KAL_MAKER_WAIT_MS,
   fmtPct, atomicWriteFileSync,
 
@@ -363,7 +363,7 @@ function setupGracefulShutdown(): void {
 // --- Boot --------------------------------------------------------------------
 
 setupGracefulShutdown();
-console.log("[BOOT] Starting ARB bot (audited modules)...");
+console.log(`[BOOT] Starting ARB bot (audited modules)...${SERVER_ID ? ` [SERVER: ${SERVER_ID}]` : ""}`);
 main().catch((err) => {
   console.error("[ARB TRADER] Fatal:", (err as Error).message ?? err);
   process.exit(1);
