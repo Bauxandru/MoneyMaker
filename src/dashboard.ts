@@ -160,11 +160,13 @@ function validateTrade(t: ArbTrade): string[] {
   //    Only add hedgeCost when it's NOT already baked into the primary cost field.
   const isPmHedged = t.kalCost === 0 && t.initialExchange === "pm" && (t.hedgeCost ?? 0) > 0;
   const isKalHedged = t.pmCost === 0 && t.initialExchange === "kal" && (t.hedgeCost ?? 0) > 0;
-  const baseCost = t.kalCost + (t.kalFees ?? 0) + t.pmCost;
+  // kalCost already includes kalFees (fees are baked into fill cost).
+  // Don't add kalFees again — that would double-count.
+  const baseCost = t.kalCost + t.pmCost;
   const feeTolerance = 0.05;
   // For pm/kal-hedged: hedgeCost is already in pmCost/kalCost — don't add it
   if (!isPmHedged && !isKalHedged && Math.abs(baseCost - t.totalCost) > feeTolerance) {
-    w.push("cost-sum-mismatch: kalCost+kalFees+pmCost != totalCost (off by $" +
+    w.push("cost-sum-mismatch: kalCost+pmCost != totalCost (off by $" +
       Math.abs(baseCost - t.totalCost).toFixed(2) + ")");
   }
   // 2. Hedge-complete P&L check
