@@ -2100,6 +2100,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
         <th class="sortable" data-sort="pnl">P&amp;L</th>
         <th class="sortable" data-sort="actualPnl">Actual P&amp;L</th>
         <th class="sortable" data-sort="maxpnl">Max Potential</th>
+        <th class="sortable" data-sort="server">Server</th>
       </tr>
     </thead>
     <tbody id="tradesBody"></tbody>
@@ -2489,6 +2490,7 @@ function sortKey(t, col) {
     case "pnl": return t.realizedPnl != null ? t.realizedPnl : -999999;
     case "actualPnl": var sm = settlementMap[t.kalTicker]; if (!sm) return -999999; var hcA = ((t.pmCost === 0 || t.kalCost === 0) && (t.hedgeCost || 0) > 0) ? (t.hedgeCost || 0) : 0; if (sm.settlementResult === "scalar" && (t.pmCost > 0 || t.pmFillPrice > 0)) return Math.round((sm.net + t.shares * 0.50 - (t.pmCost || 0) - hcA) * 100) / 100; if (_tickerTradeCount[t.kalTicker] > 1) return t.realizedPnl || 0; if (sm.status === "settled") { var kw; if (sm.settlementResult !== "scalar" && sm.pairRedemption > 0 && sm.settlementResult) { var os = (sm.buyNoCost || 0) >= (sm.buyYesCost || 0) ? "no" : "yes"; kw = sm.settlementResult === os; } else { kw = sm.settlementResult !== "scalar" && sm.settlementRevenue > 0.50; } return Math.round((sm.net + (kw ? 0 : t.shares) - (t.pmCost || 0) - hcA) * 100) / 100; } return sm.status === "sold" ? Math.round(sm.net * 100) / 100 : (t.realizedPnl || 0);
     case "maxpnl": return t._maxPnl != null ? t._maxPnl : -999999;
+    case "server": return t.serverId || "";
     default: return "";
   }
 }
@@ -2665,7 +2667,7 @@ function renderTrades(trades) {
     '&nbsp;&nbsp;Actual P&L Total: <b style="color:' + apnlC + '">' + pnlStr(totalActualPnl) + '</b></span>';
 
   if (sorted.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="14" class="empty">No trades</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="15" class="empty">No trades</td></tr>';
     return;
   }
 
@@ -2723,9 +2725,10 @@ function renderTrades(trades) {
       '<td>' + pnl + '</td>' +
       '<td>' + actualPnlCell(t) + '</td>' +
       '<td>' + maxPot + '</td>' +
+      '<td style="font-size:10px;color:#8b949e">' + esc(t.serverId || "--") + '</td>' +
       '</tr>';
 
-    const detailRow = '<tr class="detail-row' + (isOpen ? " open" : "") + '" id="' + rowId + '"><td colspan="14">' +
+    const detailRow = '<tr class="detail-row' + (isOpen ? " open" : "") + '" id="' + rowId + '"><td colspan="15">' +
       '<div class="detail-grid">' +
       '<div><span>Trade ID:</span> ' + esc(t.id) + '</div>' +
       '<div><span>Resolved:</span> ' + fmtDate(t.resolvedTs) + '</div>' +
