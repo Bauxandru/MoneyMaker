@@ -359,6 +359,11 @@ export async function postResolutionFillAudit(kalTicker: string, tradeId: string
 
     if (discrepancy < 0.02) return; // within rounding tolerance
 
+    // Only correct UPWARD: if exchange shows MORE fills than tracked, the bot
+    // missed some fills. If exchange shows FEWER, the fill data is stale/expired —
+    // never reduce kalCost based on incomplete exchange data.
+    if (totalExchangeCost < totalTrackedCost) return;
+
     // Check if another trade shares this ticker (shared ticker = don't audit)
     const sharedCount = trades.filter(t => t.kalTicker === kalTicker).length;
     if (sharedCount > 1) {
