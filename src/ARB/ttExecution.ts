@@ -1441,6 +1441,12 @@ export async function executeArb(
     // Cap PM price at breakeven based on ACTUAL KAL fill cost (not scan-time estimate).
     // Without this, slippage or fees on KAL side can push total cost > $1/share → guaranteed loss.
     let pmPriceWasCapped = false;
+    // Fallback: if Kalshi API didn't return fill cost (returns 0), estimate from limit price.
+    // This is conservative (worst-case cost) but prevents the breakeven cap from being skipped.
+    if (!DRY_RUN && kalFillCostCents === 0 && kalFilled > 0) {
+      kalFillCostCents = kalFilled * kalLimitCents;
+      console.warn(`  [KAL LEG] fill_cost not in API response — using limit price estimate: ${kalFillCostCents}c`);
+    }
     if (!DRY_RUN && kalFillCostCents > 0 && kalFilled > 0) {
       const actualKalPerShare = (kalFillCostCents / 100 + kalFeesTotal) / kalFilled;
       const rawBudget = 1 - actualKalPerShare;
