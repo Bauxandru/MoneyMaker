@@ -746,7 +746,7 @@ export async function executeArb(
         // Order is on-chain but not yet confirmed — poll until it resolves
         console.log(`  [PM LEG] On-chain pending (status=delayed), polling for confirmation...`);
         const _tPoll0 = performance.now();
-        const finalStatus = await waitForPmOrderFill(String(pmMeta.orderId), 15_000, pmLeg.tokenId, pmPreBalance);
+        const finalStatus = await waitForPmOrderFill(String(pmMeta.orderId), 20_000, pmLeg.tokenId, pmPreBalance);
         tPmPoll = performance.now() - _tPoll0;
         if (finalStatus === "matched") {
           console.log(`  [PM LEG] Confirmed filled after delay (${tPmPoll.toFixed(0)}ms).`);
@@ -841,7 +841,7 @@ export async function executeArb(
           return unhedgedShares;
         }
         if (meta.status === "delayed" && meta.orderId) {
-          const finalStatus = await waitForPmOrderFill(String(meta.orderId), 15_000, pmOppLeg.tokenId);
+          const finalStatus = await waitForPmOrderFill(String(meta.orderId), 20_000, pmOppLeg.tokenId);
           if (finalStatus === "matched") {
             console.log(`  [IMMEDIATE PM HEDGE] Filled (delayed) ${unhedgedShares}×${pmOppLeg.outcome} @${fmtPct(oppAsk)} — hedge complete.`);
             return unhedgedShares;
@@ -1546,7 +1546,7 @@ export async function executeArb(
         // FOK matched but on-chain confirmation pending — poll for it
         console.log(`  [PM LEG] FOK delayed (on-chain pending), polling for confirmation...`);
         const _tPoll0 = performance.now();
-        const finalStatus = await waitForPmOrderFill(String(fokMeta.orderId), 15_000, pmLeg.tokenId, pmPreBalance);
+        const finalStatus = await waitForPmOrderFill(String(fokMeta.orderId), 20_000, pmLeg.tokenId, pmPreBalance);
         tPmPoll = performance.now() - _tPoll0;
         if (finalStatus === "matched") {
           console.log(`  [PM LEG] Confirmed filled after delay (${tPmPoll.toFixed(0)}ms).`);
@@ -1934,7 +1934,7 @@ export async function executeArb3Leg(
           continue;
         }
         if (meta.status === "delayed" && meta.orderId) {
-          const finalStatus = await waitForPmOrderFill(String(meta.orderId), 15_000, leg.pmLeg.tokenId);
+          const finalStatus = await waitForPmOrderFill(String(meta.orderId), 20_000, leg.pmLeg.tokenId);
           if (finalStatus === "matched") {
             console.log(`  [${legLabel}] PM filled (delayed)`);
             filled.push({ leg, fillPrice: leg.price, fillCost: shares * leg.price });
@@ -3352,7 +3352,7 @@ export async function monitorLoop(watchlist: WatchEntry[]): Promise<void> {
           ? await executeArb3Leg(bestEntry, bestDir, bestEdge)
           : await Promise.race([
               executeArb(bestEntry, bestDir, bestKalAsk, bestPmAsk, bestEdge),
-              new Promise<never>((_, rej) => setTimeout(() => rej(new Error("executeArb-timeout-35s")), 35_000)),
+              new Promise<never>((_, rej) => setTimeout(() => rej(new Error("executeArb-timeout-40s")), 40_000)),
             ]);
         consecutiveErrors = 0; // reset on successful execution
 
