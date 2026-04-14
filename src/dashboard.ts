@@ -61,6 +61,15 @@ async function validateIngestToken(token: string): Promise<{ valid: boolean; nam
     return { valid: cached.valid, name: cached.name };
   }
 
+  // Simple shared-secret mode: if DASHBOARD_INGEST_SECRET is set, accept any
+  // token that matches it. No license server needed.
+  const ingestSecret = process.env.DASHBOARD_INGEST_SECRET || "";
+  if (ingestSecret && token === ingestSecret) {
+    const result = { valid: true, name: "remote-bot" };
+    tokenCache.set(token, { ...result, ts: Date.now() });
+    return result;
+  }
+
   if (!LICENSE_SERVER_URL) {
     return { valid: false, name: "" };
   }
@@ -1140,7 +1149,19 @@ app.get("/api/remote-trades", (req, res) => {
 });
 
 app.get("/api/trades", (_req, res) => {
-  res.json(loadTrades());
+  const local = loadTrades();
+  // Merge remote bot trades into the response so dashboard shows all servers
+  for (const data of remoteUsers.values()) {
+    for (const rt of (data.trades || [])) {
+      // Deduplicate by trade ID
+      if (!local.some(lt => lt.id === rt.id)) {
+        local.push(rt as ArbTrade);
+      }
+    }
+  }
+  // Sort by timestamp descending (newest first)
+  local.sort((a, b) => (b.ts || "").localeCompare(a.ts || ""));
+  res.json(local);
 });
 
 app.get("/api/positions", (_req, res) => {

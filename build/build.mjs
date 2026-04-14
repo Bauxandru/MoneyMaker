@@ -42,9 +42,13 @@ if (existsSync(envPath)) {
     envOverrides[key] = val;
   }
 }
-// Override SERVER_ID for VPS build
-// For exe builds (VPS deployment), always override SERVER_ID
+// Override VPS-specific settings for exe builds
 envOverrides["SERVER_ID"] = "toronto-vps";
+// Push trades to home dashboard (set DASHBOARD_PUSH_URL to your home IP:3456)
+// The TOKEN must match DASHBOARD_INGEST_SECRET on the dashboard
+envOverrides["LICENSE_TOKEN"] = envOverrides["DASHBOARD_INGEST_SECRET"] || "";
+// DASHBOARD_PUSH_URL must be set in .env before building (your Tailscale/public IP)
+// e.g. DASHBOARD_PUSH_URL=http://100.x.x.x:3456
 
 // Embed Kalshi private key if referenced by path
 const pemPath = envOverrides["KALSHI_PRIVATE_KEY_PATH"];
