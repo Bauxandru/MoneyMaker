@@ -684,7 +684,27 @@ export function connectPmUserWs(): void {
       for (const evt of events) {
         if (evt.event_type !== "trade") continue;
         const status = evt.status?.toUpperCase();
-        if (status !== "MATCHED" && status !== "CONFIRMED" && status !== "MINED") continue;
+        if (status !== "MATCHED" && status !== "CONFIRMED" && status !== "MINED" && status !== "FAILED" && status !== "RETRYING") continue;
+
+        // FAILED: executor gave up → transaction is dead, resolve waiter immediately
+        if (status === "FAILED") {
+          const takerId = evt.taker_order_id;
+          if (takerId && _pmFillWaiters.has(takerId)) {
+            const w = _pmFillWaiters.get(takerId)!;
+            clearTimeout(w.timer);
+            _pmFillWaiters.delete(takerId);
+            evt.status = "FAILED"; // ensure status is uppercase for caller
+            w.resolve(evt);
+            console.warn(`[PM-USER-WS] Order FAILED: ${takerId.slice(0, 16)}... — transaction dead, no on-chain settlement`);
+          }
+          continue;
+        }
+
+        // RETRYING: on-chain tx reverted, executor retrying — log and keep waiting
+        if (status === "RETRYING") {
+          console.warn(`[PM-USER-WS] Order RETRYING: ${evt.taker_order_id?.slice(0, 16)}... — executor retrying on-chain tx`);
+          continue;
+        }
 
         // Resolve any waiter for this taker order
         let matched = false;

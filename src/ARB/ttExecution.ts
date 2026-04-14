@@ -1552,8 +1552,11 @@ export async function executeArb(
           console.log(`  [PM LEG] Confirmed filled after delay (${tPmPoll.toFixed(0)}ms).`);
           pmFilled = true;
           pmFinalOrderId = String(fokMeta.orderId);
+        } else if (finalStatus === "cancelled") {
+          console.log(`  [PM LEG] Order FAILED/cancelled (${tPmPoll.toFixed(0)}ms). Transaction dead — entering hedge.`);
+          // No on-chain check needed — FAILED means executor confirmed no settlement
         } else {
-          // Check on-chain as last resort
+          // Timeout: status unknown — check on-chain as last resort
           try {
             const bal = await getOnChainBalance(pmLeg.tokenId);
             const newShares = bal - pmPreBalance;
