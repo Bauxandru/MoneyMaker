@@ -45,6 +45,7 @@ import {
   isPmServiceDown, markPmDown, markPmUp, isPm425,
   getPmServiceDownUntil, getPmWsReady, getPmWsSubs,
   isKalMarketSettled, getKalSettlement,
+  waitForKalFillData,
 } from "./ttWebSocket.js";
 
 import {
@@ -1441,11 +1442,30 @@ export async function executeArb(
     // Cap PM price at breakeven based on ACTUAL KAL fill cost (not scan-time estimate).
     // Without this, slippage or fees on KAL side can push total cost > $1/share → guaranteed loss.
     let pmPriceWasCapped = false;
-    // Fallback: if Kalshi API didn't return fill cost (returns 0), estimate from limit price.
-    // This is conservative (worst-case cost) but prevents the breakeven cap from being skipped.
+    // Primary: use WS fill data (more reliable than HTTP response — always has price/fee).
+    // WS fill often arrives BEFORE HTTP response (persistent connection, no handshake).
+    if (!DRY_RUN && kalFilled > 0 && kalOrderId) {
+      const wsFill = await waitForKalFillData(kalOrderId, 500);
+      if (wsFill) {
+        const wsPrice = Number(wsFill.yes_price_dollars || 0);
+        const wsFee = Number(wsFill.fee_cost || 0);
+        const wsCount = Number(wsFill.count_fp || 0);
+        if (wsPrice > 0 && wsCount > 0) {
+          // For NO side: cost = count * (1 - yesPrice). For YES side: cost = count * yesPrice.
+          const wsPerShareCost = kalSide === "yes" ? wsPrice : (1 - wsPrice);
+          const wsCostCents = Math.round(wsCount * wsPerShareCost * 100);
+          if (wsCostCents > 0) {
+            kalFillCostCents = wsCostCents;
+            kalFeesTotal = wsFee;
+            console.log(`  [KAL LEG] WS fill: ${wsCount} @ ${wsPrice} (${kalSide}) cost=${wsCostCents}c fee=$${wsFee.toFixed(2)}`);
+          }
+        }
+      }
+    }
+    // Fallback: if neither HTTP nor WS provided fill cost, estimate from limit price.
     if (!DRY_RUN && kalFillCostCents === 0 && kalFilled > 0) {
       kalFillCostCents = kalFilled * kalLimitCents;
-      console.warn(`  [KAL LEG] fill_cost not in API response — using limit price estimate: ${kalFillCostCents}c`);
+      console.warn(`  [KAL LEG] No fill cost from HTTP or WS — using limit price estimate: ${kalFillCostCents}c`);
     }
     if (!DRY_RUN && kalFillCostCents > 0 && kalFilled > 0) {
       const actualKalPerShare = (kalFillCostCents / 100 + kalFeesTotal) / kalFilled;

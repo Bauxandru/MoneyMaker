@@ -93,6 +93,32 @@ export type KalMarketLifecycleEvent = {
 // Kalshi fill waiters: orderId -> resolve callback
 const _kalFillWaiters = new Map<string, (evt: KalFillEvent) => void>();
 
+// Recent fill buffer: stores last 30s of fills so execution can check after HTTP response.
+// The WS fill often arrives BEFORE the HTTP response, so the fill is already buffered
+// by the time we get the orderId from HTTP.
+const _recentKalFills = new Map<string, KalFillEvent>();
+const RECENT_FILL_TTL = 30_000; // 30s buffer
+
+/** Get a recent KAL fill by orderId (from WS buffer). Returns null if not found. */
+export function getRecentKalFill(orderId: string): KalFillEvent | null {
+  const fill = _recentKalFills.get(orderId);
+  if (!fill) return null;
+  if (Date.now() - fill.ts * 1000 > RECENT_FILL_TTL) {
+    _recentKalFills.delete(orderId);
+    return null;
+  }
+  return fill;
+}
+
+/** Wait for a KAL fill to appear in the buffer (or arrive via WS). */
+export async function waitForKalFillData(orderId: string, timeoutMs = 500): Promise<KalFillEvent | null> {
+  // Check buffer first (WS likely already arrived before HTTP response)
+  const buffered = getRecentKalFill(orderId);
+  if (buffered) return buffered;
+  // Not in buffer yet — wait briefly for WS to deliver it
+  return waitForKalFillWs(orderId, timeoutMs);
+}
+
 // Kalshi order status waiters: orderId -> resolve callback
 const _kalOrderWaiters = new Map<string, (evt: KalOrderEvent) => void>();
 
@@ -357,6 +383,13 @@ export function connectKalshiWs(): void {
         const fill = msg.msg as KalFillEvent;
         const oid = fill?.order_id;
         if (oid) {
+          // Buffer recent fills so execution can check after HTTP response
+          _recentKalFills.set(oid, fill);
+          // Prune old entries periodically
+          if (_recentKalFills.size > 100) {
+            const cutoff = Date.now() - RECENT_FILL_TTL;
+            for (const [k, v] of _recentKalFills) { if (v.ts * 1000 < cutoff) _recentKalFills.delete(k); }
+          }
           // One-shot waiter
           if (_kalFillWaiters.has(oid)) _kalFillWaiters.get(oid)!(fill);
           // Persistent listener (hedge GTC tracking)
