@@ -20,7 +20,7 @@ import {
   fmtPct, atomicWriteFileSync,
 
   // Persistence
-  loadArbTrades, loadHedgeStates, saveHedgeStates, loadMetrics,
+  loadArbTrades, saveArbTrades, loadHedgeStates, saveHedgeStates, loadMetrics,
   setAllHedgeStates, setReconcileRecoveredTrades,
   getIncompletePendingFills, getActivePendingFillId, expireStalePendingFills,
 
@@ -205,6 +205,45 @@ async function main() {
   // -- Expire stale pending fills --
   const expiredCount = expireStalePendingFills();
   if (expiredCount > 0) console.log(`[STARTUP] Expired ${expiredCount} stale pending fill(s).`);
+
+  // -- Auto-repair corrupted trades --
+  // postResolutionFillAudit could inflate kalCost by attributing fills from other
+  // servers/sessions. Detect and repair: kalCost > shares (impossible for binary contracts).
+  {
+    const trades = loadArbTrades();
+    let repaired = 0;
+    for (const t of trades) {
+      if (t.shares <= 0 || t.status === "hedging") continue;
+      const maxKalCost = t.shares; // $1/share max for binary
+      if (t.kalCost > maxKalCost) {
+        const oldCost = t.kalCost;
+        // Estimate correct cost from execution metric or projected edge
+        // Best estimate: shares × kalFillPrice (if kalFillPrice looks reasonable)
+        const estPrice = t.kalFillPrice > 0 && t.kalFillPrice <= 1 ? t.kalFillPrice : (t.projectedEdge > 0 ? (1 - t.pmFillPrice - t.projectedEdge) : 0.5);
+        const estCost = Math.round(t.shares * estPrice * 100) / 100;
+        const estFees = Math.round(t.shares * 0.07 * estPrice * (1 - estPrice) * 100) / 100;
+        t.kalCost = estCost;
+        t.kalFees = estFees;
+        t.kalFillPrice = estPrice;
+        delete (t as any).overHedgeShares;
+        delete (t as any).overHedgeCost;
+        delete (t as any).overHedgeSide;
+        delete (t as any).kalYesFills;
+        delete (t as any).kalNoFills;
+        t.totalCost = Math.round((t.kalCost + t.kalFees + t.pmCost) * 100) / 100;
+        if (t.resolutionMethod === "both-legs" || t.resolutionMethod === "hedge-complete") {
+          t.realizedPnl = Math.round((t.shares - t.totalCost) * 100) / 100;
+        }
+        t.resolutionNote = `auto-repaired: kalCost was $${oldCost.toFixed(2)} (inflated by multi-server fills)`;
+        console.warn(`[REPAIR] ${t.match}: kalCost $${oldCost.toFixed(2)} -> $${estCost.toFixed(2)} (was > $${maxKalCost}/share limit)`);
+        repaired++;
+      }
+    }
+    if (repaired > 0) {
+      saveArbTrades(trades);
+      console.log(`[STARTUP] Repaired ${repaired} trade(s) with inflated kalCost.`);
+    }
+  }
 
   // -- Startup reconciliation --
   console.log("[STARTUP] Running position reconciliation (non-blocking)...");
