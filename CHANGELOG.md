@@ -30,3 +30,5 @@ Categories: `FEATURE`, `FIX`, `REFACTOR`, `CONFIG`, `SAFETY`, `HEDGE`, `RECONCIL
   - MEDIUM: Added pending fill expiration (15-min TTL) with startup cleanup (ttPersistence.ts, runARB.ts)
   - FIX: Added missing audit import and ttAuditLog re-export (runARB.ts, index.ts)
 [2026-04-14] FIX: Fixed hedge cycle deadlock — Promise.race timeout was not releasing _hedgeCycleLocks, causing all subsequent hedge cycles to skip forever. Added releaseHedgeCycleLock() export from ttHedge.ts. Timeout increased from 90s to 150s to accommodate max sequential await chain (waitForPmOrderFill 60s + verifyPmFill 60s = 120s). (ttExecution.ts, ttHedge.ts)
+[2026-04-14] FIX: Added hedge inflight guard (_hedgeInflight set) preventing orphaned promise flood when runHedgeCycle hangs — at most 1 hanging cycle per position. (ttExecution.ts)
+[2026-04-14] FIX: Added stale GTC order timeout (2h) in hedge cycle — orders with 0 fills after 2 hours are auto-cancelled instead of checking CLOB API (which hangs for settled markets). Reconciliation resolves the trade when market settles. (ttHedge.ts)

@@ -1082,6 +1082,22 @@ export async function runHedgeCycle(state: HedgeState, clobBase: string): Promis
   for (const [oid, ho] of activeOrders) {
     // Skip dry-run order IDs -- they're fake and will fail API calls
     if (oid.startsWith("dry-")) { activeOrders.delete(oid); continue; }
+
+    // Stale order timeout: if a GTC order has been resting with 0 fills for >2 hours,
+    // cancel it instead of checking status via CLOB API (which may hang for settled markets).
+    // Reconciliation will resolve the trade when the market settles.
+    const STALE_ORDER_MS = 2 * 60 * 60 * 1000; // 2 hours
+    if (ho.filledSoFar === 0 && ho.placedAt > 0 && Date.now() - ho.placedAt > STALE_ORDER_MS) {
+      console.warn(`[HEDGE] Order ${oid.slice(0, 16)}... (${ho.exchange} ${ho.role}) stale for ${Math.round((Date.now() - ho.placedAt) / 60_000)}min with 0 fills — cancelling.`);
+      try {
+        if (ho.exchange === "pm") await cancelPmOrder(oid, DRY_RUN);
+        else await cancelKalshiOrder(oid, DRY_RUN);
+        console.log(`[HEDGE] Cancelled stale order ${oid.slice(0, 16)}...`);
+      } catch { /* order may already be gone on the exchange */ }
+      activeOrders.delete(oid);
+      continue;
+    }
+
     try {
       let filledShares = 0;
       let orderDone = false;
