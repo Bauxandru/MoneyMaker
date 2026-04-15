@@ -2225,8 +2225,11 @@ const KAL_REST_REFRESH_INTERVAL_MS = 300_000; // 5 min
 export async function monitorLoop(watchlist: WatchEntry[]): Promise<void> {
   const clobBase = process.env.POLY_CLOB_URL ?? "https://clob.polymarket.com";
 
-  // Track in-flight hedge cycles to prevent spam when runHedgeCycle hangs >150s
+  // Track in-flight hedge cycles to prevent spam when runHedgeCycle hangs.
   const _hedgeInflight = new Set<string>();
+  // tradeId → timestamp until which we should NOT re-enter runHedgeCycle.
+  // Set when the watchdog fires; cleared when a cycle completes naturally.
+  const _hedgeWatchdogCooldownUntil = new Map<string, number>();
 
   // cooldownMap: matchCode → timestamp of last trade ATTEMPT (success or fail)
   const cooldownMap = new Map<string, number>();
@@ -2817,32 +2820,53 @@ export async function monitorLoop(watchlist: WatchEntry[]): Promise<void> {
         // order and then awaits WS notifications for its lifecycle. GTC orders
         // on both exchanges persist until filled or manually cancelled — they
         // are NEVER time-limited by this timeout. What the watchdog does is cap
-        // how long a single invocation of runHedgeCycle can hold its
-        // _hedgeInflight lock, so a wedged in-flight cycle can't permanently
-        // block the next re-entry. If it fires, the GTC orders stay on the
-        // exchange; only the local awaits are abandoned so the next tick can
-        // re-enter. Default bumped 150s → 30min via HEDGE_CYCLE_WATCHDOG_MS.
+        // how long a single invocation can hold its lock so a wedged cycle
+        // doesn't permanently block re-entry. If it fires, the GTC orders stay
+        // on the exchange; only the local awaits are abandoned.
+        //
+        // After a watchdog fire we apply a COOLDOWN — without it, the main loop
+        // would immediately start a fresh cycle on the next tick, accumulate a
+        // pile of orphan hanging promises, and eventually fire dozens of stale
+        // watchdog warnings in a single instant.
         const HEDGE_CYCLE_WATCHDOG_MS = Number(process.env.HEDGE_CYCLE_WATCHDOG_MS ?? 30 * 60_000);
-        // Track in-flight hedge cycles to prevent spam: don't start a new one
-        // if the previous is still running (even after lock release).
+        const HEDGE_WATCHDOG_COOLDOWN_MS = Number(process.env.HEDGE_WATCHDOG_COOLDOWN_MS ?? 5 * 60_000);
         for (const hs of hedgeStates) {
           const ticker = hs.position.kalLeg.ticker;
           const tradeId = hs.position.tradeId;
           if (_hedgeInflight.has(tradeId)) continue; // previous cycle still running
+          // Respect post-watchdog cooldown so we don't immediately re-enter
+          // and stack hanging cycles on top of each other.
+          const cooldownUntil = _hedgeWatchdogCooldownUntil.get(tradeId);
+          if (cooldownUntil && Date.now() < cooldownUntil) continue;
           _hedgeInflight.add(tradeId);
+          let watchdogTimer: ReturnType<typeof setTimeout> | null = null;
+          let watchdogFired = false;
           Promise.race([
             runHedgeCycle(hs, clobBase),
-            new Promise<void>(resolve => setTimeout(() => {
-              console.warn(
-                `[HEDGE] cycle watchdog fired for ${ticker} (${HEDGE_CYCLE_WATCHDOG_MS / 60_000}min). ` +
-                `GTC orders on the exchange are NOT cancelled; next re-entry will pick up where this left off.`
-              );
-              releaseHedgeCycleLock(tradeId);
-              resolve();
-            }, HEDGE_CYCLE_WATCHDOG_MS)),
+            new Promise<void>(resolve => {
+              watchdogTimer = setTimeout(() => {
+                watchdogFired = true;
+                console.warn(
+                  `[HEDGE] cycle watchdog fired for ${ticker} (${HEDGE_CYCLE_WATCHDOG_MS / 60_000}min). ` +
+                  `Re-entry blocked for ${HEDGE_WATCHDOG_COOLDOWN_MS / 60_000}min cooldown. ` +
+                  `GTC orders on the exchange are NOT cancelled.`
+                );
+                _hedgeWatchdogCooldownUntil.set(tradeId, Date.now() + HEDGE_WATCHDOG_COOLDOWN_MS);
+                releaseHedgeCycleLock(tradeId);
+                resolve();
+              }, HEDGE_CYCLE_WATCHDOG_MS);
+            }),
           ])
           .catch(err => console.error(`[HEDGE] cycle error for ${ticker}: ${(err as Error).message}`))
-          .finally(() => _hedgeInflight.delete(tradeId));
+          .finally(() => {
+            // Always clear the watchdog timer when the race is done — without
+            // this, a naturally-completed cycle still has a pending timer that
+            // will fire later and log a stale watchdog warning.
+            if (watchdogTimer) clearTimeout(watchdogTimer);
+            // Successful completion clears any prior cooldown.
+            if (!watchdogFired) _hedgeWatchdogCooldownUntil.delete(tradeId);
+            _hedgeInflight.delete(tradeId);
+          });
         }
 
         // Remove resolved positions
