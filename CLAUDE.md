@@ -405,6 +405,31 @@ These are known issues. Do not waste time "discovering" them — they're documen
 
 **Claude must commit and push after every modification session.** This is a hard rule to prevent work loss.
 
+### Explicit commit authorization (overrides default "ask before committing")
+
+The user hereby authorizes Claude to `git commit` and `git push` to
+`origin main` at the end of every modification session, **without
+asking first**, provided:
+
+- All staged files are source (`.ts`, `.tsx`, `.js`, `.mjs`, `.md`),
+  config (`package.json`, `tsconfig.json`, `.gitignore`), or tests.
+- No file under `data/`, `.env*`, `hedge_state.json`, `node_modules/`,
+  `dist/`, or `secrets/` is staged.
+- The pre-commit secret scanner hook passes.
+- The commit message uses the project's style: short subject line
+  (under 70 chars), bulleted body explaining *why* and *what*,
+  `Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>`
+  trailer.
+
+This authorization **overrides** the default global "never commit
+unless user explicitly asks" safety. The scope is limited to this
+repo. When in doubt about whether a file belongs in the commit,
+err on the side of leaving it unstaged and ask — but don't use
+uncertainty about one file as an excuse to skip committing the rest.
+
+An external `Stop` hook at `~/.claude/hooks/git-uncommitted-check.sh`
+warns if a session ends with uncommitted source files, as a safety net.
+
 ### After Every Change
 
 1. **Stage changed files** — use specific filenames, never `git add -A` or `git add .`
