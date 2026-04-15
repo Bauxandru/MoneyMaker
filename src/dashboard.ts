@@ -2303,130 +2303,81 @@ async function fetchSettlementMap() {
   } catch (e) { console.warn("Settlement map fetch failed:", e); }
 }
 
-// Shared Actual P&L computation -- single source of truth used by:
-//   actualPnlCell(), totals loop, and detail panel.
-// Returns { actualNet, statusLabel, cls, badge, kalWon, pmPayout, isShared, isScalar, usable }
-// usable=false means no exchange data / not computable -- caller should fall back.
+// Per-trade "Actual P&L" used by actualPnlCell(), totals loop, and detail panel.
+//
+// Design: the trade record's own realizedPnl is the single source of truth.
+// It is stamped at execution time from real exchange fills (WS fee_cost,
+// CLOB getTrades) and maintained by reconciliation paths that are all now
+// guarded so they cannot cross-attribute sibling-trade fills. An earlier
+// version of this function recomputed actualNet from a ticker-wide
+// settlementMap, which mis-attributed aggregate KAL fills across shared
+// tickers (especially across home + VPS servers) and produced phantom
+// losses. That computation is removed -- we display what the execution
+// pipeline actually recorded.
+//
+// Metadata fields (kalWon, pmPayout, isScalar, isShared) remain computed
+// from settlementMap because they are display-only labels and their errors
+// do not feed back into dollar numbers.
 function computeActualPnl(t) {
-  var s = settlementMap[t.kalTicker];
-
-  // No exchange audit data -- fall back to recorded realizedPnl for resolved trades
-  if (!s) {
-    if (t.status === "resolved" && t.realizedPnl != null) {
-      return { actualNet: t.realizedPnl, statusLabel: "from trade record", cls: t.realizedPnl >= 0 ? "green" : "red",
-               badge: '', kalWon: false, pmPayout: 0,
-               isShared: false, isScalar: false, usable: true };
-    }
+  if (t.status !== "resolved" || t.realizedPnl == null) {
     return { usable: false, resolved: t.status === "resolved" };
   }
 
-  // Edge case 9: PM-hedged trade (kalCost=0, hedge done entirely on PM opposite token).
-  // Exchange settlement data only shows the KAL side (which has 0 fills for this trade).
-  // The PM hedge payout ($1/share from opposite outcome) isn't in settlement data.
-  // Use the stored realizedPnl which was verified by the re-audit against PM positions.
-  if (t.resolutionMethod === "hedge-complete" && t.kalCost === 0 && t.initialExchange === "pm" && (t.hedgeCost || 0) > 0) {
-    var pmHedgePnl = t.realizedPnl != null ? t.realizedPnl : 0;
-    return { actualNet: pmHedgePnl, statusLabel: "pm-hedged", cls: pmHedgePnl >= 0 ? "green" : "red",
-             badge: '', kalWon: false, pmPayout: t.shares,
-             isShared: false, isScalar: false, usable: true };
-  }
-
-  // Edge case 2: Shared tickers -- multiple trades on same KAL ticker.
-  // Exchange data can't be split per-trade, fall back to realizedPnl.
+  var s = settlementMap[t.kalTicker];
   var isSharedTicker = _tickerTradeCount[t.kalTicker] > 1;
-
-  var pmCost = t.pmCost || 0;
-  var actualNet, statusLabel, cls, badge = '';
-
-  // hedgeCost adjustment logic:
-  // - When pmCost=0 (hedge on KAL): s.net already includes hedge cost. Do NOT subtract.
-  // - When kalCost=0 (hedge on PM): hedge cost is PM spending NOT in s.net. Subtract it.
-  // - hcAdj only applies when kalCost===0 AND hedgeCost>0
-  var hcAdj = (t.kalCost === 0 && (t.hedgeCost || 0) > 0) ? (t.hedgeCost || 0) : 0;
-
   var kalSide = ("CDGHI".indexOf(t.dir) >= 0) ? "no" : "yes";
-  var hasPmLeg = (pmCost > 0 || t.pmFillPrice > 0);
-  var isScalar = s.settlementResult === "scalar";
+  var hasPmLeg = ((t.pmCost || 0) > 0 || (t.pmFillPrice || 0) > 0);
+
+  // Display-only metadata. Safe defaults when settlementMap has no entry.
+  var isScalar = !!t.scalarSettlement || (s && s.settlementResult === "scalar");
   var kalWon = false;
   var pmPayout = 0;
+  var statusLabel = "from trade record";
+  var badge = '';
 
-  if (s.status === "settled") {
-    // Winner determination (priority order):
-    // 1. Scalar/voided: kalWon=false always (refund scenario)
-    // 2. settlementResult exists: direct from Kalshi
-    // 3. pairRedemption > 0: both sides covered, payout = shares regardless
-    // 4. Fallback heuristic: settlementRevenue > 0.50
+  if (s && s.status === "settled") {
     if (isScalar) {
       kalWon = false;
+      statusLabel = "settled (voided)";
+      badge = ' <span style="color:#d29922;font-size:9px">VOID</span>';
     } else if (s.settlementResult) {
       kalWon = s.settlementResult === kalSide;
+      statusLabel = kalWon ? "settled (KAL won)" : "settled (PM won)";
     } else if (s.pairRedemption > 0) {
-      // Both YES+NO bought -- pair redemption covers payout regardless of winner
-      kalWon = true; // doesn't matter, pairRedemption already in s.net
+      kalWon = true;
+      statusLabel = "settled (pair redemption)";
     } else {
       kalWon = s.settlementRevenue > 0.50;
-    }
-
-    // PM payout: PM side wins when KAL side lost AND trade has a PM leg
-    pmPayout = (!kalWon && !isScalar && hasPmLeg) ? t.shares : 0;
-
-    if (isScalar && hasPmLeg) {
-      // Edge case 3: Voided/scalar settlement
-      // KAL refunds (s.net ~ -fees), PM settles at 50c/share
-      var pmVoidPayout = t.shares * 0.50;
-      actualNet = Math.round((s.net + pmVoidPayout - pmCost - hcAdj) * 100) / 100;
-      statusLabel = "settled (voided)";
-      cls = actualNet >= 0 ? "green" : "red";
-      badge = ' <span style="color:#d29922;font-size:9px">VOID</span>';
-    } else if (isSharedTicker) {
-      // Edge case 2: shared ticker -- use per-trade P&L
-      if (t.realizedPnl != null) {
-        actualNet = t.realizedPnl;
-        statusLabel = kalWon ? "settled (KAL won)" : "settled (PM won)";
-        cls = actualNet >= 0 ? "green" : "red";
-        badge = ' <span style="color:#8b949e;font-size:9px" title="KAL exchange data shared across ' + _tickerTradeCount[t.kalTicker] + ' trades -- using per-trade P&L">(' + _tickerTradeCount[t.kalTicker] + 'x)</span>';
-      } else {
-        return { usable: false, resolved: true };
-      }
-    } else {
-      // Standard case: s.net covers all KAL activity, add PM payout, subtract PM costs
-      actualNet = Math.round((s.net + pmPayout - pmCost - hcAdj) * 100) / 100;
       statusLabel = kalWon ? "settled (KAL won)" : "settled (PM won)";
-      cls = actualNet >= 0 ? "green" : "red";
     }
-  } else if (s.status === "sold") {
-    // Edge case 6: Sold positions -- s.net covers sell revenue
-    if (isSharedTicker) {
-      if (t.realizedPnl != null) {
-        actualNet = t.realizedPnl;
-        statusLabel = "sold (shared ticker)";
-        cls = actualNet >= 0 ? "green" : "red";
-        badge = ' <span style="color:#d29922;font-size:9px">SOLD</span>';
-      } else {
-        return { usable: false, resolved: true };
-      }
-    } else {
-      actualNet = Math.round((s.net) * 100) / 100;
-      statusLabel = "sold (PM pending)";
-      cls = actualNet >= 0 ? "green" : "red";
-      badge = ' <span style="color:#d29922;font-size:9px">SOLD</span>';
-    }
+    pmPayout = (!kalWon && !isScalar && hasPmLeg) ? t.shares : 0;
+    if (isScalar && hasPmLeg) pmPayout = t.shares * 0.50;
+  } else if (s && s.status === "sold") {
+    statusLabel = "sold";
+    badge = ' <span style="color:#d29922;font-size:9px">SOLD</span>';
+  } else if (!s) {
+    // No exchange audit entry yet -- still show the trade's stored P&L.
+    statusLabel = "from trade record";
   } else {
-    // Edge case 5: Open/unsettled -- use realizedPnl as estimate
-    if (t.status === "resolved" && t.realizedPnl != null) {
-      actualNet = t.realizedPnl;
-      statusLabel = "pending";
-      cls = actualNet >= 0 ? "green" : "red";
-      badge = ' <span style="color:#8b949e;font-size:9px">PENDING</span>';
-    } else {
-      return { usable: false, resolved: false };
-    }
+    statusLabel = "pending";
+    badge = ' <span style="color:#8b949e;font-size:9px">PENDING</span>';
+  }
+
+  if (t.pnlVerified) {
+    badge = ' <span style="color:#3fb950;font-size:9px" title="pnlVerified ' + t.pnlVerified + '">✓</span>' + badge;
+    statusLabel = "verified from exchange";
   }
 
   return {
-    actualNet: actualNet, statusLabel: statusLabel, cls: cls, badge: badge,
-    kalWon: kalWon, pmPayout: pmPayout, isShared: isSharedTicker,
-    isScalar: isScalar, usable: true
+    actualNet: t.realizedPnl,
+    statusLabel: statusLabel,
+    cls: t.realizedPnl >= 0 ? "green" : "red",
+    badge: badge,
+    kalWon: kalWon,
+    pmPayout: pmPayout,
+    isShared: isSharedTicker,
+    isScalar: isScalar,
+    usable: true,
   };
 }
 
@@ -2478,7 +2429,9 @@ function kalFee(t) {
   return t.kalFees != null ? t.kalFees : Math.max(0, t.kalCost - t.shares * t.kalFillPrice);
 }
 function pmFee(t) {
-  // pmCost can include hedgeCost (opposite PM token buy) — don't count that as fee
+  // Prefer the authoritative value captured at fill time (feeSchedule.rate × shares × p × (1-p)).
+  // Fall back to inferring from pmCost when the trade predates the pmFees field.
+  if (t.pmFees != null) return t.pmFees;
   var basePmCost = t.pmCost - (t.hedgeCost || 0);
   return Math.max(0, basePmCost - t.shares * t.pmFillPrice);
 }

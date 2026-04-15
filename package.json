@@ -38,6 +38,7 @@
     "check:poly": "tsx src/checkPolyAuth.ts",
     "approve:poly": "tsx src/approvePolyAllowance.ts",
     "bench:latency": "tsx src/benchmarkLatency.ts",
+    "bench:speed": "tsx src/benchmarkSpeed.ts",
     "repair:trades": "tsx src/repairTrades.ts",
     "live:mention": "tsx src/liveMention.ts",
     "scan:multi": "tsx src/scanMultiOutcome.ts",

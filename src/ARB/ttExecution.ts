@@ -15,6 +15,7 @@ import {
   KAL_WS_STALE_MS, PM_WS_STALE_MS,
   DISCOVERY_CACHE_TTL_MS, MIN_DEPTH_MULT,
   PM_MARKETABLE_MIN_VALUE, KALSHI_FEE_RATE, PM_FEE_RATE,
+  pmFeeRateFor, pmFeePaid,
   KAL_MAKER_MODE, KAL_MAKER_WAIT_MS, KAL_MAKER_POLL_MS,
   PM_ORDER_TYPE,
   atomicWriteFileSync, fmtPct, ts, estimateFees,
@@ -414,9 +415,11 @@ export async function executeArb(
   console.log(`  PM:  ${entry.pmSlug} outcome=${pmLeg.outcome} @${fmtPct(pmAsk)}`);
 
   // KAL IOC limit: account for KAL taker fee + PM taker fee + MIN_EDGE
-  // fee(price) = KALSHI_FEE_RATE * price * (1 - price) + PM_FEE_RATE * pmAsk * (1 - pmAsk)
+  // fee(price) = KALSHI_FEE_RATE * price * (1 - price) + feeRate * pmAsk * (1 - pmAsk)
+  // feeRate is per-market (from gamma's feeSchedule.rate), defaults to PM_FEE_RATE.
   // Iterate: find highest kalPrice where kalPrice + fees + pmAsk + MIN_EDGE <= 1
-  const pmFeeForLimit = PM_FEE_RATE * pmAsk * (1 - pmAsk);
+  const pmFeeRateLeg = pmFeeRateFor(pmLeg);
+  const pmFeeForLimit = pmFeeRateLeg * pmAsk * (1 - pmAsk);
   let kalLimitCents = Math.max(1, Math.min(99, Math.floor((1 - pmAsk - MIN_EDGE - pmFeeForLimit) * 100)));
   while (kalLimitCents > 0) {
     const p = kalLimitCents / 100;
@@ -746,7 +749,7 @@ export async function executeArb(
         // Order is on-chain but not yet confirmed — poll until it resolves
         console.log(`  [PM LEG] On-chain pending (status=delayed), polling for confirmation...`);
         const _tPoll0 = performance.now();
-        const finalStatus = await waitForPmOrderFill(String(pmMeta.orderId), 20_000, pmLeg.tokenId, pmPreBalance);
+        const finalStatus = await waitForPmOrderFill(String(pmMeta.orderId), undefined, pmLeg.tokenId, pmPreBalance);
         tPmPoll = performance.now() - _tPoll0;
         if (finalStatus === "matched") {
           console.log(`  [PM LEG] Confirmed filled after delay (${tPmPoll.toFixed(0)}ms).`);
@@ -841,7 +844,7 @@ export async function executeArb(
           return unhedgedShares;
         }
         if (meta.status === "delayed" && meta.orderId) {
-          const finalStatus = await waitForPmOrderFill(String(meta.orderId), 20_000, pmOppLeg.tokenId);
+          const finalStatus = await waitForPmOrderFill(String(meta.orderId), undefined, pmOppLeg.tokenId);
           if (finalStatus === "matched") {
             console.log(`  [IMMEDIATE PM HEDGE] Filled (delayed) ${unhedgedShares}×${pmOppLeg.outcome} @${fmtPct(oppAsk)} — hedge complete.`);
             return unhedgedShares;
@@ -1376,7 +1379,7 @@ export async function executeArb(
           const kalFeeReserve = KALSHI_FEE_RATE * kalLimitPerShare * (1 - kalLimitPerShare);
           const worstKalCostPerShare = kalLimitPerShare + kalFeeReserve;
           const parallelRawBudget = 1 - worstKalCostPerShare;
-          const parallelPmFee = PM_FEE_RATE * parallelRawBudget * (1 - parallelRawBudget);
+          const parallelPmFee = pmFeeRateFor(pmLeg) * parallelRawBudget * (1 - parallelRawBudget);
           const parallelPmBudget = parallelRawBudget - parallelPmFee;
           const parallelPmPrice = Math.floor(parallelPmBudget / (pmLeg.tickSize || 0.01)) * (pmLeg.tickSize || 0.01);
 
@@ -1519,7 +1522,7 @@ export async function executeArb(
     if (!DRY_RUN && kalFillCostCents > 0 && kalFilled > 0) {
       const actualKalPerShare = (kalFillCostCents / 100 + kalFeesTotal) / kalFilled;
       const rawBudget = 1 - actualKalPerShare;
-      const pmFeeAtBudget = PM_FEE_RATE * rawBudget * (1 - rawBudget);
+      const pmFeeAtBudget = pmFeeRateFor(pmLeg) * rawBudget * (1 - rawBudget);
       const pmBudget = rawBudget - pmFeeAtBudget;
       const pmTick = pmLeg.tickSize || 0.01;
       pmOrderPrice = Math.floor(pmBudget / pmTick) * pmTick;
@@ -1596,7 +1599,7 @@ export async function executeArb(
         // FOK matched but on-chain confirmation pending — poll for it
         console.log(`  [PM LEG] FOK delayed (on-chain pending), polling for confirmation...`);
         const _tPoll0 = performance.now();
-        const finalStatus = await waitForPmOrderFill(String(fokMeta.orderId), 20_000, pmLeg.tokenId, pmPreBalance);
+        const finalStatus = await waitForPmOrderFill(String(fokMeta.orderId), undefined, pmLeg.tokenId, pmPreBalance);
         tPmPoll = performance.now() - _tPoll0;
         if (finalStatus === "matched") {
           console.log(`  [PM LEG] Confirmed filled after delay (${tPmPoll.toFixed(0)}ms).`);
@@ -1797,7 +1800,7 @@ export async function executeArb(
   // Use the ACTUAL order price (which may have been capped at breakeven), not the scan-time ask.
   const actualPmFillPrice = pmOrderPrice;
   const pmCostBothLegs = Math.round(shares * actualPmFillPrice * 100) / 100;
-  const pmTakerFee = Math.round(PM_FEE_RATE * actualPmFillPrice * (1 - actualPmFillPrice) * shares * 100) / 100;
+  const pmTakerFee = Math.round(pmFeeRateFor(pmLeg) * actualPmFillPrice * (1 - actualPmFillPrice) * shares * 100) / 100;
   const totalCostBothLegs = Math.round((kalCostRaw + kalFeesTotal + pmCostBothLegs + pmTakerFee) * 100) / 100;
   if (kalFillCostCents > 0) {
     console.log(`  [COST] KAL actual fill: ${kalFilled}×${(actualKalFillPrice * 100).toFixed(1)}¢ = $${kalRawCost.toFixed(2)} + $${kalFeesTotal.toFixed(2)} fee (snapshot was ${(kalAsk * 100).toFixed(0)}¢)`);
@@ -1823,6 +1826,7 @@ export async function executeArb(
     pmTokenId: pmLeg.tokenId,
     pmFillPrice: actualPmFillPrice,
     pmCost: pmCostBothLegs,
+    pmFees: pmTakerFee,
     totalCost: totalCostBothLegs,
     projectedEdge: edge,
     projectedProfit,
@@ -1987,7 +1991,7 @@ export async function executeArb3Leg(
           continue;
         }
         if (meta.status === "delayed" && meta.orderId) {
-          const finalStatus = await waitForPmOrderFill(String(meta.orderId), 20_000, leg.pmLeg.tokenId);
+          const finalStatus = await waitForPmOrderFill(String(meta.orderId), undefined, leg.pmLeg.tokenId);
           if (finalStatus === "matched") {
             console.log(`  [${legLabel}] PM filled (delayed)`);
             filled.push({ leg, fillPrice: leg.price, fillCost: shares * leg.price });
@@ -2807,9 +2811,18 @@ export async function monitorLoop(watchlist: WatchEntry[]): Promise<void> {
       const hedgeCheckInterval = allOrdersPlaced ? 25 : 1; // 25 cycles ≈ 10s once orders are placed
 
       if (cycle % hedgeCheckInterval === 0) {
-        // Run all hedge cycles in parallel, non-blocking. Each has 150s timeout.
-        // Timeout must exceed the max sequential await chain inside runHedgeCycle
-        // (waitForPmOrderFill 60s + verifyPmFill 60s = 120s worst case).
+        // Run all hedge cycles in parallel, non-blocking.
+        //
+        // WATCHDOG (not a GTC deadline): the inner `runHedgeCycle` places a GTC
+        // order and then awaits WS notifications for its lifecycle. GTC orders
+        // on both exchanges persist until filled or manually cancelled — they
+        // are NEVER time-limited by this timeout. What the watchdog does is cap
+        // how long a single invocation of runHedgeCycle can hold its
+        // _hedgeInflight lock, so a wedged in-flight cycle can't permanently
+        // block the next re-entry. If it fires, the GTC orders stay on the
+        // exchange; only the local awaits are abandoned so the next tick can
+        // re-enter. Default bumped 150s → 30min via HEDGE_CYCLE_WATCHDOG_MS.
+        const HEDGE_CYCLE_WATCHDOG_MS = Number(process.env.HEDGE_CYCLE_WATCHDOG_MS ?? 30 * 60_000);
         // Track in-flight hedge cycles to prevent spam: don't start a new one
         // if the previous is still running (even after lock release).
         for (const hs of hedgeStates) {
@@ -2820,10 +2833,13 @@ export async function monitorLoop(watchlist: WatchEntry[]): Promise<void> {
           Promise.race([
             runHedgeCycle(hs, clobBase),
             new Promise<void>(resolve => setTimeout(() => {
-              console.warn(`[HEDGE] runHedgeCycle timeout (150s) for ${ticker}`);
+              console.warn(
+                `[HEDGE] cycle watchdog fired for ${ticker} (${HEDGE_CYCLE_WATCHDOG_MS / 60_000}min). ` +
+                `GTC orders on the exchange are NOT cancelled; next re-entry will pick up where this left off.`
+              );
               releaseHedgeCycleLock(tradeId);
               resolve();
-            }, 150_000)),
+            }, HEDGE_CYCLE_WATCHDOG_MS)),
           ])
           .catch(err => console.error(`[HEDGE] cycle error for ${ticker}: ${(err as Error).message}`))
           .finally(() => _hedgeInflight.delete(tradeId));
@@ -3144,10 +3160,13 @@ export async function monitorLoop(watchlist: WatchEntry[]): Promise<void> {
         let eF = 1 - PH - PD - KA;
         eD -= estimateFees(KH, 0); eE -= estimateFees(KD, 0); eF -= estimateFees(KA, 0);
 
-        // 2-leg NO combos (G-L)
-        let eG = 1 - KH_no - PH - estimateFees(KH_no, PH);
-        let eH = 1 - KD_no - PD - estimateFees(KD_no, PD);
-        let eI = 1 - KA_no - PA - estimateFees(KA_no, PA);
+        // 2-leg NO combos (G-L). Per-leg PM fee rate from feeSchedule.
+        const pm1Rate3 = pmFeeRateFor(entry.pm1);
+        const pm2Rate3 = pmFeeRateFor(entry.pm2);
+        const pm3Rate3 = pmFeeRateFor(entry.pm3);
+        let eG = 1 - KH_no - PH - estimateFees(KH_no, PH, pm1Rate3);
+        let eH = 1 - KD_no - PD - estimateFees(KD_no, PD, pm3Rate3);
+        let eI = 1 - KA_no - PA - estimateFees(KA_no, PA, pm2Rate3);
         const PH_no = entry.pm1.noTokenId ? (pmPriceMap.get(entry.pm1.noTokenId) ?? null) : null;
         const PA_no = entry.pm2.noTokenId ? (pmPriceMap.get(entry.pm2.noTokenId) ?? null) : null;
         const PD_no = entry.pm3.noTokenId ? (pmPriceMap.get(entry.pm3.noTokenId) ?? null) : null;
@@ -3201,8 +3220,11 @@ export async function monitorLoop(watchlist: WatchEntry[]): Promise<void> {
       } else if (entry.isBinary) {
         const rawEdgeA = 1 - entry.kal1.yesAsk - pm2Ask;
         const rawEdgeC = 1 - entry.kal1.noAsk - pm1Ask;
-        let edgeA = rawEdgeA - estimateFees(entry.kal1.yesAsk, pm2Ask);
-        let edgeC = rawEdgeC - estimateFees(entry.kal1.noAsk, pm1Ask);
+        // Per-leg PM fee rate (from gamma feeSchedule.rate captured at discovery)
+        const pm1Rate = pmFeeRateFor(entry.pm1);
+        const pm2Rate = pmFeeRateFor(entry.pm2);
+        let edgeA = rawEdgeA - estimateFees(entry.kal1.yesAsk, pm2Ask, pm2Rate);
+        let edgeC = rawEdgeC - estimateFees(entry.kal1.noAsk, pm1Ask, pm1Rate);
 
         if (edgeA > 0) { const re = realisticEdge(entry.kal1.ticker, "yes", pm2Ask, pmMin2); if (re !== null) edgeA = re; }
         if (edgeC > 0) { const re = realisticEdge(entry.kal1.ticker, "no", pm1Ask, pmMin1); if (re !== null) edgeC = re; }
@@ -3235,10 +3257,13 @@ export async function monitorLoop(watchlist: WatchEntry[]): Promise<void> {
         const rawEdgeB = 1 - entry.kal2.yesAsk - pm1Ask;
         const rawEdgeC = 1 - entry.kal1.noAsk - pm1Ask;
         const rawEdgeD = 1 - entry.kal2.noAsk - pm2Ask;
-        let edgeA = rawEdgeA - estimateFees(entry.kal1.yesAsk, pm2Ask);
-        let edgeB = rawEdgeB - estimateFees(entry.kal2.yesAsk, pm1Ask);
-        let edgeC = rawEdgeC - estimateFees(entry.kal1.noAsk, pm1Ask);
-        let edgeD = rawEdgeD - estimateFees(entry.kal2.noAsk, pm2Ask);
+        // Per-leg PM fee rate (from gamma feeSchedule.rate at discovery)
+        const pm1Rate = pmFeeRateFor(entry.pm1);
+        const pm2Rate = pmFeeRateFor(entry.pm2);
+        let edgeA = rawEdgeA - estimateFees(entry.kal1.yesAsk, pm2Ask, pm2Rate);
+        let edgeB = rawEdgeB - estimateFees(entry.kal2.yesAsk, pm1Ask, pm1Rate);
+        let edgeC = rawEdgeC - estimateFees(entry.kal1.noAsk, pm1Ask, pm1Rate);
+        let edgeD = rawEdgeD - estimateFees(entry.kal2.noAsk, pm2Ask, pm2Rate);
 
         if (edgeA > 0) { const re = realisticEdge(entry.kal1.ticker, "yes", pm2Ask, pmMin2); if (re !== null) edgeA = re; }
         if (edgeB > 0) { const re = realisticEdge(entry.kal2.ticker, "yes", pm1Ask, pmMin1); if (re !== null) edgeB = re; }

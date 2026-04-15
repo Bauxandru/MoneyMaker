@@ -157,6 +157,13 @@ export type PmLeg = {
   tickSize: number;
   minSize: number;
   negRisk: boolean;
+  /**
+   * Per-market taker fee coefficient from gamma's `feeSchedule.rate`.
+   * Formula: fee_paid = shares × feeRate × price × (1 - price).
+   * Defaults to PM_FEE_RATE (0.03) if not set. Some markets charge 0,
+   * others charge higher (e.g. eSports sports_fees_v2 — verify feeSchedule).
+   */
+  feeRate?: number;
 };
 
 export type WatchEntry = {

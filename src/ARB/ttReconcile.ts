@@ -131,10 +131,25 @@ export async function handleGhostFill(tokenId: string, shares: number, txHash: s
     return;
   }
 
-  // Look for a "hedging" trade on the same KAL ticker that needs PM shares
-  const hedgingTrade = trades.find(t =>
+  // Look for a "hedging" trade on the same KAL ticker that needs PM shares.
+  //
+  // BUG CAUGHT BY SEA KRAKEN 2026-04-14: when two arbs fire on the same ticker
+  // within a cooldown gap (both hedging, both pmCost=0), a plain Array.find()
+  // picks the FIRST match regardless of which trade the ghost fill actually
+  // belongs to. PendingFill has no tradeId field, but the trade's ts and the
+  // pending fill's ts were recorded milliseconds apart (logArbTrade runs right
+  // after completePendingFill). Pick the hedging trade whose ts is CLOSEST to
+  // the ghost's pending-fill ts — within a 60s window — to attribute correctly.
+  const ghostTs = new Date(ghostPf.ts).getTime();
+  const hedgingCandidates = trades.filter(t =>
     t.status === "hedging" && t.kalTicker === ghostPf.kalTicker && t.pmCost === 0
   );
+  const hedgingTrade = hedgingCandidates.length === 0 ? undefined
+    : hedgingCandidates.length === 1 ? hedgingCandidates[0]
+    : hedgingCandidates
+        .map(t => ({ t, dist: Math.abs(new Date(t.ts).getTime() - ghostTs) }))
+        .sort((a, b) => a.dist - b.dist)
+        .filter(x => x.dist < 60_000)[0]?.t;
 
   if (hedgingTrade) {
     // The hedge trade was waiting for PM shares -- they just arrived as a ghost fill!
@@ -349,6 +364,9 @@ export async function postResolutionFillAudit(kalTicker: string, tradeId: string
     actualBuyCost = Math.round(actualBuyCost * 100) / 100;
     actualFees = Math.round(actualFees * 100) / 100;
     if (!trade || trade.status !== "resolved") return;
+    // Ground-truth lock: rebuildPnLFromExchange has already set authoritative
+    // values from Kalshi fills + PM CLOB. Don't re-derive heuristically.
+    if (trade.pnlVerified) return;
 
     // Compare: are there more fills on exchange than tracked?
     const trackedKalCost = trade.kalCost ?? 0;
@@ -440,7 +458,9 @@ export async function repairPmCostsFromClob(trades: ArbTradeRecord[]): Promise<{
     !(t.initialExchange === "kal" && (t.resolutionMethod === "hedge-complete" || t.resolutionMethod === "settlement")) &&
     // Skip trades still hedging — the hedge cycle will set pmCost when the GTC fills.
     // Timestamp-matching here would assign fills from other trades/sessions, corrupting costs.
-    t.status !== "hedging"
+    t.status !== "hedging" &&
+    // Ground-truth lock: verified records must not be re-derived.
+    !t.pnlVerified
   );
   if (needRepair.length === 0) return { repaired, changed };
 
@@ -549,6 +569,8 @@ export async function verifyAndFixPnl(
     // Scalar-settled trades have manually-verified P&L from actual settlement values.
     // Never overwrite with the binary formula.
     if (trade.scalarSettlement) continue;
+    // Ground-truth lock: rebuildPnLFromExchange has set authoritative P&L.
+    if (trade.pnlVerified) continue;
 
     let correctPnl: number;
 
@@ -787,6 +809,9 @@ export async function reconcilePositions(trigger: string = "startup"): Promise<v
       if (group.length <= 1) continue;
       const hasGhost = group.some(g => g.id.includes("ghost") || g.id.includes("recovered") || g.id.includes("excess"));
       if (!hasGhost) continue;
+      // Ground-truth lock: skip consolidation if ANY trade in the group is verified.
+      // Consolidation rewrites kalCost/pmCost/realizedPnl on the primary — would clobber verified values.
+      if (group.some(g => g.pnlVerified)) continue;
 
       // Get actual Kalshi position for this ticker
       const kalPos = kalPosMap.get(ticker);
@@ -1316,6 +1341,7 @@ export async function reconcilePositions(trigger: string = "startup"): Promise<v
   for (const trade of trades) {
     if (trade.status !== "resolved") continue;
     if (isResolvedPastDay(trade)) continue;
+    if (trade.pnlVerified) continue; // ground-truth lock
     if (trade.resolutionMethod !== "settlement") continue;
     if ((trade.realizedPnl ?? 0) >= 0) continue; // only repair losses
     if ((trade.hedgeCost ?? 0) > 0) continue;     // hedge already recorded
@@ -1693,6 +1719,10 @@ export async function reconcilePositions(trigger: string = "startup"): Promise<v
 
     for (const t of allTrades) {
       if (t.status !== "resolved" || !t.kalTicker) continue;
+      // Ground-truth lock: rebuildPnLFromExchange has set authoritative values
+      // for this trade. Skipping here prevents the aggregate-per-ticker math
+      // below from re-overwriting them on every reconcile cycle.
+      if (t.pnlVerified) continue;
       // Skip tickers shared by multiple trades (can't attribute fills)
       const sharedCount = allTrades.filter(x => x.kalTicker === t.kalTicker).length;
       if (sharedCount > 1) continue;
@@ -1773,6 +1803,8 @@ export async function reconcilePositions(trigger: string = "startup"): Promise<v
       if (t.status !== "resolved" || !t.pmSlug || !t.pmTokenId) continue;
       if (t.resolutionMethod !== "hedge-complete" && t.resolutionMethod !== "settlement") continue;
       if (t.initialExchange !== "pm") continue;
+      // Ground-truth lock: do not rewrite hedgeCost on verified records.
+      if (t.pnlVerified) continue;
 
       // Find PM positions on the same slug that are NOT the initial token
       const oppHeld = pmPositions.filter((p: PmPosition) => {

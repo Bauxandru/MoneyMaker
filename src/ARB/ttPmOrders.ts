@@ -324,13 +324,16 @@ export async function postPreSignedPmOrder(signedOrder: unknown): Promise<unknow
 
 export async function waitForPmOrderFill(
   orderId: string,
-  timeoutMs = 15_000,
+  timeoutMs?: number,
   _tokenId?: string,
   _preBalance = 0
 ): Promise<"matched" | "cancelled" | "timeout"> {
-  // Primary: wait for fill via PM User WebSocket — require on-chain confirmation.
-  // MATCHED means CLOB accepted but on-chain not yet settled.
-  // CONFIRMED/MINED means on-chain settled.
+  // Wait indefinitely for Polymarket's executor to confirm MINED/CONFIRMED or
+  // declare FAILED. No timeout by default — the PM executor queue can legitimately
+  // take minutes during busy windows, and every premature abort triggered false
+  // hedge-mode entries on orders that were still alive. A 30-minute safety cap
+  // exists in waitForPmFillWs to prevent zombie waiters if the WS dies silently.
+  // To opt back into a shorter timeout, callers can pass timeoutMs explicitly.
   if (isPmUserWsReady()) {
     const evt = await waitForPmFillWs(orderId, timeoutMs); // requireMined=true (default)
     if (evt) {
@@ -345,7 +348,7 @@ export async function waitForPmOrderFill(
       }
       if (status === "FAILED") return "cancelled";
     }
-    // WS timed out -- fall through to one REST check
+    // WS safety cap fired OR returned null -- fall through to one REST check
   }
 
   // Fallback: single REST check (not a polling loop)

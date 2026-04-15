@@ -36,6 +36,34 @@ function _kalshiWsSign(ts: string): string {
   return signer.sign({ key: _kalshiPK, padding: crypto.constants.RSA_PKCS1_PSS_PADDING, saltLength: 32 }, "base64");
 }
 
+// --- Raw WS event logger ------------------------------------------------------
+// Appends every Kalshi fill, Kalshi order update, and PM trade event verbatim to
+// data/raw_ws_events.jsonl. Purpose: when a trade record's price disagrees with
+// post-hoc /portfolio/fills data (e.g. bot recorded 0.22 but exchange shows 0.74),
+// we need the actual WS payload we consumed at the time. Without this log we're
+// guessing about what Kalshi/PM sent. Rotates at 20MB, keeps 2 rotated files.
+const RAW_WS_LOG_PATH = "data/raw_ws_events.jsonl";
+const RAW_WS_LOG_MAX_BYTES = 20 * 1024 * 1024;
+let _rawWsLogSize = -1; // -1 = unchecked; 0+ = cached byte count
+function logRawWsEvent(source: "kal-fill" | "kal-order" | "kal-lifecycle" | "pm-trade", payload: unknown): void {
+  try {
+    if (_rawWsLogSize < 0) {
+      try { _rawWsLogSize = fs.existsSync(RAW_WS_LOG_PATH) ? fs.statSync(RAW_WS_LOG_PATH).size : 0; }
+      catch { _rawWsLogSize = 0; }
+    }
+    if (_rawWsLogSize > RAW_WS_LOG_MAX_BYTES) {
+      try {
+        if (fs.existsSync(RAW_WS_LOG_PATH + ".1")) fs.renameSync(RAW_WS_LOG_PATH + ".1", RAW_WS_LOG_PATH + ".2");
+        fs.renameSync(RAW_WS_LOG_PATH, RAW_WS_LOG_PATH + ".1");
+      } catch { /* best-effort */ }
+      _rawWsLogSize = 0;
+    }
+    const line = JSON.stringify({ ts: new Date().toISOString(), source, payload }) + "\n";
+    fs.appendFileSync(RAW_WS_LOG_PATH, line);
+    _rawWsLogSize += line.length;
+  } catch { /* never let logging break the WS handler */ }
+}
+
 // --- In-memory live orderbook state ------------------------------------------
 
 export const wsKalBooks = new Map<string, WsLiveBook>();
@@ -381,6 +409,7 @@ export function connectKalshiWs(): void {
       // --- Kalshi fill channel ---
       } else if (msg.type === "fill") {
         const fill = msg.msg as KalFillEvent;
+        logRawWsEvent("kal-fill", fill);
         const oid = fill?.order_id;
         if (oid) {
           // Buffer recent fills so execution can check after HTTP response
@@ -399,6 +428,7 @@ export function connectKalshiWs(): void {
       // --- Kalshi user_orders channel ---
       } else if (msg.type === "user_order") {
         const order = msg.msg as KalOrderEvent;
+        logRawWsEvent("kal-order", order);
         const oid = order?.order_id;
         if (oid) {
           // One-shot waiter
@@ -410,6 +440,7 @@ export function connectKalshiWs(): void {
       // --- Kalshi market lifecycle channel ---
       } else if (msg.type === "market_lifecycle_v2") {
         const evt = msg.msg as KalMarketLifecycleEvent;
+        logRawWsEvent("kal-lifecycle", evt);
         if (evt.event_type === "determined" && evt.market_ticker) {
           const result = (evt.result ?? "").toUpperCase();
           const sv = Number(evt.settlement_value ?? (result === "YES" ? 1 : 0));
@@ -576,17 +607,34 @@ export function setPmGhostFillHandler(
  *  MATCHED event if one arrived (caller can check status to know it's unconfirmed).
  *
  *  When requireMined=false, resolves immediately on any status (MATCHED/CONFIRMED/MINED).
- *  Use this only for non-critical checks where speed matters more than on-chain certainty. */
-export function waitForPmFillWs(orderId: string, timeoutMs = 15_000, requireMined = true): Promise<PmTradeEvent | null> {
+ *  Use this only for non-critical checks where speed matters more than on-chain certainty.
+ *
+ *  TIMEOUT: as of 2026-04-15, there is NO time limit. We wait until Polymarket's
+ *  executor either confirms MINED/CONFIRMED or declares FAILED. The prior 15-20s
+ *  timeouts were the direct cause of false hedge-mode entries when the executor
+ *  queue was slow but the order was still alive. A hard safety cap is kept at 30
+ *  minutes to prevent zombie waiters if the WS connection dies silently; a loud
+ *  warning is logged if this fires, so it's detectable. Set PM_WAIT_MAX_MS=0 in
+ *  env to disable the safety cap entirely. */
+const PM_WAIT_MAX_MS_DEFAULT = Number(process.env.PM_WAIT_MAX_MS ?? 30 * 60_000);
+export function waitForPmFillWs(orderId: string, timeoutMs?: number, requireMined = true): Promise<PmTradeEvent | null> {
+  const safetyCap = timeoutMs ?? PM_WAIT_MAX_MS_DEFAULT;
   return new Promise((resolve) => {
-    const timer = setTimeout(() => {
-      const w = _pmFillWaiters.get(orderId);
-      const storedEvt = w?.matchedEvt ?? null;
-      _pmFillWaiters.delete(orderId);
-      resolve(storedEvt); // resolve with MATCHED event if we have one, else null
-    }, timeoutMs);
-
-    _pmFillWaiters.set(orderId, { resolve, timer, matchedEvt: null, requireMined });
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    if (safetyCap > 0) {
+      timer = setTimeout(() => {
+        const w = _pmFillWaiters.get(orderId);
+        const storedEvt = w?.matchedEvt ?? null;
+        _pmFillWaiters.delete(orderId);
+        console.error(
+          `[PM-USER-WS] SAFETY-CAP HIT for order ${orderId.slice(0, 16)}... after ${safetyCap / 60_000}min. ` +
+          `WS likely disconnected without delivering MINED/FAILED. Resolving with ${storedEvt ? "stored MATCHED event" : "null"}; ` +
+          `reconciliation will settle this trade.`
+        );
+        resolve(storedEvt);
+      }, safetyCap);
+    }
+    _pmFillWaiters.set(orderId, { resolve, timer: timer as ReturnType<typeof setTimeout>, matchedEvt: null, requireMined });
   });
 }
 
@@ -619,7 +667,7 @@ export function extractPmFillCost(evt: PmTradeEvent): { totalCost: number; total
 function _resolveWaiterIfReady(w: PmFillWaiter, orderId: string, evt: PmTradeEvent, isOnChain: boolean): boolean {
   if (isOnChain || !w.requireMined) {
     // CONFIRMED/MINED or waiter doesn't require on-chain → resolve immediately
-    clearTimeout(w.timer);
+    if (w.timer) clearTimeout(w.timer);
     _pmFillWaiters.delete(orderId);
     w.resolve(evt);
     return true;
@@ -685,13 +733,14 @@ export function connectPmUserWs(): void {
         if (evt.event_type !== "trade") continue;
         const status = evt.status?.toUpperCase();
         if (status !== "MATCHED" && status !== "CONFIRMED" && status !== "MINED" && status !== "FAILED" && status !== "RETRYING") continue;
+        logRawWsEvent("pm-trade", evt);
 
         // FAILED: executor gave up → transaction is dead, resolve waiter immediately
         if (status === "FAILED") {
           const takerId = evt.taker_order_id;
           if (takerId && _pmFillWaiters.has(takerId)) {
             const w = _pmFillWaiters.get(takerId)!;
-            clearTimeout(w.timer);
+            if (w.timer) clearTimeout(w.timer);
             _pmFillWaiters.delete(takerId);
             evt.status = "FAILED"; // ensure status is uppercase for caller
             w.resolve(evt);

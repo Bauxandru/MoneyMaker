@@ -28,6 +28,29 @@ import {
   SOCCER_SERIES, CBB_SERIES, NON_MONEYLINE_BINARY_SERIES, SET_WINNER_SERIES,
 } from "./ttNameMatch.js";
 import { fetchPmAsk } from "./ttPmOrders.js";
+
+/**
+ * Extract the per-market PM taker fee rate from a gamma market response.
+ * Gamma returns `feeSchedule.rate` as the coefficient for the bell-curve
+ * formula: fee = shares × rate × p × (1 - p). If a market has fees disabled
+ * or the field is missing, returns 0 / undefined (default will be applied).
+ * Source: docs.polymarket.com/trading/fees (verified 2026-04-15)
+ */
+function extractPmFeeRate(pmMarket: Record<string, unknown>): number | undefined {
+  if (pmMarket.feesEnabled === false) return 0;
+  const schedule = pmMarket.feeSchedule as { rate?: unknown } | undefined;
+  if (schedule && typeof schedule.rate === "number" && Number.isFinite(schedule.rate)) {
+    return schedule.rate;
+  }
+  // Some endpoints return feeSchedule as a JSON string rather than parsed object.
+  if (typeof schedule === "string") {
+    try {
+      const parsed = JSON.parse(schedule as unknown as string) as { rate?: unknown };
+      if (typeof parsed.rate === "number" && Number.isFinite(parsed.rate)) return parsed.rate;
+    } catch { /* fallthrough */ }
+  }
+  return undefined;
+}
 import type { GammaMarket, KalshiEvent, KalshiMarket, WatchEntry, KalshiLeg, PmLeg } from "./ttTypes.js";
 
 // --- Discovery helpers --------------------------------------------------------
@@ -280,6 +303,7 @@ export async function loadStaticPairs(): Promise<WatchEntry[]> {
     const tickSize = Number(pmMarket.orderPriceMinTickSize ?? 0.01);
     const minSize = Number(pmMarket.orderMinSize ?? 1);
     const negRisk = Boolean(pmMarket.negRisk);
+    const feeRate = extractPmFeeRate(pmMarket as Record<string, unknown>);
 
     // -- Map Kalshi names to PM outcomes --
     function findPmToken(kalName: string): { outcome: string; tokenId: string } | null {
@@ -335,8 +359,8 @@ export async function loadStaticPairs(): Promise<WatchEntry[]> {
       matchCode, pmSlug, date,
       kal1: { ticker: kalTickers[0], surname: kalNames[0], yesAsk: kalAsks[0], noAsk: kalNoAsks[0], yesAskSize: kalYesAskSizes[0] ?? 0, noAskSize: kalNoAskSizes[0] ?? 0 },
       kal2: { ticker: kalTickers[1], surname: kalNames[1], yesAsk: kalAsks[1], noAsk: kalNoAsks[1], yesAskSize: kalYesAskSizes[1] ?? 0, noAskSize: kalNoAskSizes[1] ?? 0 },
-      pm1: { outcome: pm1Info.outcome, tokenId: pm1Info.tokenId, tickSize, minSize, negRisk },
-      pm2: { outcome: pm2Info.outcome, tokenId: pm2Info.tokenId, tickSize, minSize, negRisk },
+      pm1: { outcome: pm1Info.outcome, tokenId: pm1Info.tokenId, tickSize, minSize, negRisk, feeRate },
+      pm2: { outcome: pm2Info.outcome, tokenId: pm2Info.tokenId, tickSize, minSize, negRisk, feeRate },
     });
     console.log(`[STATIC] LOADED: ${kalNames[0]} vs ${kalNames[1]} -> ${pmSlug}`);
   }
@@ -1325,6 +1349,7 @@ export async function discoverWatchlist(): Promise<{ watchlist: WatchEntry[]; no
       const tickSize = Number(pmMarket.orderPriceMinTickSize ?? 0.01);
       const minSize  = Number(pmMarket.orderMinSize ?? 1);
       const negRisk  = Boolean(pmMarket.negRisk);
+      const feeRate  = extractPmFeeRate(pmMarket as Record<string, unknown>);
 
       // For binary markets: kal1 = kal2 = same Kalshi market
       // pm1 = first PM outcome (Over / team covers), pm2 = second PM outcome (Under / opp team)
@@ -1364,8 +1389,8 @@ export async function discoverWatchlist(): Promise<{ watchlist: WatchEntry[]; no
         matchCode: cand.matchCode, pmSlug, date: cand.date, isBinary: true,
         kal1: { ticker: kalEntity.ticker, surname: surname1, yesAsk: kalEntity.yesAsk, noAsk: kalEntity.noAsk, yesAskSize: kalEntity.yesAskSize ?? 0, noAskSize: kalEntity.noAskSize ?? 0 },
         kal2: { ticker: kalEntity.ticker, surname: surname2, yesAsk: kalEntity.yesAsk, noAsk: kalEntity.noAsk, yesAskSize: kalEntity.yesAskSize ?? 0, noAskSize: kalEntity.noAskSize ?? 0 },
-        pm1: { outcome: outcomes[0], tokenId: tokenIds[0], tickSize, minSize, negRisk },
-        pm2: { outcome: outcomes[1], tokenId: tokenIds[1], tickSize, minSize, negRisk },
+        pm1: { outcome: outcomes[0], tokenId: tokenIds[0], tickSize, minSize, negRisk, feeRate },
+        pm2: { outcome: outcomes[1], tokenId: tokenIds[1], tickSize, minSize, negRisk, feeRate },
       });
       console.log(`[DISCOVER] MATCHED BINARY [${seriesPrefix}] ${marketType}: ${surname1} vs ${surname2} -> ${pmSlug} (${outcomes[0]}/${outcomes[1]})`);
       continue;
@@ -1435,6 +1460,7 @@ export async function discoverWatchlist(): Promise<{ watchlist: WatchEntry[]; no
           tickSize: Number(m.orderPriceMinTickSize ?? 0.01),
           minSize: Number(m.orderMinSize ?? 1),
           negRisk: Boolean(m.negRisk),
+          feeRate: extractPmFeeRate(m as Record<string, unknown>),
         };
       };
       const pm1Token = extractYesToken(pmHome);
@@ -1479,6 +1505,7 @@ export async function discoverWatchlist(): Promise<{ watchlist: WatchEntry[]; no
     const tickSize = Number(pmMarket.orderPriceMinTickSize ?? 0.01);
     const minSize  = Number(pmMarket.orderMinSize ?? 1);
     const negRisk  = Boolean(pmMarket.negRisk);
+    const feeRate  = extractPmFeeRate(pmMarket as Record<string, unknown>);
 
     function findToken(entityName: string): { outcome: string; tokenId: string } | null {
       for (let i = 0; i < outcomes.length; i++)
@@ -1593,8 +1620,8 @@ export async function discoverWatchlist(): Promise<{ watchlist: WatchEntry[]; no
       matchCode: cand.matchCode, pmSlug, date: cand.date,
       kal1: { ticker: e1.ticker, surname: e1.name, yesAsk: e1.yesAsk, noAsk: e1.noAsk, yesAskSize: e1.yesAskSize ?? 0, noAskSize: e1.noAskSize ?? 0 },
       kal2: { ticker: e2.ticker, surname: e2.name, yesAsk: e2.yesAsk, noAsk: e2.noAsk, yesAskSize: e2.yesAskSize ?? 0, noAskSize: e2.noAskSize ?? 0 },
-      pm1: { outcome: pm1Info.outcome, tokenId: pm1Info.tokenId, tickSize, minSize, negRisk },
-      pm2: { outcome: pm2Info.outcome, tokenId: pm2Info.tokenId, tickSize, minSize, negRisk },
+      pm1: { outcome: pm1Info.outcome, tokenId: pm1Info.tokenId, tickSize, minSize, negRisk, feeRate },
+      pm2: { outcome: pm2Info.outcome, tokenId: pm2Info.tokenId, tickSize, minSize, negRisk, feeRate },
     });
     console.log(`[DISCOVER] MATCHED [${seriesPrefix || cand.eventTicker}] ${marketType}: ${e1.name} vs ${e2.name} -> ${pmSlug} (tick=${tickSize} negRisk=${negRisk})`);
   }

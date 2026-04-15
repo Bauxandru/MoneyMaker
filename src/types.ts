@@ -73,6 +73,8 @@ export type ArbTradeRecord = {
   realizedPnl?: number;
   initialExchange?: "pm" | "kal";
   kalFees?: number;   // actual Kalshi taker+maker fees from order response
+  pmFees?: number;    // actual PM taker fee paid (feeRate × shares × p × (1-p))
+  pmFeeRateBps?: number; // fee_rate_bps captured from CLOB getTrades() for audit
   // Scalar settlement fields -- set when Kalshi settles a cancelled/voided match
   scalarSettlement?: boolean;           // true if Kalshi settled as scalar (not binary)
   kalSettlementValue?: number;          // per-share KAL payout (e.g. 0.14 for NO at 86c YES scalar)
@@ -89,6 +91,12 @@ export type ArbTradeRecord = {
   serverId?: string;                     // which server placed this trade (e.g. "ashburn-vps", "romania-local")
   // PM overfill tracking -- when PM fills more fractional shares than ordered
   pmActualShares?: number;              // actual shares received from PM (e.g., 11.55 when 11 ordered)
+  // Ground-truth verification lock -- set by rebuildPnLFromExchange.ts after
+  // recomputing kalCost/pmCost/realizedPnl from Kalshi fills + PM CLOB trades.
+  // Reconciliation paths MUST skip any trade with pnlVerified set, otherwise
+  // they will re-overwrite the verified values with heuristic matches.
+  pnlVerified?: string;                 // ISO timestamp when record was verified against exchanges
+  pnlVerifiedBy?: string;               // e.g. "rebuildPnLFromExchange"
 };
 
 // Shared CLOB trade type -- used by dashboard.ts and repairTrades.ts

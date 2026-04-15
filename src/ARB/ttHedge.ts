@@ -22,6 +22,8 @@ import {
   KALSHI_FEE_RATE,
   KALSHI_MAKER_FEE_RATE,
   PM_FEE_RATE,
+  pmFeeRateFor,
+  pmFeePaid,
   TRADE_USD,
   MAX_CONTRACTS,
   HEDGE_TARGET,
@@ -1339,7 +1341,7 @@ export async function runHedgeCycle(state: HedgeState, clobBase: string): Promis
     const kalFeeReserve = KALSHI_FEE_RATE * estCompletePrice * (1 - estCompletePrice);
     // PM GTC placed above ask fills as TAKER (3% fee). Reserve for it.
     const estPmOppPrice = 1 - pos.pmCostBasis - hedgeEdge;
-    const pmOppFeeReserve = PM_FEE_RATE * estPmOppPrice * (1 - estPmOppPrice);
+    const pmOppFeeReserve = pmFeeRateFor(pos.pmOppLeg) * estPmOppPrice * (1 - estPmOppPrice);
     const maxKalPrice = 1 - pos.pmCostBasis - hedgeEdge - kalFeeReserve;
     const maxOppPrice = 1 - pos.pmCostBasis - hedgeEdge - pmOppFeeReserve;
     // Safety: log breakeven calculation on first hedge cycle
@@ -1431,7 +1433,7 @@ export async function runHedgeCycle(state: HedgeState, clobBase: string): Promis
         ]);
       }
       // IOC sweep is taker — check that ask + taker fee fits within breakeven
-      const pmTakerFeeAtAsk = oppCurrentAsk !== null ? PM_FEE_RATE * oppCurrentAsk * (1 - oppCurrentAsk) : 0;
+      const pmTakerFeeAtAsk = oppCurrentAsk !== null ? pmFeeRateFor(pos.pmOppLeg) * oppCurrentAsk * (1 - oppCurrentAsk) : 0;
       const maxOppPriceTaker = maxOppPrice - pmTakerFeeAtAsk; // tighter limit for taker IOC
       if (oppCurrentAsk !== null && oppCurrentAsk <= maxOppPriceTaker && sharesNeeded * oppCurrentAsk >= PM_MARKETABLE_MIN_VALUE) {
         try {
@@ -1456,7 +1458,7 @@ export async function runHedgeCycle(state: HedgeState, clobBase: string): Promis
             }
           }
           if (filled > 0) {
-            const pmIocFee = PM_FEE_RATE * oppCurrentAsk * (1 - oppCurrentAsk) * filled;
+            const pmIocFee = pmFeeRateFor(pos.pmOppLeg) * oppCurrentAsk * (1 - oppCurrentAsk) * filled;
             pos.sharesHeld = Math.max(0, pos.sharesHeld - filled);
             pos.hedgeFillCost += filled * oppCurrentAsk + pmIocFee;
             pos.hedgeFillCostPm += filled * oppCurrentAsk + pmIocFee;
@@ -1808,7 +1810,7 @@ export async function runHedgeCycle(state: HedgeState, clobBase: string): Promis
     // PM GTC placed above market ask fills as TAKER (3% fee). Reserve for it.
     // fee = PM_FEE_RATE × price × (1 - price). Estimate at the expected fill price.
     const estPmFillPrice = 1 - pos.kalCostBasis - hedgeEdge2;
-    const pmFeeReserve = PM_FEE_RATE * estPmFillPrice * (1 - estPmFillPrice);
+    const pmFeeReserve = pmFeeRateFor(pos.pmLeg) * estPmFillPrice * (1 - estPmFillPrice);
     const maxPmPrice = 1 - pos.kalCostBasis - hedgeEdge2 - pmFeeReserve;
     // Safety: log breakeven calculation on first hedge cycle
     if (!state.lastCompleteExchange) {
@@ -1911,7 +1913,50 @@ export async function runHedgeCycle(state: HedgeState, clobBase: string): Promis
             } catch { /* order may already be gone */ }
           }
           activeOrders.clear();
-          // Update trade record with actual PM fill data
+          // Guard: if this trade has been ground-truth-verified by rebuildPnLFromExchange,
+          // DO NOT overwrite its values with heuristic CLOB-attribution (see types.ts pnlVerified).
+          const existingTrade = loadArbTrades().find(t => t.id === pos.tradeId);
+          if (existingTrade?.pnlVerified) {
+            console.log(`[HEDGE] Skipping hedge-reconciled-onchain write — trade ${pos.tradeId} has pnlVerified=${existingTrade.pnlVerified}`);
+            pos.sharesHeld = 0;
+            saveHedgeState(state);
+            return;
+          }
+
+          // ── Breakeven gate: reject attributed fills that violate the arb cap ──
+          // If the on-chain fill price exceeds this trade's breakeven (kalCostBasis + pmFeeReserve),
+          // we should NOT stamp the trade as a successful hedge-reconciled-onchain. Attribution by
+          // timestamp can grab fills from sibling trades on the same PM token — their bad prices
+          // would lock in a loss on THIS trade's record. Instead, acknowledge the on-chain shares,
+          // park the position in `hedging` status, and let the market-settlement path compute a
+          // truthful P&L when the market closes.
+          const pmFeeAtFill = pmFeeRateFor(pos.pmLeg) * fillPrice * (1 - fillPrice);
+          const breakevenCap = 1 - pos.kalCostBasis - pmFeeAtFill;
+          const BREAKEVEN_TOLERANCE = 0.005; // 0.5c — tolerate tick rounding / fee jitter
+          if (fillPrice > breakevenCap + BREAKEVEN_TOLERANCE) {
+            console.warn(
+              `[HEDGE] On-chain PM fill ${fmtPct(fillPrice)} EXCEEDS breakeven ${fmtPct(breakevenCap)} ` +
+              `(kalCostBasis=${fmtPct(pos.kalCostBasis)}) for trade ${pos.tradeId}. ` +
+              `Attribution may be cross-trade; not resolving as complete arb. ` +
+              `Recording actual PM cost in hedgeFillCost and letting settlement close the trade.`
+            );
+            audit({
+              module: "hedge", fn: "runHedgeCycle", action: "reconcile-onchain-overpriced",
+              tradeId: pos.tradeId, kalTicker: pos.kalLeg.ticker, shares: totalSize,
+              price: fillPrice, context: {
+                breakevenCap, kalCostBasis: pos.kalCostBasis, fillCost,
+                note: "PM fills attributed but over breakeven — staying in hedging until settlement",
+              },
+            });
+            // Reflect real on-chain state so the outer hedge cycle doesn't place more PM orders.
+            pos.hedgeFillCost += fillCost;
+            pos.hedgeFillCostPm += fillCost;
+            pos.sharesHeld = 0;
+            saveHedgeState(state);
+            return;
+          }
+
+          // Within breakeven — legitimate arb completion. Resolve the trade.
           const totalCost = Math.round((pos.initialCost + fillCost) * 100) / 100;
           resolveArbTrade(pos.kalLeg.ticker, {
             status: "resolved",
@@ -1953,7 +1998,7 @@ export async function runHedgeCycle(state: HedgeState, clobBase: string): Promis
         ]);
       }
       // IOC sweep is taker — subtract taker fee from breakeven
-      const pmTakerFeeKH = pmCurrentAsk !== null ? PM_FEE_RATE * pmCurrentAsk * (1 - pmCurrentAsk) : 0;
+      const pmTakerFeeKH = pmCurrentAsk !== null ? pmFeeRateFor(pos.pmLeg) * pmCurrentAsk * (1 - pmCurrentAsk) : 0;
       const maxPmPriceTaker = maxPmPrice - pmTakerFeeKH;
       if (pmCurrentAsk === null) {
         console.log(`  [HEDGE] PM ask fetch returned null for ${pos.pmLeg.outcome} (token ${pos.pmLeg.tokenId.slice(0,16)}...)`);
@@ -1988,7 +2033,7 @@ export async function runHedgeCycle(state: HedgeState, clobBase: string): Promis
               }
             }
             if (filled > 0) {
-              const pmIocFeeKH = PM_FEE_RATE * pmCurrentAsk * (1 - pmCurrentAsk) * filled;
+              const pmIocFeeKH = pmFeeRateFor(pos.pmLeg) * pmCurrentAsk * (1 - pmCurrentAsk) * filled;
               pos.sharesHeld = Math.max(0, pos.sharesHeld - filled);
               pos.hedgeFillCost += filled * pmCurrentAsk + pmIocFeeKH;
               pos.hedgeFillCostPm += filled * pmCurrentAsk + pmIocFeeKH;

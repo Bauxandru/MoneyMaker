@@ -117,11 +117,31 @@ export const polyClobFetch = createRateLimitedFetcher(numEnv("POLY_CLOB_INTERVAL
 export function fmtPct(v: number, d = 1): string { return (v * 100).toFixed(d) + "%"; }
 export function ts(): string { return new Date().toISOString().replace("T", " ").slice(0, 23); }
 
-/** Estimate total per-share fee cost for one arb direction. */
-export function estimateFees(kalAsk: number, pmAsk: number): number {
+/** Estimate total per-share fee cost for one arb direction.
+ *  Optional pmFeeRate overrides the default PM_FEE_RATE — used when the
+ *  specific PM market exposes its own feeSchedule.rate (e.g. some categories
+ *  charge 0, others charge more). When unknown, defaults to PM_FEE_RATE. */
+export function estimateFees(kalAsk: number, pmAsk: number, pmFeeRate?: number): number {
   const kalFee = KALSHI_FEE_RATE * kalAsk * (1 - kalAsk);
-  const pmFee = PM_FEE_RATE * pmAsk * (1 - pmAsk);
+  const rate = typeof pmFeeRate === "number" ? pmFeeRate : PM_FEE_RATE;
+  const pmFee = rate * pmAsk * (1 - pmAsk);
   return kalFee + pmFee;
+}
+
+/** Resolve the PM taker fee rate for a specific leg — uses per-market rate
+ *  when available (populated at discovery from gamma's feeSchedule.rate),
+ *  falls back to the PM_FEE_RATE default when the market metadata is missing. */
+export function pmFeeRateFor(leg: { feeRate?: number } | undefined | null): number {
+  const r = leg?.feeRate;
+  return (typeof r === "number" && Number.isFinite(r)) ? r : PM_FEE_RATE;
+}
+
+/** Compute the actual PM taker fee paid for a fill, per Polymarket's formula:
+ *    fee = shares × feeRate × price × (1 - price)
+ *  Takes the per-leg feeRate as authoritative; falls back to PM_FEE_RATE. */
+export function pmFeePaid(shares: number, price: number, leg: { feeRate?: number } | undefined | null): number {
+  const rate = pmFeeRateFor(leg);
+  return shares * rate * price * (1 - price);
 }
 
 // --- Gamma/Kalshi API response parsers ----------------------------------------
