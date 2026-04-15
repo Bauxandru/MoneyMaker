@@ -242,25 +242,34 @@ function awaitPmOrderStatus(orderId: string, expected: string[], timeoutMs = 15_
 
 // --- Pick a live test market ------------------------------------------------
 async function pickKalshiTicker(): Promise<{ ticker: string; bestYesAsk: number }> {
-  // Walk pages until we find a market with a sane mid-range yes_ask (10-90c).
-  let cursor = "";
-  for (let page = 0; page < 5; page++) {
-    const qs = `status=open&limit=200${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`;
-    const r = await fetch(`${KAL_BASE}/markets?${qs}`);
-    const j = await r.json();
-    const markets = (j.markets ?? []) as any[];
-    for (const m of markets) {
-      // Field is yes_ask_dollars (string, in dollars). Convert to cents.
-      const yaDollars = Number(m.yes_ask_dollars ?? 0);
-      const yaCents = yaDollars * 100;
-      if (yaCents >= 10 && yaCents <= 90) {
-        return { ticker: String(m.ticker), bestYesAsk: Math.round(yaCents) };
+  // Prefer high-liquidity series. Try them in order; stop at first usable market.
+  const PREFERRED_SERIES = ["KXNHLGAME", "KXNBAGAME", "KXMLBGAME", "KXATPMATCH", "KXWTAMATCH", "KXCS2GAME", "KXLOLGAME", "KXVALORANTGAME"];
+  let scanned = 0;
+  for (const series of PREFERRED_SERIES) {
+    try {
+      const r = await fetch(`${KAL_BASE}/markets?status=open&series_ticker=${series}&limit=50`);
+      const j = await r.json();
+      const markets = (j.markets ?? []) as any[];
+      for (const m of markets) {
+        scanned++;
+        const yaCents = Number(m.yes_ask_dollars ?? 0) * 100;
+        if (yaCents < 10 || yaCents > 90) continue;
+        try {
+          const ob = await kalRequest("GET", `/markets/${m.ticker}/orderbook`);
+          const obj = ob.json?.orderbook_fp ?? {};
+          const yes = (Array.isArray(obj.yes_dollars) ? obj.yes_dollars : []) as Array<[string, string]>;
+          const no = (Array.isArray(obj.no_dollars) ? obj.no_dollars : []) as Array<[string, string]>;
+          if (yes.length === 0 || no.length === 0) continue;
+          const yesDepth = yes.reduce((s, l) => s + Number(l[1] ?? 0), 0);
+          const noDepth = no.reduce((s, l) => s + Number(l[1] ?? 0), 0);
+          if (yesDepth < 5 || noDepth < 5) continue;
+          console.log(`  Picked ${series}: ${m.ticker} (yesDepth=${yesDepth}, noDepth=${noDepth}) after scanning ${scanned} markets`);
+          return { ticker: String(m.ticker), bestYesAsk: Math.round(yaCents) };
+        } catch { continue; }
       }
-    }
-    cursor = String(j.cursor ?? "");
-    if (!cursor || markets.length < 200) break;
+    } catch { continue; }
   }
-  throw new Error("no usable kalshi market found (looked through 5 pages × 200)");
+  throw new Error(`no usable kalshi market found with sufficient depth (scanned ${scanned} markets across ${PREFERRED_SERIES.length} series)`);
 }
 
 async function pickPmMarket(): Promise<{ tokenId: string; tickSize: number; negRisk: boolean; bestAsk: number }> {
@@ -500,24 +509,33 @@ async function probePmFullCycle(
     const tStart = performance.now();
     let buyOrderId = "";
     let buyPlaceHttpMs = 0;
+    let buyHttpStatus = "";
+    let buyRes: any;
     try {
       const t0 = performance.now();
-      const buyRes = await (client as any).createAndPostOrder(
+      buyRes = await (client as any).createAndPostOrder(
         { tokenID: tokenId, price: ask, size: SHARES, side: Side.BUY },
         { tickSize: tickSize.toString(), negRisk },
         OrderType.FAK,
       );
       buyPlaceHttpMs = performance.now() - t0;
       buyOrderId = String(buyRes?.orderID ?? buyRes?.orderId ?? "");
+      buyHttpStatus = String(buyRes?.status ?? "").toLowerCase();
       if (!buyOrderId) {
-        console.error(`    BUY no orderId: ${JSON.stringify(buyRes).slice(0, 200)}`);
+        console.error(`    BUY no orderId: ${JSON.stringify(buyRes).slice(0, 300)}`);
         continue;
       }
+      console.log(`    BUY HTTP returned status=${buyHttpStatus} orderId=${buyOrderId.slice(0, 16)}...`);
     } catch (e) {
       console.error(`    BUY threw: ${(e as Error).message}`);
       continue;
     }
     const tBuyHttpDone = performance.now();
+    // If HTTP says unmatched, the order didn't fill — skip cycle, no shares to sell.
+    if (buyHttpStatus === "unmatched" || buyHttpStatus === "rejected") {
+      console.warn(`    BUY did not match (status=${buyHttpStatus}). No position to sell. Skipping cycle.`);
+      continue;
+    }
     // Wait MATCHED then MINED via WS
     let buyMatchedWsMs = 0, buyMinedWsMs = 0, tMatched = 0;
     try {
@@ -525,30 +543,33 @@ async function probePmFullCycle(
       tMatched = matched.tArrived;
       buyMatchedWsMs = tMatched - tBuyHttpDone;
       console.log(`    BUY MATCHED at +${buyMatchedWsMs.toFixed(0)}ms, waiting MINED...`);
-      // Now wait for MINED/CONFIRMED for the same order
       const mined = await awaitPmOrderStatus(buyOrderId, ["MINED", "CONFIRMED"], 60_000);
       buyMinedWsMs = mined.tArrived - tMatched;
       console.log(`    BUY MINED at +${buyMinedWsMs.toFixed(0)}ms`);
     } catch (e) {
-      console.error(`    BUY WS wait failed: ${(e as Error).message} — aborting cycle to avoid hung position`);
-      // Try emergency sell so we don't hold the stuck shares
+      console.error(`    BUY WS wait failed: ${(e as Error).message} — checking on-chain to confirm position state...`);
       try {
-        await (client as any).createAndPostOrder(
-          { tokenID: tokenId, price: bid * 0.5, size: SHARES, side: Side.SELL },
-          { tickSize: tickSize.toString(), negRisk },
-          OrderType.FAK,
-        );
-        console.warn(`    EMERGENCY SELL placed at ${(bid * 0.5).toFixed(3)} (deep bid, may not fill — manual review needed)`);
-      } catch { /* best effort */ }
-      continue;
+        const { getOnChainBalanceWithFallback } = await import("./polyChain.js");
+        const bal = await getOnChainBalanceWithFallback(tokenId);
+        console.warn(`    On-chain balance for token: ${bal} shares`);
+        if (bal < SHARES) {
+          console.log(`    Insufficient on-chain shares (${bal} < ${SHARES}) — BUY likely did not fill. Skipping cycle (no SELL).`);
+          continue;
+        }
+        console.warn(`    Have ${bal} shares on-chain. Proceeding to SELL despite WS timeout.`);
+      } catch (be) {
+        console.error(`    On-chain check failed: ${(be as Error).message}. Aborting cycle.`);
+        continue;
+      }
     }
 
     // -- SELL at best bid --
     let sellOrderId = "";
     let sellPlaceHttpMs = 0;
+    let sellRes: any;
     try {
       const t0 = performance.now();
-      const sellRes = await (client as any).createAndPostOrder(
+      sellRes = await (client as any).createAndPostOrder(
         { tokenID: tokenId, price: bid, size: SHARES, side: Side.SELL },
         { tickSize: tickSize.toString(), negRisk },
         OrderType.FAK,
@@ -556,8 +577,24 @@ async function probePmFullCycle(
       sellPlaceHttpMs = performance.now() - t0;
       sellOrderId = String(sellRes?.orderID ?? sellRes?.orderId ?? "");
       if (!sellOrderId) {
-        console.error(`    SELL no orderId — POSITION STUCK, manual unwind needed`);
-        continue;
+        console.error(`    SELL no orderId. Full response: ${JSON.stringify(sellRes)}`);
+        // Retry once at a slightly worse price (deeper into bids) — book may have moved
+        await new Promise((r) => setTimeout(r, 500));
+        const fallbackPrice = Math.max(0.01, bid - 0.02);
+        console.warn(`    Retrying SELL at fallback ${fallbackPrice.toFixed(2)} (2c below original bid)`);
+        try {
+          const retryRes: any = await (client as any).createAndPostOrder(
+            { tokenID: tokenId, price: fallbackPrice, size: SHARES, side: Side.SELL },
+            { tickSize: tickSize.toString(), negRisk },
+            OrderType.FAK,
+          );
+          sellOrderId = String(retryRes?.orderID ?? retryRes?.orderId ?? "");
+          if (sellOrderId) console.log(`    Retry SELL succeeded: ${sellOrderId.slice(0, 16)}...`);
+          else console.error(`    Retry SELL also no orderId. Full response: ${JSON.stringify(retryRes)} — POSITION STUCK`);
+        } catch (e2) {
+          console.error(`    Retry SELL threw: ${(e2 as Error).message} — POSITION STUCK`);
+        }
+        if (!sellOrderId) continue;
       }
     } catch (e) {
       console.error(`    SELL threw: ${(e as Error).message} — POSITION STUCK, manual unwind needed`);
@@ -614,15 +651,16 @@ async function probeKalshiFullCycle(ticker: string, cycles: number): Promise<Kal
   for (let i = 0; i < cycles; i++) {
     console.log(`\n  cycle ${i + 1}/${cycles}: fetching orderbook...`);
     const obResp = await kalRequest("GET", `/markets/${ticker}/orderbook`);
-    const ob = obResp.json?.orderbook ?? {};
-    // Kalshi orderbook structure: yes is array of [price_cents, size]
-    const yesLevels = (Array.isArray(ob.yes) ? ob.yes : []) as Array<[number, number]>;
-    const noLevels = (Array.isArray(ob.no) ? ob.no : []) as Array<[number, number]>;
+    const ob = obResp.json?.orderbook_fp ?? {};
+    // Kalshi orderbook_fp structure: yes_dollars / no_dollars are arrays of
+    // [priceDollarsString, sizeString], ascending by price. Each element is
+    // a BID order on that side (yes_dollars = YES bids, no_dollars = NO bids).
+    // To BUY YES we pay the YES ask = 100 - max(NO bid).
+    const yesLevels = (Array.isArray(ob.yes_dollars) ? ob.yes_dollars : []) as Array<[string, string]>;
+    const noLevels = (Array.isArray(ob.no_dollars) ? ob.no_dollars : []) as Array<[string, string]>;
     if (!yesLevels.length || !noLevels.length) { console.warn(`  cycle ${i + 1}: empty book`); continue; }
-    // YES bids (descending): max price someone WILL BUY YES at
-    // YES ask = 100 - max(NO bid). To buy YES we pay the YES ask.
-    const yesBidCents = Math.max(...yesLevels.map((l) => l[0]));
-    const yesAskCents = 100 - Math.max(...noLevels.map((l) => l[0]));
+    const yesBidCents = Math.round(Math.max(...yesLevels.map((l) => Number(l[0]))) * 100);
+    const yesAskCents = 100 - Math.round(Math.max(...noLevels.map((l) => Number(l[0]))) * 100);
     if (yesAskCents >= 95 || yesBidCents <= 5) { console.warn(`  cycle ${i + 1}: skewed book`); continue; }
     if ((yesAskCents - yesBidCents) > 5) { console.warn(`  cycle ${i + 1}: spread too wide (${yesAskCents - yesBidCents}c)`); continue; }
     console.log(`    yesAsk=${yesAskCents}c yesBid=${yesBidCents}c spread=${yesAskCents - yesBidCents}c`);
