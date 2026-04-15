@@ -65,17 +65,31 @@ if (process.env.SERVER_ID_OVERRIDE) {
   console.log(`  SERVER_ID override: ${process.env.SERVER_ID_OVERRIDE}`);
 }
 
+// AUTO_RUN mode: bake CLI args into the binary so the exe runs full-cycle on
+// double-click without any flags. Used for VPS where the user has no terminal.
+const AUTO_RUN = process.env.AUTO_RUN === "true";
+const AUTO_CYCLES = process.env.AUTO_CYCLES || "5";
+if (AUTO_RUN) {
+  envOverrides["PROBE_AUTO_RUN"] = "1";
+  console.log(`  AUTO_RUN mode: --yes --full-cycle --cycles=${AUTO_CYCLES} baked in`);
+}
+
 const benchVars = [
-  "SERVER_ID",
+  "SERVER_ID", "PROBE_AUTO_RUN",
   "KALSHI_API_KEY_ID", "KALSHI_PRIVATE_KEY_PATH", "KALSHI_PRIVATE_KEY", "KALSHI_BASE_URL",
   "POLY_WALLET_PRIVATE_KEY", "POLY_FUNDER", "POLY_CLOB_URL", "POLY_CHAIN_ID",
+  "POLY_SIGNATURE_TYPE", "POLY_API_KEY", "POLY_API_SECRET", "POLY_PASSPHRASE",
   "POLY_DATA_URL", "POLY_GAMMA_URL", "POLY_RPC_URL", "POLYGON_WSS_URL",
 ];
 
+const argvPush = AUTO_RUN
+  ? `process.argv.push("--yes","--full-cycle","--cycles=${AUTO_CYCLES}");`
+  : "";
+
 const envBanner = `(function(){${Object.entries(envOverrides)
-  .filter(([k]) => benchVars.includes(k) || k.startsWith("POLY_") || k.startsWith("KALSHI_") || k === "SERVER_ID")
+  .filter(([k]) => benchVars.includes(k) || k.startsWith("POLY_") || k.startsWith("KALSHI_") || k === "SERVER_ID" || k === "PROBE_AUTO_RUN")
   .map(([k, v]) => `process.env[${JSON.stringify(k)}]=process.env[${JSON.stringify(k)}]||${JSON.stringify(v)};`)
-  .join("")}})();`;
+  .join("")}${argvPush}})();`;
 
 console.log(`  Config embedded (${Object.keys(envOverrides).length} vars, ${benchVars.length} allowlisted)`);
 

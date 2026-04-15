@@ -831,6 +831,22 @@ async function main() {
   // Cleanup WS
   if (_kalWs) _kalWs.close();
   if (_pmWs) _pmWs.close();
+
+  // Auto-run mode (double-clicked exe): pause so the window stays open
+  // for the user to read the output before the cmd window closes.
+  if (process.env.PROBE_AUTO_RUN === "1") {
+    console.log("\n========================================");
+    console.log("  Done. Report saved to data/ folder.");
+    console.log("  Press ENTER to close this window...");
+    console.log("========================================");
+    try {
+      process.stdin.resume();
+      await new Promise<void>((r) => process.stdin.once("data", () => r()));
+    } catch {
+      // No TTY (background launch) — fall through to timed exit
+      await new Promise((r) => setTimeout(r, 30_000));
+    }
+  }
   setTimeout(() => process.exit(0), 500);
 }
 
