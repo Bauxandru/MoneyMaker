@@ -51,20 +51,34 @@ const ITERS = (() => {
 })();
 const KAL_ONLY = args.includes("--kalshi-only");
 const PM_ONLY = args.includes("--pm-only");
+const FULL_CYCLE = args.includes("--full-cycle");
+const CYCLES = (() => {
+  const a = args.find((s) => s.startsWith("--cycles="));
+  return a ? Math.min(5, Math.max(1, Number(a.split("=")[1]) || 3)) : 3;
+})();
 
 if (!HAS_CONFIRM) {
   console.error(`
 PROBE EXECUTION SPEED — places REAL orders on Kalshi and Polymarket.
 
-Safety:
+DEFAULT MODE (place + cancel only, no fills):
   - Orders are GTC at 1 cent (Kalshi) / tickSize (PM) — far below market.
   - If anyone is selling at that price you BUY at a profit (worst case loss
     is bounded to ~$0.01 per fill).
   - Each order is cancelled within a few seconds.
-  - Default 5 iterations per exchange.
 
-To run, add --yes:
-  probe-speed.exe --yes [--iters=N] [--kalshi-only|--pm-only]
+FULL-CYCLE MODE (--full-cycle): BUYS at market then SELLS back immediately.
+  - Captures real fill latency end-to-end (place → MATCHED → MINED → sell → MINED).
+  - Costs the spread + 2× taker fee per cycle, ~\$0.025-0.05 per round-trip.
+  - Capped at 5 cycles (--cycles=N, default 3) → max ~\$0.25 total cost.
+
+To run:
+  probe-speed.exe --yes                              # default place+cancel, 5 iters
+  probe-speed.exe --yes --iters=10
+  probe-speed.exe --yes --kalshi-only
+  probe-speed.exe --yes --full-cycle                 # 3 BUY+SELL cycles per exchange
+  probe-speed.exe --yes --full-cycle --cycles=5      # max
+  probe-speed.exe --yes --full-cycle --pm-only       # PM only round-trip
 `);
   process.exit(1);
 }
@@ -422,6 +436,258 @@ async function probePm(tokenId: string, tickSize: number, negRisk: boolean, iter
   return results;
 }
 
+// --- PM full-cycle (BUY at market then SELL it back) -------------------------
+// Costs: spread + 2× taker fee per cycle. Captures real fill latency:
+//   place_buy → MATCHED → MINED/CONFIRMED → place_sell → MATCHED → MINED/CONFIRMED.
+type PmCycleIter = {
+  iter: number;
+  buyOrderId: string;
+  sellOrderId: string;
+  buyPlaceHttpMs: number;
+  buyMatchedWsMs: number;     // HTTP done → MATCHED received
+  buyMinedWsMs: number;       // MATCHED → MINED/CONFIRMED received
+  sellPlaceHttpMs: number;
+  sellMatchedWsMs: number;
+  sellMinedWsMs: number;
+  totalCycleMs: number;       // place_buy start → sell MINED received
+  buyPrice: number;
+  sellPrice: number;
+  shares: number;
+  spreadCost: number;         // (buyPrice - sellPrice) × shares (positive = loss)
+};
+
+async function probePmFullCycle(
+  tokenId: string, tickSize: number, negRisk: boolean, bestAsk: number, cycles: number
+): Promise<PmCycleIter[]> {
+  console.log(`\n[PM-CYCLE] BUY+SELL cycles on token ${tokenId.slice(0, 16)}... (current ask=${bestAsk})`);
+  const pk = process.env.POLY_WALLET_PRIVATE_KEY;
+  if (!pk) throw new Error("PM cycle probe requires POLY_WALLET_PRIVATE_KEY");
+  const host = process.env.POLY_CLOB_URL ?? "https://clob.polymarket.com";
+  const chainId = Number(process.env.POLY_CHAIN_ID ?? 137);
+  const sigType = Number(process.env.POLY_SIGNATURE_TYPE ?? 0);
+  const wallet = new EthersWallet(pk);
+  const funder = process.env.POLY_FUNDER || wallet.address;
+  if (!process.env.POLY_API_KEY || !process.env.POLY_API_SECRET || !process.env.POLY_PASSPHRASE) {
+    throw new Error("requires POLY_API_KEY, POLY_API_SECRET, POLY_PASSPHRASE");
+  }
+  const creds = {
+    key: process.env.POLY_API_KEY,
+    secret: process.env.POLY_API_SECRET,
+    passphrase: process.env.POLY_PASSPHRASE,
+  };
+  const client = new ClobClient(host, chainId, wallet as any, creds, sigType, funder);
+  const results: PmCycleIter[] = [];
+  const SHARES = 5; // PM minimum order size
+
+  for (let i = 0; i < cycles; i++) {
+    console.log(`\n  cycle ${i + 1}/${cycles}: refreshing book...`);
+    // Fresh book per cycle so we hit the actual best ask/bid
+    const bookResp = await fetch(`${host}/book?token_id=${tokenId}`);
+    const book = await bookResp.json();
+    const asks = (Array.isArray(book.asks) ? book.asks : []).map((a: any) => ({ price: Number(a.price), size: Number(a.size) }));
+    const bids = (Array.isArray(book.bids) ? book.bids : []).map((b: any) => ({ price: Number(b.price), size: Number(b.size) }));
+    asks.sort((a: any, b: any) => a.price - b.price);
+    bids.sort((a: any, b: any) => b.price - a.price);
+    const ask = asks[0]?.price;
+    const bid = bids[0]?.price;
+    if (!ask || !bid) { console.warn(`  cycle ${i + 1}: empty book, skipping`); continue; }
+    if (ask >= 0.95 || bid <= 0.05) { console.warn(`  cycle ${i + 1}: book skewed (ask=${ask} bid=${bid}), skipping`); continue; }
+    if ((ask - bid) > 0.05) { console.warn(`  cycle ${i + 1}: spread too wide (${((ask - bid) * 100).toFixed(1)}c), skipping`); continue; }
+
+    console.log(`    book: ask=${ask.toFixed(3)} bid=${bid.toFixed(3)} spread=${((ask - bid) * 100).toFixed(1)}c, buying ${SHARES}×${ask}`);
+
+    // -- BUY at best ask --
+    const tStart = performance.now();
+    let buyOrderId = "";
+    let buyPlaceHttpMs = 0;
+    try {
+      const t0 = performance.now();
+      const buyRes = await (client as any).createAndPostOrder(
+        { tokenID: tokenId, price: ask, size: SHARES, side: Side.BUY },
+        { tickSize: tickSize.toString(), negRisk },
+        OrderType.FAK,
+      );
+      buyPlaceHttpMs = performance.now() - t0;
+      buyOrderId = String(buyRes?.orderID ?? buyRes?.orderId ?? "");
+      if (!buyOrderId) {
+        console.error(`    BUY no orderId: ${JSON.stringify(buyRes).slice(0, 200)}`);
+        continue;
+      }
+    } catch (e) {
+      console.error(`    BUY threw: ${(e as Error).message}`);
+      continue;
+    }
+    const tBuyHttpDone = performance.now();
+    // Wait MATCHED then MINED via WS
+    let buyMatchedWsMs = 0, buyMinedWsMs = 0, tMatched = 0;
+    try {
+      const matched = await awaitPmOrderStatus(buyOrderId, ["MATCHED"], 30_000);
+      tMatched = matched.tArrived;
+      buyMatchedWsMs = tMatched - tBuyHttpDone;
+      console.log(`    BUY MATCHED at +${buyMatchedWsMs.toFixed(0)}ms, waiting MINED...`);
+      // Now wait for MINED/CONFIRMED for the same order
+      const mined = await awaitPmOrderStatus(buyOrderId, ["MINED", "CONFIRMED"], 60_000);
+      buyMinedWsMs = mined.tArrived - tMatched;
+      console.log(`    BUY MINED at +${buyMinedWsMs.toFixed(0)}ms`);
+    } catch (e) {
+      console.error(`    BUY WS wait failed: ${(e as Error).message} — aborting cycle to avoid hung position`);
+      // Try emergency sell so we don't hold the stuck shares
+      try {
+        await (client as any).createAndPostOrder(
+          { tokenID: tokenId, price: bid * 0.5, size: SHARES, side: Side.SELL },
+          { tickSize: tickSize.toString(), negRisk },
+          OrderType.FAK,
+        );
+        console.warn(`    EMERGENCY SELL placed at ${(bid * 0.5).toFixed(3)} (deep bid, may not fill — manual review needed)`);
+      } catch { /* best effort */ }
+      continue;
+    }
+
+    // -- SELL at best bid --
+    let sellOrderId = "";
+    let sellPlaceHttpMs = 0;
+    try {
+      const t0 = performance.now();
+      const sellRes = await (client as any).createAndPostOrder(
+        { tokenID: tokenId, price: bid, size: SHARES, side: Side.SELL },
+        { tickSize: tickSize.toString(), negRisk },
+        OrderType.FAK,
+      );
+      sellPlaceHttpMs = performance.now() - t0;
+      sellOrderId = String(sellRes?.orderID ?? sellRes?.orderId ?? "");
+      if (!sellOrderId) {
+        console.error(`    SELL no orderId — POSITION STUCK, manual unwind needed`);
+        continue;
+      }
+    } catch (e) {
+      console.error(`    SELL threw: ${(e as Error).message} — POSITION STUCK, manual unwind needed`);
+      continue;
+    }
+    const tSellHttpDone = performance.now();
+    let sellMatchedWsMs = 0, sellMinedWsMs = 0;
+    try {
+      const matched = await awaitPmOrderStatus(sellOrderId, ["MATCHED"], 30_000);
+      const tSellMatched = matched.tArrived;
+      sellMatchedWsMs = tSellMatched - tSellHttpDone;
+      const mined = await awaitPmOrderStatus(sellOrderId, ["MINED", "CONFIRMED"], 60_000);
+      sellMinedWsMs = mined.tArrived - tSellMatched;
+      console.log(`    SELL MATCHED at +${sellMatchedWsMs.toFixed(0)}ms, MINED at +${sellMinedWsMs.toFixed(0)}ms`);
+    } catch (e) {
+      console.warn(`    SELL WS wait failed: ${(e as Error).message} — sell may still settle on-chain`);
+    }
+
+    const totalCycleMs = performance.now() - tStart;
+    const spreadCost = Math.round((ask - bid) * SHARES * 10000) / 10000;
+    results.push({
+      iter: i + 1, buyOrderId, sellOrderId,
+      buyPlaceHttpMs, buyMatchedWsMs, buyMinedWsMs,
+      sellPlaceHttpMs, sellMatchedWsMs, sellMinedWsMs,
+      totalCycleMs, buyPrice: ask, sellPrice: bid, shares: SHARES, spreadCost,
+    });
+    console.log(`    cycle total: ${totalCycleMs.toFixed(0)}ms, spread cost: $${spreadCost.toFixed(4)}`);
+    await new Promise((r) => setTimeout(r, 1000)); // breathe between cycles
+  }
+  void bestAsk;
+  return results;
+}
+
+// --- Kalshi full-cycle (IOC BUY then IOC SELL) -------------------------------
+// Kalshi sell: action="sell" with side="yes" sells your YES position.
+type KalCycleIter = {
+  iter: number;
+  buyOrderId: string;
+  sellOrderId: string;
+  buyPlaceHttpMs: number;
+  buyFillWsMs: number;        // HTTP done → fill event received
+  sellPlaceHttpMs: number;
+  sellFillWsMs: number;
+  totalCycleMs: number;
+  buyPrice: number;
+  sellPrice: number;
+  spreadCost: number;
+};
+
+async function probeKalshiFullCycle(ticker: string, cycles: number): Promise<KalCycleIter[]> {
+  console.log(`\n[KAL-CYCLE] BUY+SELL cycles on ${ticker}`);
+  const results: KalCycleIter[] = [];
+
+  for (let i = 0; i < cycles; i++) {
+    console.log(`\n  cycle ${i + 1}/${cycles}: fetching orderbook...`);
+    const obResp = await kalRequest("GET", `/markets/${ticker}/orderbook`);
+    const ob = obResp.json?.orderbook ?? {};
+    // Kalshi orderbook structure: yes is array of [price_cents, size]
+    const yesLevels = (Array.isArray(ob.yes) ? ob.yes : []) as Array<[number, number]>;
+    const noLevels = (Array.isArray(ob.no) ? ob.no : []) as Array<[number, number]>;
+    if (!yesLevels.length || !noLevels.length) { console.warn(`  cycle ${i + 1}: empty book`); continue; }
+    // YES bids (descending): max price someone WILL BUY YES at
+    // YES ask = 100 - max(NO bid). To buy YES we pay the YES ask.
+    const yesBidCents = Math.max(...yesLevels.map((l) => l[0]));
+    const yesAskCents = 100 - Math.max(...noLevels.map((l) => l[0]));
+    if (yesAskCents >= 95 || yesBidCents <= 5) { console.warn(`  cycle ${i + 1}: skewed book`); continue; }
+    if ((yesAskCents - yesBidCents) > 5) { console.warn(`  cycle ${i + 1}: spread too wide (${yesAskCents - yesBidCents}c)`); continue; }
+    console.log(`    yesAsk=${yesAskCents}c yesBid=${yesBidCents}c spread=${yesAskCents - yesBidCents}c`);
+
+    // -- BUY 1 YES at ask via IOC --
+    const tStart = performance.now();
+    const buyClientId = `probe-cycle-buy-${Date.now()}-${i}`;
+    const buyPayload = {
+      ticker, client_order_id: buyClientId, side: "yes", action: "buy",
+      type: "limit", yes_price: yesAskCents, count: 1, time_in_force: "immediate_or_cancel",
+    };
+    const buy = await kalRequest("POST", "/portfolio/orders", buyPayload);
+    const tBuyHttpDone = performance.now();
+    const buyOrderId = String(buy.json?.order?.order_id ?? "");
+    if (!buyOrderId) { console.error(`    BUY no orderId: ${JSON.stringify(buy.json).slice(0, 200)}`); continue; }
+    let buyFillWsMs = 0;
+    try {
+      const evt = await awaitKalOrderStatus(buyOrderId, ["executed", "filled", "any"], 10_000);
+      buyFillWsMs = evt.tArrived - tBuyHttpDone;
+      console.log(`    BUY status=${evt.status} at +${buyFillWsMs.toFixed(0)}ms`);
+    } catch (e) {
+      console.error(`    BUY WS timeout: ${(e as Error).message} — checking via HTTP`);
+      const status = await kalRequest("GET", `/portfolio/orders/${buyOrderId}`);
+      console.log(`    BUY HTTP status: ${status.json?.order?.status}`);
+    }
+
+    // -- SELL 1 YES via IOC at bid --
+    const sellClientId = `probe-cycle-sell-${Date.now()}-${i}`;
+    const sellPayload = {
+      ticker, client_order_id: sellClientId, side: "yes", action: "sell",
+      type: "limit", yes_price: yesBidCents, count: 1, time_in_force: "immediate_or_cancel",
+    };
+    const tSellStart = performance.now();
+    const sell = await kalRequest("POST", "/portfolio/orders", sellPayload);
+    const tSellHttpDone = performance.now();
+    const sellOrderId = String(sell.json?.order?.order_id ?? "");
+    if (!sellOrderId) {
+      console.error(`    SELL no orderId — POSITION STUCK at 1 YES, manual unwind needed: ${JSON.stringify(sell.json).slice(0, 200)}`);
+      continue;
+    }
+    let sellFillWsMs = 0;
+    try {
+      const evt = await awaitKalOrderStatus(sellOrderId, ["executed", "filled", "any"], 10_000);
+      sellFillWsMs = evt.tArrived - tSellHttpDone;
+      console.log(`    SELL status=${evt.status} at +${sellFillWsMs.toFixed(0)}ms`);
+    } catch (e) {
+      console.warn(`    SELL WS timeout: ${(e as Error).message}`);
+    }
+
+    const totalCycleMs = performance.now() - tStart;
+    const spreadCostCents = yesAskCents - yesBidCents;
+    results.push({
+      iter: i + 1, buyOrderId, sellOrderId,
+      buyPlaceHttpMs: buy.httpMs, buyFillWsMs,
+      sellPlaceHttpMs: sell.httpMs, sellFillWsMs,
+      totalCycleMs, buyPrice: yesAskCents / 100, sellPrice: yesBidCents / 100,
+      spreadCost: spreadCostCents / 100,
+    });
+    console.log(`    cycle total: ${totalCycleMs.toFixed(0)}ms, spread cost: ${spreadCostCents}c`);
+    void tStart; void tSellStart;
+    await new Promise((r) => setTimeout(r, 500));
+  }
+  return results;
+}
+
 // --- Summary table ----------------------------------------------------------
 function printSummary(label: string, samples: Record<string, number[]>) {
   console.log(`\n=== ${label} ===`);
@@ -450,21 +716,36 @@ async function main() {
     if (!KAL_KEY || !KAL_PK) throw new Error("Kalshi auth missing (KALSHI_API_KEY_ID, KALSHI_PRIVATE_KEY[_PATH])");
     console.log("[1/4] Connecting Kalshi WS...");
     await connectKalshiWs();
-    console.log("  Kalshi WS connected, subscribed to fill+user_order");
+    console.log("  Kalshi WS connected, subscribed to fill+user_orders");
     console.log("\n[2/4] Picking Kalshi market...");
     const kal = await pickKalshiTicker();
-    console.log(`  Using ticker ${kal.ticker} (yesAsk=${kal.bestYesAsk}c). Probe orders at 1¢ won't fill.`);
-    const kalResults = await probeKalshi(kal.ticker, ITERS);
-    report.kalshi = { ticker: kal.ticker, bestYesAsk: kal.bestYesAsk, iterations: kalResults };
-    printSummary("KALSHI per-phase latency", {
-      "RSA sign (place)": kalResults.map((r) => r.placeSignMs),
-      "HTTP place (POST)": kalResults.map((r) => r.placeHttpMs),
-      "WS notification (place)": kalResults.map((r) => r.placeWsMs).filter((x) => x > 0),
-      "RSA sign (cancel)": kalResults.map((r) => r.cancelSignMs),
-      "HTTP cancel (DELETE)": kalResults.map((r) => r.cancelHttpMs),
-      "WS notification (cancel)": kalResults.map((r) => r.cancelWsMs).filter((x) => x > 0),
-      "Total round-trip": kalResults.map((r) => r.totalRoundTripMs),
-    });
+    console.log(`  Using ticker ${kal.ticker} (yesAsk=${kal.bestYesAsk}c).`);
+
+    if (FULL_CYCLE) {
+      const kalCycles = await probeKalshiFullCycle(kal.ticker, CYCLES);
+      report.kalshi = { ticker: kal.ticker, bestYesAsk: kal.bestYesAsk, fullCycle: kalCycles };
+      printSummary("KALSHI full-cycle latency (BUY+SELL)", {
+        "BUY place HTTP": kalCycles.map((r) => r.buyPlaceHttpMs),
+        "BUY fill WS notification": kalCycles.map((r) => r.buyFillWsMs).filter((x) => x > 0),
+        "SELL place HTTP": kalCycles.map((r) => r.sellPlaceHttpMs),
+        "SELL fill WS notification": kalCycles.map((r) => r.sellFillWsMs).filter((x) => x > 0),
+        "Total cycle (BUY→SELL)": kalCycles.map((r) => r.totalCycleMs),
+      });
+      const totalCost = kalCycles.reduce((s, r) => s + r.spreadCost, 0);
+      console.log(`\n  Total Kalshi cycle cost (spread, before fees): $${totalCost.toFixed(4)}`);
+    } else {
+      const kalResults = await probeKalshi(kal.ticker, ITERS);
+      report.kalshi = { ticker: kal.ticker, bestYesAsk: kal.bestYesAsk, iterations: kalResults };
+      printSummary("KALSHI per-phase latency", {
+        "RSA sign (place)": kalResults.map((r) => r.placeSignMs),
+        "HTTP place (POST)": kalResults.map((r) => r.placeHttpMs),
+        "WS notification (place)": kalResults.map((r) => r.placeWsMs).filter((x) => x > 0),
+        "RSA sign (cancel)": kalResults.map((r) => r.cancelSignMs),
+        "HTTP cancel (DELETE)": kalResults.map((r) => r.cancelHttpMs),
+        "WS notification (cancel)": kalResults.map((r) => r.cancelWsMs).filter((x) => x > 0),
+        "Total round-trip": kalResults.map((r) => r.totalRoundTripMs),
+      });
+    }
   }
 
   if (!KAL_ONLY) {
@@ -478,13 +759,29 @@ async function main() {
     console.log("\n[4/4] Picking PM market...");
     const pm = await pickPmMarket();
     console.log(`  Using token ${pm.tokenId.slice(0, 16)}... (bestAsk=${pm.bestAsk}, tickSize=${pm.tickSize}). Probe orders at ${pm.tickSize} won't fill.`);
-    const pmResults = await probePm(pm.tokenId, pm.tickSize, pm.negRisk, ITERS);
-    report.polymarket = { tokenId: pm.tokenId, bestAsk: pm.bestAsk, tickSize: pm.tickSize, iterations: pmResults };
-    printSummary("POLYMARKET per-phase latency", {
-      "HTTP place (createAndPostOrder)": pmResults.map((r) => r.placeHttpMs),
-      "HTTP cancel (cancelOrder)": pmResults.map((r) => r.cancelHttpMs),
-      "Total round-trip": pmResults.map((r) => r.totalRoundTripMs),
-    });
+    if (FULL_CYCLE) {
+      const pmCycles = await probePmFullCycle(pm.tokenId, pm.tickSize, pm.negRisk, pm.bestAsk, CYCLES);
+      report.polymarket = { tokenId: pm.tokenId, bestAsk: pm.bestAsk, tickSize: pm.tickSize, fullCycle: pmCycles };
+      printSummary("POLYMARKET full-cycle latency (BUY+SELL)", {
+        "BUY place HTTP": pmCycles.map((r) => r.buyPlaceHttpMs),
+        "BUY MATCHED WS": pmCycles.map((r) => r.buyMatchedWsMs).filter((x) => x > 0),
+        "BUY MINED WS (after MATCHED)": pmCycles.map((r) => r.buyMinedWsMs).filter((x) => x > 0),
+        "SELL place HTTP": pmCycles.map((r) => r.sellPlaceHttpMs),
+        "SELL MATCHED WS": pmCycles.map((r) => r.sellMatchedWsMs).filter((x) => x > 0),
+        "SELL MINED WS (after MATCHED)": pmCycles.map((r) => r.sellMinedWsMs).filter((x) => x > 0),
+        "Total cycle (BUY→SELL MINED)": pmCycles.map((r) => r.totalCycleMs),
+      });
+      const totalCost = pmCycles.reduce((s, r) => s + r.spreadCost, 0);
+      console.log(`\n  Total PM cycle cost (spread, before fees): $${totalCost.toFixed(4)}`);
+    } else {
+      const pmResults = await probePm(pm.tokenId, pm.tickSize, pm.negRisk, ITERS);
+      report.polymarket = { tokenId: pm.tokenId, bestAsk: pm.bestAsk, tickSize: pm.tickSize, iterations: pmResults };
+      printSummary("POLYMARKET per-phase latency", {
+        "HTTP place (createAndPostOrder)": pmResults.map((r) => r.placeHttpMs),
+        "HTTP cancel (cancelOrder)": pmResults.map((r) => r.cancelHttpMs),
+        "Total round-trip": pmResults.map((r) => r.totalRoundTripMs),
+      });
+    }
   }
 
   report.completedAt = new Date().toISOString();
