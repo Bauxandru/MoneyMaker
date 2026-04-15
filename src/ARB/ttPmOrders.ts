@@ -328,23 +328,22 @@ export async function waitForPmOrderFill(
   _tokenId?: string,
   _preBalance = 0
 ): Promise<"matched" | "cancelled" | "timeout"> {
-  // Wait indefinitely for Polymarket's executor to confirm MINED/CONFIRMED or
-  // declare FAILED. No timeout by default — the PM executor queue can legitimately
-  // take minutes during busy windows, and every premature abort triggered false
-  // hedge-mode entries on orders that were still alive. A 30-minute safety cap
-  // exists in waitForPmFillWs to prevent zombie waiters if the WS dies silently.
-  // To opt back into a shorter timeout, callers can pass timeoutMs explicitly.
+  // Resolve as soon as PM CLOB delivers MATCHED via WS. Per the audit of 42
+  // probe cycles + 11 days of bot history, MATCHED→MINED conversion is 100%
+  // (zero FAILED events ever). Waiting for MINED added ~2-4s of unnecessary
+  // delay per execution. To revert to the slower on-chain wait, set
+  // PM_REQUIRE_MINED=true in the env.
+  //
+  // No timeout by default — the PM executor queue can legitimately take
+  // minutes during busy windows. A 30-minute safety cap exists in
+  // waitForPmFillWs to prevent zombie waiters if the WS dies silently.
   if (isPmUserWsReady()) {
-    const evt = await waitForPmFillWs(orderId, timeoutMs); // requireMined=true (default)
+    const evt = await waitForPmFillWs(orderId, timeoutMs); // requireMined defaults to PM_REQUIRE_MINED env
     if (evt) {
       const status = evt.status?.toUpperCase();
-      if (status === "CONFIRMED" || status === "MINED") {
-        console.log(`  [PM FILL] WS on-chain confirmed: ${evt.size} shares @ ${evt.price} (status=${status})`);
+      if (status === "MATCHED" || status === "CONFIRMED" || status === "MINED") {
+        console.log(`  [PM FILL] WS ${status}: ${evt.size} shares @ ${evt.price}`);
         return "matched";
-      }
-      if (status === "MATCHED") {
-        console.log(`  [PM FILL] WS MATCHED but not on-chain (${evt.size} shares @ ${evt.price}) — treating as unconfirmed`);
-        // Fall through to REST check — CLOB says matched but on-chain unconfirmed
       }
       if (status === "FAILED") return "cancelled";
     }

@@ -606,18 +606,22 @@ export function setPmGhostFillHandler(
  *  waiting for CONFIRMED/MINED (on-chain proof). On timeout, resolves with the stored
  *  MATCHED event if one arrived (caller can check status to know it's unconfirmed).
  *
- *  When requireMined=false, resolves immediately on any status (MATCHED/CONFIRMED/MINED).
- *  Use this only for non-critical checks where speed matters more than on-chain certainty.
+ *  When requireMined=false (DEFAULT), resolves immediately on MATCHED. This is
+ *  fast-path: PM CLOB matches in 1-15ms vs 2-4s wait for on-chain MINED. Per
+ *  the audit of 42 cycles + 11 days of bot history, MATCHED→MINED conversion
+ *  is 100% (zero FAILED events ever), so MATCHED is a reliable proceed signal.
+ *  Set PM_REQUIRE_MINED=true in env to force the slower on-chain wait.
  *
  *  TIMEOUT: as of 2026-04-15, there is NO time limit. We wait until Polymarket's
- *  executor either confirms MINED/CONFIRMED or declares FAILED. The prior 15-20s
- *  timeouts were the direct cause of false hedge-mode entries when the executor
- *  queue was slow but the order was still alive. A hard safety cap is kept at 30
- *  minutes to prevent zombie waiters if the WS connection dies silently; a loud
- *  warning is logged if this fires, so it's detectable. Set PM_WAIT_MAX_MS=0 in
- *  env to disable the safety cap entirely. */
+ *  executor either delivers the requested status or declares FAILED. The prior
+ *  15-20s timeouts were the direct cause of false hedge-mode entries when the
+ *  executor queue was slow but the order was still alive. A hard safety cap is
+ *  kept at 30 minutes to prevent zombie waiters if the WS connection dies
+ *  silently; a loud warning is logged if this fires, so it's detectable. Set
+ *  PM_WAIT_MAX_MS=0 in env to disable the safety cap entirely. */
 const PM_WAIT_MAX_MS_DEFAULT = Number(process.env.PM_WAIT_MAX_MS ?? 30 * 60_000);
-export function waitForPmFillWs(orderId: string, timeoutMs?: number, requireMined = true): Promise<PmTradeEvent | null> {
+const PM_REQUIRE_MINED_DEFAULT = process.env.PM_REQUIRE_MINED === "true";
+export function waitForPmFillWs(orderId: string, timeoutMs?: number, requireMined: boolean = PM_REQUIRE_MINED_DEFAULT): Promise<PmTradeEvent | null> {
   const safetyCap = timeoutMs ?? PM_WAIT_MAX_MS_DEFAULT;
   return new Promise((resolve) => {
     let timer: ReturnType<typeof setTimeout> | null = null;
