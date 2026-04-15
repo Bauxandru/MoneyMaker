@@ -1494,30 +1494,45 @@ export async function executeArb(
     // Cap PM price at breakeven based on ACTUAL KAL fill cost (not scan-time estimate).
     // Without this, slippage or fees on KAL side can push total cost > $1/share → guaranteed loss.
     let pmPriceWasCapped = false;
-    // Primary: use WS fill data (more reliable than HTTP response — always has price/fee).
-    // WS fill often arrives BEFORE HTTP response (persistent connection, no handshake).
+    // SOURCE OF TRUTH for KAL fill cost: /portfolio/orders/{id} REST endpoint.
+    //
+    // PREVIOUS BUG (VAN/LAK 2026-04-15): using individual `kal-fill` WS events
+    // as the cost source was unreliable for split fills. When Kalshi walked
+    // the book across price levels, it emitted multiple kal-fill events per
+    // order but `waitForKalFillData` only captured the FIRST one — undercounting
+    // total cost by whatever the other fills added up to. That undercount made
+    // the bot compute a too-loose breakeven, place a PM hedge at a too-high
+    // price, and lock in a loss that only showed up after postResolutionFillAudit
+    // ran later and corrected kalCost from the authoritative REST source.
+    //
+    // Fix: fetch the ORDER-level aggregate (taker_fill_cost_dollars + maker_fill_cost_dollars)
+    // directly before computing breakeven. This is the same REST call the
+    // post-cancel reconciliation already uses, just run earlier in the pipeline.
+    // Kalshi's /portfolio/orders/{id} is consistent with /portfolio/fills.
     if (!DRY_RUN && kalFilled > 0 && kalOrderId) {
-      const wsFill = await waitForKalFillData(kalOrderId, 500);
-      if (wsFill) {
-        const wsPrice = Number(wsFill.yes_price_dollars || 0);
-        const wsFee = Number(wsFill.fee_cost || 0);
-        const wsCount = Number(wsFill.count_fp || 0);
-        if (wsPrice > 0 && wsCount > 0) {
-          // For NO side: cost = count * (1 - yesPrice). For YES side: cost = count * yesPrice.
-          const wsPerShareCost = kalSide === "yes" ? wsPrice : (1 - wsPrice);
-          const wsCostCents = Math.round(wsCount * wsPerShareCost * 100);
-          if (wsCostCents > 0) {
-            kalFillCostCents = wsCostCents;
-            kalFeesTotal = wsFee;
-            console.log(`  [KAL LEG] WS fill: ${wsCount} @ ${wsPrice} (${kalSide}) cost=${wsCostCents}c fee=$${wsFee.toFixed(2)}`);
-          }
+      try {
+        const restOrder = await getKalshiOrder(kalOrderId);
+        const takerCost = Number(restOrder.taker_fill_cost_dollars ?? 0);
+        const makerCost = Number(restOrder.maker_fill_cost_dollars ?? 0);
+        const takerFees = Number(restOrder.taker_fees_dollars ?? 0);
+        const makerFees = Number(restOrder.maker_fees_dollars ?? 0);
+        const totalFillDollars = takerCost + makerCost;
+        const totalFeesDollars = takerFees + makerFees;
+        if (totalFillDollars > 0) {
+          kalFillCostCents = Math.round(totalFillDollars * 100);
+          kalFeesTotal = totalFeesDollars;
+          console.log(`  [KAL LEG] REST fills: cost=$${totalFillDollars.toFixed(2)} fees=$${totalFeesDollars.toFixed(2)} (authoritative, used for PM breakeven)`);
+        } else {
+          console.warn(`  [KAL LEG] REST returned zero fill cost — falling back to HTTP response value ${kalFillCostCents}c`);
         }
+      } catch (e) {
+        console.warn(`  [KAL LEG] REST fill-cost fetch failed: ${(e as Error).message} — falling back to HTTP response value ${kalFillCostCents}c`);
       }
     }
-    // Fallback: if neither HTTP nor WS provided fill cost, estimate from limit price.
+    // Fallback: if REST and HTTP both failed to provide fill cost, estimate from limit price.
     if (!DRY_RUN && kalFillCostCents === 0 && kalFilled > 0) {
       kalFillCostCents = kalFilled * kalLimitCents;
-      console.warn(`  [KAL LEG] No fill cost from HTTP or WS — using limit price estimate: ${kalFillCostCents}c`);
+      console.warn(`  [KAL LEG] No fill cost from REST or HTTP — using limit price estimate: ${kalFillCostCents}c`);
     }
     if (!DRY_RUN && kalFillCostCents > 0 && kalFilled > 0) {
       const actualKalPerShare = (kalFillCostCents / 100 + kalFeesTotal) / kalFilled;

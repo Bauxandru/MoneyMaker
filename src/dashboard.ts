@@ -23,7 +23,15 @@ import { resolvePolyApiCreds } from "./polyAuth.js";
 
 const __filename = typeof import.meta?.url === "string" ? fileURLToPath(import.meta.url) : __filename ?? process.argv[1] ?? "";
 const __dirname = __filename ? dirname(__filename) : process.cwd();
-const ROOT = join(__dirname, "..");
+// ROOT defaults to the directory above the running script (programu/), but can
+// be overridden with DASHBOARD_DATA_ROOT to point at a different folder layout.
+// Useful for running multiple dashboards (one per server's data snapshot) on
+// different ports against different data directories — the override expects
+// the same layout: <root>/data/arb_trades.json, <root>/hedge_state.json, etc.
+const ROOT = process.env.DASHBOARD_DATA_ROOT || join(__dirname, "..");
+if (process.env.DASHBOARD_DATA_ROOT) {
+  console.log(`[BOOT] Using DASHBOARD_DATA_ROOT=${ROOT}`);
+}
 
 const PORT = parseInt(process.env.DASHBOARD_PORT || "3456", 10);
 
