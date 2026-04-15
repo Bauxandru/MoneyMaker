@@ -636,6 +636,7 @@ export async function executeArb(
       pmTokenId: pmLeg.tokenId,
       pmFillPrice: held === "pm" ? pmAsk : 0,
       pmCost: held === "pm" ? Math.round(sharesHeld * pmAsk * 100) / 100 : 0,
+      pmFees: held === "pm" ? pmFeePaid(sharesHeld, pmAsk, pmLeg) : 0,
       totalCost: held === "pm" ? Math.round(sharesHeld * pmAsk * 100) / 100 : kalCostHedge,
       projectedEdge: edge,
       projectedProfit: sharesHeld * edge,
@@ -887,7 +888,7 @@ export async function executeArb(
             match: `${entry.kal1.surname} vs ${entry.kal2.surname}`,
             dir, shares: pmFilled, kalTicker: kalLeg.ticker, kalFillPrice: 0, kalCost: 0,
             pmOutcome: pmLeg.outcome, pmSlug: entry.pmSlug, pmTokenId: pmLeg.tokenId,
-            pmFillPrice: pmAsk, pmCost: pmFilled * pmAsk, totalCost: totalCostFull,
+            pmFillPrice: pmAsk, pmCost: pmFilled * pmAsk, pmFees: pmFeePaid(pmFilled, pmAsk, pmLeg), totalCost: totalCostFull,
             projectedEdge: edge, projectedProfit: pmFilled * edge,
             status: "resolved", resolutionMethod: "hedge-complete",
             hedgeCost: hedgeCostPm, realizedPnl: Math.round((pmFilled - totalCostFull) * 100) / 100,
@@ -1013,7 +1014,7 @@ export async function executeArb(
             kalTicker: kalLeg.ticker, kalFillPrice: actualKalPricePartial,
             kalCost: kalCostPartial, kalFees: kalFeesTotal,
             pmOutcome: pmLeg.outcome, pmSlug: entry.pmSlug, pmTokenId: pmLeg.tokenId,
-            pmFillPrice: pmAsk, pmCost: pmCostFull,
+            pmFillPrice: pmAsk, pmCost: pmCostFull, pmFees: pmFeePaid(pmFilled, pmAsk, pmLeg),
             totalCost: totalCostResolved,
             projectedEdge: edge, projectedProfit: pmFilled * edge,
             status: "resolved", resolutionMethod: "hedge-complete",
@@ -1039,7 +1040,7 @@ export async function executeArb(
               kalTicker: kalLeg.ticker, kalFillPrice: actualKalPricePartial,
               kalCost: kalCostPartial, kalFees: kalFeesTotal,
               pmOutcome: pmLeg.outcome, pmSlug: entry.pmSlug, pmTokenId: pmLeg.tokenId,
-              pmFillPrice: pmAsk, pmCost: pmCostMatched,
+              pmFillPrice: pmAsk, pmCost: pmCostMatched, pmFees: pmFeePaid(kalFilled, pmAsk, pmLeg),
               totalCost: Math.round((kalCostPartial + kalFeesTotal + pmCostMatched) * 100) / 100,
               projectedEdge: edge, projectedProfit: kalFilled * edge,
               status: "filled",
@@ -1089,7 +1090,7 @@ export async function executeArb(
             kalTicker: kalLeg.ticker, kalFillPrice: pcAvgPrice,
             kalCost: kalCostActual, kalFees: pcFees,
             pmOutcome: pmLeg.outcome, pmSlug: entry.pmSlug, pmTokenId: pmLeg.tokenId,
-            pmFillPrice: pmAsk, pmCost: pmCostMatched,
+            pmFillPrice: pmAsk, pmCost: pmCostMatched, pmFees: pmFeePaid(kalFilled, pmAsk, pmLeg),
             totalCost: Math.round((kalCostActual + pcFees + pmCostMatched) * 100) / 100,
             projectedEdge: edge, projectedProfit: matchedShares * edge,
             status: unhedgedPm > 0 ? "filled" : "resolved",
@@ -1154,7 +1155,7 @@ export async function executeArb(
               kalTicker: kalLeg.ticker, kalFillPrice: lateKalAvg,
               kalCost: kalCostLate, kalFees: lateKalFees,
               pmOutcome: pmLeg.outcome, pmSlug: entry.pmSlug, pmTokenId: pmLeg.tokenId,
-              pmFillPrice: pmAsk, pmCost: pmCostLate,
+              pmFillPrice: pmAsk, pmCost: pmCostLate, pmFees: pmFeePaid(pmFilled, pmAsk, pmLeg),
               totalCost: Math.round((kalCostLate + lateKalFees + pmCostLate) * 100) / 100,
               projectedEdge: edge, projectedProfit: pmFilled * edge,
               status: "filled", initialExchange: "pm",
@@ -1180,7 +1181,7 @@ export async function executeArb(
             match: `${entry.kal1.surname} vs ${entry.kal2.surname}`,
             dir, shares: pmFilled, kalTicker: kalLeg.ticker, kalFillPrice: 0, kalCost: 0,
             pmOutcome: pmLeg.outcome, pmSlug: entry.pmSlug, pmTokenId: pmLeg.tokenId,
-            pmFillPrice: pmAsk, pmCost: pmFilled * pmAsk, totalCost: totalCostFull,
+            pmFillPrice: pmAsk, pmCost: pmFilled * pmAsk, pmFees: pmFeePaid(pmFilled, pmAsk, pmLeg), totalCost: totalCostFull,
             projectedEdge: edge, projectedProfit: pmFilled * edge,
             status: "resolved", resolutionMethod: "hedge-complete",
             hedgeCost: hedgeCostPm, realizedPnl: Math.round((pmFilled - totalCostFull) * 100) / 100,
@@ -1448,6 +1449,15 @@ export async function executeArb(
 
     if (kalFailed) {
       console.error(`  [KAL LEG] Order FAILED (pre-PM): ${(kalResult as Error).message}`);
+      // In PARALLEL_MODE, PM may have ALREADY fired and filled before KAL failed.
+      // If so, we have naked PM exposure that must enter hedge mode — not be abandoned.
+      if (pmFilled) {
+        console.error(`  [PARALLEL] KAL failed but PM ALREADY filled — entering hedge mode with PM-held position to close exposure`);
+        printTimings();
+        metric.firstLegFilled = shares;
+        saveExecMetric("hedge-entry", "parallel-kal-failed-pm-held");
+        return { sessionSkip: true, unhedged: makeUnhedged("pm", shares) };
+      }
       console.log("  [ABORT] PM never fired. No exposure taken.");
       printTimings();
       saveExecMetric("abort-pre-first", "kal-order-failed");
@@ -1461,6 +1471,14 @@ export async function executeArb(
     const kalOrderId = kalMeta.orderId ? String(kalMeta.orderId) : "";
 
     if (!DRY_RUN && kalFilled === 0) {
+      // Same PARALLEL_MODE concern: PM may have filled while KAL got 0 fills.
+      if (pmFilled) {
+        console.error(`  [PARALLEL] KAL 0-fills but PM ALREADY filled — entering hedge mode with PM-held position`);
+        printTimings();
+        metric.firstLegFilled = shares;
+        saveExecMetric("hedge-entry", "parallel-kal-zero-fills-pm-held");
+        return { sessionSkip: true, unhedged: makeUnhedged("pm", shares) };
+      }
       console.log(`  [KAL LEG] 0 fills — book was empty or pulled. No exposure.`);
       printTimings();
       saveExecMetric("abort-pre-first", "kal-ioc-no-fill");
@@ -1723,6 +1741,7 @@ export async function executeArb(
         pmTokenId: pmLeg.tokenId,
         pmFillPrice: pmAsk,
         pmCost: partialPmCost,
+        pmFees: pmFeePaid(pmFilled ? pmShares : kalFilled, pmAsk, pmLeg),
         totalCost: Math.round((partialKalCost + partialPmCost) * 100) / 100,
         projectedEdge: edge,
         projectedProfit,

@@ -1033,6 +1033,9 @@ export async function runHedgeCycle(state: HedgeState, clobBase: string): Promis
         kalCost: kalSettleCost,
         kalFees: kalSettleFees,
         pmCost: pmSettleCost,
+        pmFees: pmSettleTotal > 0
+          ? pmFeePaid(pos.initialShares, pmSettleTotal / pos.initialShares, pos.pmLeg)
+          : 0,
         totalCost: settleTotal,
         kalFillPrice: kalSettleRaw > 0
           ? Math.round((kalSettleRaw / pos.initialShares) * 100) / 100
@@ -1390,12 +1393,33 @@ export async function runHedgeCycle(state: HedgeState, clobBase: string): Promis
           const meta = extractKalMeta(res);
           const filled = DRY_RUN ? sharesNeeded : meta.filled;
           if (filled > 0) {
+            // Authoritative cost: REST /portfolio/orders/{id} gives aggregate fill cost
+            // across ALL fills of this order (same source postResolutionFillAudit uses).
+            // Fallback: filled × kalCurrentAsk (old behavior) when REST fails.
+            let hedgeRestCost = filled * kalCurrentAsk;
+            let hedgeRestFees = meta.fees;
+            if (!DRY_RUN && meta.orderId) {
+              try {
+                const restOrder = await getKalshiOrder(String(meta.orderId));
+                const takerCost = Number(restOrder.taker_fill_cost_dollars ?? 0);
+                const makerCost = Number(restOrder.maker_fill_cost_dollars ?? 0);
+                const takerFees = Number(restOrder.taker_fees_dollars ?? 0);
+                const makerFees = Number(restOrder.maker_fees_dollars ?? 0);
+                if ((takerCost + makerCost) > 0) {
+                  hedgeRestCost = takerCost + makerCost;
+                  hedgeRestFees = takerFees + makerFees;
+                  console.log(`  [HEDGE] REST fills: cost=$${hedgeRestCost.toFixed(2)} fees=$${hedgeRestFees.toFixed(2)} (authoritative)`);
+                }
+              } catch (e) {
+                console.warn(`  [HEDGE] REST fill-cost fetch failed: ${(e as Error).message} — using kalCurrentAsk estimate`);
+              }
+            }
             pos.sharesHeld = Math.max(0, pos.sharesHeld - filled);
-            pos.hedgeFillCost += filled * kalCurrentAsk;
-            pos.hedgeFillCostKal += filled * kalCurrentAsk;
-            pos.kalFees += meta.fees;
+            pos.hedgeFillCost += hedgeRestCost;
+            pos.hedgeFillCostKal += hedgeRestCost;
+            pos.kalFees += hedgeRestFees;
             sharesNeeded = pos.sharesHeld;
-            console.log(`\n[HEDGE] IOC Kalshi ${pos.kalSide.toUpperCase()} filled ${filled}@${fmtPct(kalCurrentAsk)} fee=$${meta.fees.toFixed(2)}. Remaining: ${pos.sharesHeld} (hedgeCost=$${pos.hedgeFillCost.toFixed(2)})`);
+            console.log(`\n[HEDGE] IOC Kalshi ${pos.kalSide.toUpperCase()} filled ${filled}@${fmtPct(kalCurrentAsk)} fee=$${hedgeRestFees.toFixed(2)}. Remaining: ${pos.sharesHeld} (hedgeCost=$${pos.hedgeFillCost.toFixed(2)})`);
             appendEvent({
               type: "fill-detected", tradeId: pos.tradeId, exchange: "kal",
               orderId: meta.orderId ? String(meta.orderId) : "", ticker: pos.kalLeg.ticker,
@@ -1963,6 +1987,7 @@ export async function runHedgeCycle(state: HedgeState, clobBase: string): Promis
             resolutionMethod: "hedge-reconciled-onchain",
             pmFillPrice: fillPrice,
             pmCost: fillCost,
+            pmFees: pmFeePaid(pos.initialShares, fillPrice, pos.pmLeg),
             totalCost,
             hedgeCost: 0,
             realizedPnl: Math.round((pos.initialShares - totalCost) * 100) / 100,

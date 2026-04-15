@@ -848,7 +848,12 @@ export async function reconcilePositions(trigger: string = "startup"): Promise<v
       const actualPmFillPrice = pmCostPerShare > 0 ? Math.round(pmCostPerShare * 100) / 100 : primary.pmFillPrice;
 
       // Arb shares = min(KAL fills, PM fills). Cap both sides to arb size.
-      const arbShares = Math.min(totalKalFillShares, actualPmShares) || totalKalFillShares || primary.shares;
+      // IMPORTANT: also cap at the PRIMARY trade's share count — the trade was
+      // created as a N-share arb; inheriting totalKalFillShares across multiple
+      // trades on the same ticker (including orphan positions from prior
+      // sessions) is how kalCost got inflated 2× on T1/DKIA (2026-04-15).
+      const rawArbShares = Math.min(totalKalFillShares, actualPmShares) || totalKalFillShares || primary.shares;
+      const arbShares = primary.shares > 0 ? Math.min(rawArbShares, primary.shares) : rawArbShares;
       const cappedPmShares = Math.min(actualPmShares, arbShares);
       const cappedPmCost = Math.round(cappedPmShares * pmCostPerShare * 100) / 100;
       const cappedKalShares = Math.min(totalKalFillShares, arbShares);
