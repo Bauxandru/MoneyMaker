@@ -37,9 +37,9 @@ const USDC = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174";
 
 const SNAPSHOT_PATH = path.join("data", "session_snapshots.json");
 const DRIFT_WARN_USD = Number(process.env.DRIFT_WARN_USD ?? 5);
-/** Only audit on-chain USDC transfers when the wall-clock gap between snapshots
- *  is bigger than this. Avoids the slow Alchemy call on fast successive restarts. */
-const DEPOSIT_CHECK_MIN_GAP_MINUTES = Number(process.env.DRIFT_DEPOSIT_CHECK_MIN_MIN ?? 30);
+/** Use `local` for local-time day rollover (recommended — matches user's mental model),
+ *  `utc` for UTC rollover. Deposit audit runs on the first startup of a new day. */
+const DEPOSIT_CHECK_DAY_TZ = (process.env.DRIFT_DEPOSIT_CHECK_TZ ?? "local").toLowerCase();
 
 /** A running bot's wallet snapshot at a single moment. All monetary values in USD. */
 export interface SessionSnapshot {
@@ -241,9 +241,14 @@ export async function reportSessionDelta(
   // Bot-claimed delta (what the trade journal says happened since then)
   const botDelta = curr.botClaimedPnl - prev.botClaimedPnl;
 
-  // Net external deposit detection. Only bother if gap > N minutes.
+  // Deposit audit runs only on the first startup of a new calendar day (vs. the
+  // previous snapshot). Avoids the slow Alchemy call on same-day restarts.
+  const prevDay = dayString(new Date(prev.ts));
+  const currDay = dayString(new Date(curr.ts));
+  const isNewDay = prevDay !== currDay;
+
   let netExternal: number | null = null;
-  if (gapMinutes >= DEPOSIT_CHECK_MIN_GAP_MINUTES && funder && rpcUrl()) {
+  if (isNewDay && funder && rpcUrl()) {
     netExternal = await alchemyNetExternalFlow(
       funder,
       Date.parse(prev.ts) / 1000,
@@ -270,7 +275,7 @@ export async function reportSessionDelta(
     console.log(`[SESSION]   ─────────`);
     console.log(`[SESSION]   Drift (bot - true): ${fmt$(drift)}${Math.abs(drift) > DRIFT_WARN_USD ? "   ⚠ LARGER THAN $" + DRIFT_WARN_USD : ""}`);
   } else {
-    console.log(`[SESSION]   Drift (bot - wealth): ${fmt$(drift)}   (no deposit audit — gap was only ${gapMinutes.toFixed(0)}m)`);
+    console.log(`[SESSION]   Drift (bot - wealth): ${fmt$(drift)}   (no deposit audit — same-day restart)`);
     if (Math.abs(drift) > DRIFT_WARN_USD) {
       console.log(`[SESSION]   ⚠ Drift exceeds $${DRIFT_WARN_USD}. Run \`npm run audit:balances\` for a full investigation.`);
     }
@@ -283,6 +288,17 @@ export async function reportSessionDelta(
 function fmt$(n: number): string {
   const s = Math.abs(n).toFixed(2);
   return (n >= 0 ? "+$" + s : "-$" + s).padStart(10);
+}
+
+/** Calendar-day string for rollover detection. Local time by default so the
+ *  "new day" matches when the user actually considers it a new day. */
+function dayString(d: Date): string {
+  if (DEPOSIT_CHECK_DAY_TZ === "utc") return d.toISOString().slice(0, 10);
+  // Local time YYYY-MM-DD
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
 }
 
 /** Convenience: take snapshot, print delta, persist. Call from bot startup. */
