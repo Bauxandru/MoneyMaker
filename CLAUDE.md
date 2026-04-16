@@ -535,6 +535,14 @@ A git pre-commit hook (`.git/hooks/pre-commit`) automatically scans every commit
 | `npm run repair:trades` | Repair trade records (`src/repairTrades.ts`) |
 | `npm run audit:balances` | Compare bot P&L vs actual wallet wealth; detect deposits/withdrawals (`src/auditBalances.ts`) |
 | `npm run snapshot` | Take a per-startup wealth snapshot; auto-compare with previous run and warn on drift > $5 (`src/sessionSnapshot.ts`). Also fires automatically when `npm run trade:arb` starts. |
+
+### Runtime tuning via `settings.txt`
+
+The bot loads `settings.txt` at startup (via `src/loadSettings.ts`, imported first in `runARB.ts`). Used by both `npm run trade:arb` and the packaged `dist/arb-bot.exe`. Precedence (highest wins): **shell env vars → settings.txt → embedded build-time defaults → .env**.
+
+Lookup path for the file: same directory as the running executable first (i.e. `dist/settings.txt` when running the .exe), then `process.cwd()`. Build copies `settings.txt.template` into `dist/settings.txt` on every `npm run build:exe`, but only seeds it if `dist/settings.txt` doesn't already exist — the user's edits persist across rebuilds.
+
+Use `run-bot-exe.bat` to launch the .exe in a restart loop with timestamped log redirection (matches `run-bot.bat` but for the packaged build).
 | `npm run prune:pm` | Remove stale Polymarket data |
 | `npm run prune:high:mna` | Prune high-match MNA data |
 | `npm run expand:opt` | Expand optimized arb entries |

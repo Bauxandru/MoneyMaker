@@ -1,0 +1,53 @@
+# ═══════════════════════════════════════════════════════════════════════════
+#  arb-bot settings.txt
+#
+#  Place this file next to arb-bot.exe and edit values as needed. One KEY=VALUE
+#  per line. Lines starting with `#` are comments.
+#
+#  Precedence (highest wins):
+#    1. Shell env vars (e.g. $env:TRADE_USD="7" in PowerShell before running)
+#    2. This file
+#    3. Values embedded into the .exe at build time
+#
+#  To apply changes: restart the bot. (run-bot.bat auto-restarts every 5s
+#  after exit, so you can just close the window and relaunch.)
+# ═══════════════════════════════════════════════════════════════════════════
+
+# ── Core trading ──────────────────────────────────────────────────────────
+DRY_RUN=false
+TRADE_USD=7
+MIN_EDGE=0.01
+MIN_DEPTH_MULT=1
+MAX_CONTRACTS=999
+MAX_HEDGE_POSITIONS=50
+MAX_CONSECUTIVE_ERRORS=5
+
+# ── Hedge behaviour ───────────────────────────────────────────────────────
+# HEDGE_TARGET=payout   # "payout" = any fill up to breakeven, "profit" = require MIN_EDGE margin
+HEDGE_TARGET=payout
+STRICT_HEDGE=true
+
+# ── Kalshi order mode ─────────────────────────────────────────────────────
+# false = IOC taker (7% fee, faster), true = GTC maker (1.75% fee, slower)
+KAL_MAKER_MODE=false
+
+# ── Discovery ─────────────────────────────────────────────────────────────
+# 0 = date-based expiry (midnight UTC), otherwise TTL in ms (e.g. 21600000 = 6h)
+DISCOVERY_CACHE_TTL_MS=21600000
+# LIVE_ONLY=false        # skip pre-match trades
+# FORCE_DISCOVER=false   # force re-discovery on startup (ignores cache)
+
+# ── Session snapshot / drift detection ────────────────────────────────────
+DRIFT_WARN_USD=5
+# DRIFT_DEPOSIT_CHECK_TZ=local   # 'local' or 'utc' for day rollover
+
+# ── API endpoints (only override if you have a specific reason) ───────────
+# POLY_CLOB_URL=https://clob.polymarket.com
+# KALSHI_BASE_URL=https://api.elections.kalshi.com/trade-api/v2
+
+# ── Dashboard push (for multi-server setups) ──────────────────────────────
+# DASHBOARD_PUSH_URL=http://100.x.x.x:3456
+# DASHBOARD_INGEST_SECRET=your-shared-secret
+
+# ── Server identification (for multi-bot dashboards) ──────────────────────
+# SERVER_ID=home

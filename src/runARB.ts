@@ -9,6 +9,10 @@
  *   DRY_RUN=false TRADE_USD=10 npx tsx src/runARB.ts
  */
 
+// Must be imported FIRST so settings.txt is loaded into process.env before any
+// ARB module calls dotenv.config() or reads env vars at import time.
+import "./loadSettings.js";
+
 import fs from "fs";
 import path from "path";
 

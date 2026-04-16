@@ -63,10 +63,14 @@ if (pemPath) {
 }
 console.log(`  ${Object.keys(envOverrides).length} env vars embedded`);
 
-// Build the banner JS that sets process.env before anything else runs
-const envBanner = `(function(){${Object.entries(envOverrides).map(
-  ([k, v]) => `process.env[${JSON.stringify(k)}]=process.env[${JSON.stringify(k)}]||${JSON.stringify(v)};`
-).join("")}})();`;
+// Build the banner JS that sets process.env before anything else runs.
+// For each embedded key, only write it if the shell hasn't already set it.
+// Also track the keys we set into process.env.__ARB_EMBEDDED_KEYS so the
+// loadSettings module can distinguish banner-set vs. shell-set values and
+// let settings.txt override banner values.
+const envBanner = `(function(){var _emb=[];` + Object.entries(envOverrides).map(
+  ([k, v]) => `if(!process.env[${JSON.stringify(k)}]){process.env[${JSON.stringify(k)}]=${JSON.stringify(v)};_emb.push(${JSON.stringify(k)});}`
+).join("") + `process.env.__ARB_EMBEDDED_KEYS=_emb.join(",");})();`;
 
 // ── Step 1: esbuild bundle ─────────────────────────────────────────────────
 
@@ -194,6 +198,24 @@ try {
   try { unlinkSync(join(DIST, "loader.cjs")); } catch {}
   try { unlinkSync(join(DIST, "sea-prep.blob")); } catch {}
 
+  // Copy settings.txt.template next to the .exe if the user hasn't already
+  // placed a real settings.txt there. Gives them a ready-to-edit starting point.
+  try {
+    const templateSrc = join(ROOT, "settings.txt.template");
+    const templateDst = join(DIST, "settings.txt.template");
+    const liveSettings = join(DIST, "settings.txt");
+    if (existsSync(templateSrc)) {
+      copyFileSync(templateSrc, templateDst);
+      console.log(`  Copied settings.txt.template -> ${templateDst}`);
+      if (!existsSync(liveSettings)) {
+        copyFileSync(templateSrc, liveSettings);
+        console.log(`  Seeded ${liveSettings} from template (edit to adjust)`);
+      }
+    }
+  } catch (err) {
+    console.warn(`  settings template copy failed: ${err.message}`);
+  }
+
   console.log(`\n========================================`);
   console.log(`  BUILD SUCCESSFUL`);
   console.log(`  ${exePath}`);
@@ -201,9 +223,10 @@ try {
   console.log(`\nProtection: esbuild minify + obfuscator + V8 bytecode`);
   console.log(`No JS source in the final executable.\n`);
   console.log(`Distribution package:`);
-  console.log(`  - dist/arb-bot.exe       (the bot)`);
-  console.log(`  - settings.csv.template   (user fills in API keys)`);
-  console.log(`  - kalshi_key.pem          (user provides their own)`);
+  console.log(`  - dist/arb-bot.exe            (the bot)`);
+  console.log(`  - dist/settings.txt           (edit to adjust runtime settings)`);
+  console.log(`  - dist/settings.txt.template  (pristine reference)`);
+  console.log(`  - run-bot-exe.bat             (restart loop + log redirect)`);
 } catch (err) {
   console.error("Executable creation failed:", err.message);
   process.exit(1);
