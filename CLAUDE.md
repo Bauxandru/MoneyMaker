@@ -533,6 +533,7 @@ A git pre-commit hook (`.git/hooks/pre-commit`) automatically scans every commit
 | `npm run sync` | Run position reconciliation (`src/_reconcile.ts`) |
 | `npm run hedge` | Run standalone hedge cycle (`src/_hedge.ts`) |
 | `npm run repair:trades` | Repair trade records (`src/repairTrades.ts`) |
+| `npm run audit:balances` | Compare bot P&L vs actual wallet wealth; detect deposits/withdrawals (`src/auditBalances.ts`) |
 | `npm run prune:pm` | Remove stale Polymarket data |
 | `npm run prune:high:mna` | Prune high-match MNA data |
 | `npm run expand:opt` | Expand optimized arb entries |
