@@ -8,6 +8,7 @@ import { execSync } from "child_process";
 import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync, unlinkSync } from "fs";
 import { join, dirname } from "path";
 import { fileURLToPath } from "url";
+import { randomBytes, createCipheriv } from "crypto";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -60,10 +61,38 @@ if (pemPath) {
   }
 }
 
-const envBanner = `(function(){${Object.entries(envOverrides)
-  .filter(([k]) => dashboardVars.includes(k) || k.startsWith("DASHBOARD_") || k.startsWith("POLY_") || k.startsWith("KALSHI_"))
-  .map(([k, v]) => `process.env[${JSON.stringify(k)}]=process.env[${JSON.stringify(k)}]||${JSON.stringify(v)};`)
-  .join("")}})();`;
+// Encrypt embedded values — see build.mjs for rationale. `strings dashboard.exe`
+// should not reveal plaintext secrets (DASHBOARD_INGEST_SECRET, Kalshi PEM,
+// etc.). Same AES-256-GCM scheme as the trading bot build.
+const _filteredEntries = Object.entries(envOverrides)
+  .filter(([k]) => dashboardVars.includes(k) || k.startsWith("DASHBOARD_") || k.startsWith("POLY_") || k.startsWith("KALSHI_"));
+const _aesKey = randomBytes(32);
+const _scramble = randomBytes(32);
+const _scrambledKey = Buffer.alloc(32);
+for (let i = 0; i < 32; i++) _scrambledKey[i] = _aesKey[i] ^ _scramble[i];
+const _enc = [];
+for (const [k, v] of _filteredEntries) {
+  const iv = randomBytes(12);
+  const c = createCipheriv("aes-256-gcm", _aesKey, iv);
+  const ct = Buffer.concat([c.update(String(v), "utf8"), c.final()]);
+  _enc.push([k, iv.toString("hex"), c.getAuthTag().toString("hex"), ct.toString("hex")]);
+}
+function _chunkHex(buf, n = 8) {
+  const step = Math.ceil(buf.length / n);
+  const out = [];
+  for (let i = 0; i < buf.length; i += step) out.push(buf.slice(i, i + step).toString("hex"));
+  return out;
+}
+const envBanner = `(function(){
+var c=require("crypto");
+var kp=${JSON.stringify(_chunkHex(_scrambledKey))}.map(function(s){return Buffer.from(s,"hex");});
+var pp=${JSON.stringify(_chunkHex(_scramble))}.map(function(s){return Buffer.from(s,"hex");});
+var k=Buffer.concat(kp),p=Buffer.concat(pp),key=Buffer.alloc(k.length);
+for(var i=0;i<k.length;i++)key[i]=k[i]^p[i];
+function D(i,t,x){var d=c.createDecipheriv("aes-256-gcm",key,Buffer.from(i,"hex"));d.setAuthTag(Buffer.from(t,"hex"));return Buffer.concat([d.update(Buffer.from(x,"hex")),d.final()]).toString("utf8");}
+var E=${JSON.stringify(_enc)};
+for(var j=0;j<E.length;j++){var e=E[j];if(!process.env[e[0]])process.env[e[0]]=D(e[1],e[2],e[3]);}
+})();`;
 
 console.log(`  Config embedded`);
 

@@ -316,9 +316,18 @@ export async function recordStartupSnapshot(funder: string): Promise<SessionSnap
 
 // ─── CLI entry ─────────────────────────────────────────────────────────────
 // Run directly: `npx tsx src/sessionSnapshot.ts` — useful for manual testing.
+// Guarded so the module can also be imported from runARB without side effects.
+// `import.meta.url` is undefined inside Node's SEA single-executable bundle, so
+// we wrap the check to prevent the CLI path from crashing the .exe startup.
 
 import { fileURLToPath } from "url";
-const isMain = process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1]);
+let isMain = false;
+try {
+  const metaUrl = (import.meta as { url?: string }).url;
+  if (metaUrl && process.argv[1]) {
+    isMain = fileURLToPath(metaUrl) === path.resolve(process.argv[1]);
+  }
+} catch { isMain = false; }
 if (isMain) {
   (async () => {
     const dotenv = await import("dotenv");

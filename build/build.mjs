@@ -17,6 +17,7 @@ import { execSync } from "child_process";
 import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync, unlinkSync } from "fs";
 import { join, dirname } from "path";
 import { fileURLToPath } from "url";
+import { randomBytes, createCipheriv } from "crypto";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -63,14 +64,62 @@ if (pemPath) {
 }
 console.log(`  ${Object.keys(envOverrides).length} env vars embedded`);
 
-// Build the banner JS that sets process.env before anything else runs.
-// For each embedded key, only write it if the shell hasn't already set it.
-// Also track the keys we set into process.env.__ARB_EMBEDDED_KEYS so the
-// loadSettings module can distinguish banner-set vs. shell-set values and
-// let settings.txt override banner values.
-const envBanner = `(function(){var _emb=[];` + Object.entries(envOverrides).map(
-  ([k, v]) => `if(!process.env[${JSON.stringify(k)}]){process.env[${JSON.stringify(k)}]=${JSON.stringify(v)};_emb.push(${JSON.stringify(k)});}`
-).join("") + `process.env.__ARB_EMBEDDED_KEYS=_emb.join(",");})();`;
+// ── Encrypt embedded values with AES-256-GCM ──────────────────────────────
+// Without this, `strings arb-bot.exe` returns every embedded secret in
+// plaintext — including POLY_WALLET_PRIVATE_KEY, POLY_API_SECRET, etc.
+// The key is still embedded in the banner (there's no way around that in a
+// self-contained binary), but strings(1) / grep won't find plaintext secrets,
+// and casual inspection is defeated.
+//
+// Important limitations, be honest about them:
+//   - Anyone who can RUN the .exe can see the decrypted values in process.env.
+//   - A reverse-engineer with a debugger can still extract them.
+//   - This protects against accidental leaks (sharing the .exe, grep on a
+//     captured binary), NOT against a motivated attacker.
+//
+// The AES key is pack-and-xor scrambled across 8 byte-array slices so it's
+// harder to spot as a contiguous 32-byte blob in the binary.
+const aesKey = randomBytes(32);
+const scramble = randomBytes(32);
+const scrambledKey = Buffer.alloc(32);
+for (let i = 0; i < 32; i++) scrambledKey[i] = aesKey[i] ^ scramble[i];
+
+const encryptedEntries = [];
+for (const [k, v] of Object.entries(envOverrides)) {
+  const iv = randomBytes(12);
+  const cipher = createCipheriv("aes-256-gcm", aesKey, iv);
+  const ct = Buffer.concat([cipher.update(String(v), "utf8"), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  encryptedEntries.push([k, iv.toString("hex"), tag.toString("hex"), ct.toString("hex")]);
+}
+
+// Chunk the scrambled key + scramble pad into 8 byte-array pieces each.
+// Defeats `strings`/grep from spotting a 64-char hex key — and also any
+// naive search for the pad next to the encrypted blobs.
+function chunkHex(buf, pieces = 8) {
+  const step = Math.ceil(buf.length / pieces);
+  const out = [];
+  for (let i = 0; i < buf.length; i += step) {
+    out.push(buf.slice(i, i + step).toString("hex"));
+  }
+  return out;
+}
+const keyPieces = chunkHex(scrambledKey);
+const padPieces = chunkHex(scramble);
+
+// Runtime decrypt IIFE.
+const envBanner = `(function(){
+var c=require("crypto");
+var kp=${JSON.stringify(keyPieces)}.map(function(s){return Buffer.from(s,"hex");});
+var pp=${JSON.stringify(padPieces)}.map(function(s){return Buffer.from(s,"hex");});
+var k=Buffer.concat(kp),p=Buffer.concat(pp),key=Buffer.alloc(k.length);
+for(var i=0;i<k.length;i++)key[i]=k[i]^p[i];
+function D(i,t,x){var d=c.createDecipheriv("aes-256-gcm",key,Buffer.from(i,"hex"));d.setAuthTag(Buffer.from(t,"hex"));return Buffer.concat([d.update(Buffer.from(x,"hex")),d.final()]).toString("utf8");}
+var E=${JSON.stringify(encryptedEntries)};
+var _emb=[];
+for(var j=0;j<E.length;j++){var e=E[j];if(!process.env[e[0]]){process.env[e[0]]=D(e[1],e[2],e[3]);_emb.push(e[0]);}}
+process.env.__ARB_EMBEDDED_KEYS=_emb.join(",");
+})();`;
 
 // ── Step 1: esbuild bundle ─────────────────────────────────────────────────
 
