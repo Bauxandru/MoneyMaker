@@ -45,6 +45,7 @@
     "build:probe": "node build/build-probe.mjs",
     "repair:trades": "tsx src/repairTrades.ts",
     "audit:balances": "tsx src/auditBalances.ts",
+    "snapshot": "tsx src/sessionSnapshot.ts",
     "live:mention": "tsx src/liveMention.ts",
     "scan:multi": "tsx src/scanMultiOutcome.ts",
     "license-server": "tsx src/licenseServer.ts",

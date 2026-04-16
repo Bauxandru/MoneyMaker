@@ -60,6 +60,7 @@ import { validateLicense, startPeriodicRevalidation } from "./licenseClient.js";
 import { startPeriodicPush } from "./dashboardPush.js";
 import { matchCodePrefix } from "./ARB/ttNameMatch.js";
 import { polyFetch } from "./ARB/ttConfig.js";
+import { recordStartupSnapshot } from "./sessionSnapshot.js";
 
 // --- Settlement filtering helpers --------------------------------------------
 
@@ -195,6 +196,19 @@ async function main() {
     console.warn(`[STARTUP] Balance check failed: ${(err as Error).message}`);
   }
 
+  // -- Session snapshot & drift check (vs. previous startup) --
+  // Compares total wealth + bot-claimed realized P&L between this startup and
+  // the last one. If a deposit audit of the between-period shows drift > $5,
+  // prints a warning. Full details via `npm run audit:balances`.
+  try {
+    const { Wallet } = await import("ethers");
+    const pk = process.env.POLY_WALLET_PRIVATE_KEY ?? "";
+    const funder = process.env.POLY_FUNDER || (pk ? new Wallet(pk).address : "");
+    if (funder) await recordStartupSnapshot(funder);
+  } catch (err) {
+    console.warn(`[SESSION] snapshot skipped: ${(err as Error).message}`);
+  }
+
   // -- Reconciliation state (shared by hourly + settlement triggers) --
   let settlementReconcileTimer: ReturnType<typeof setTimeout> | null = null;
   let reconcileRunning = false;
@@ -247,6 +261,13 @@ async function main() {
 
   // -- Startup reconciliation --
   console.log("[STARTUP] Running position reconciliation (non-blocking)...");
+  // Auto-backfill any on-chain positions that lack a journal entry BEFORE reconcile runs,
+  // so the reconciler sees the full picture. Runs in parallel with the reconcile so neither
+  // blocks startup path; if it errors, we just proceed without backfilling.
+  import("./ARB/ttReconcile.js")
+    .then(m => m.autoBackfillUntracked?.())
+    .catch(err => console.warn(`[AUTO-BACKFILL] skipped: ${(err as Error).message}`));
+
   reconcilePositions("startup").catch(err =>
     console.error(`[RECONCILE] Startup reconciliation failed: ${(err as Error).message}`)
   );
@@ -262,6 +283,21 @@ async function main() {
       .catch(err => console.error(`[RECONCILE] Hourly reconciliation error: ${(err as Error).message}`))
       .finally(() => { reconcileRunning = false; lastReconcileEndTs = Date.now(); });
   }, 60 * 60 * 1000);
+
+  // Schedule hourly wallet-vs-journal diff — catches over-hedge / untracked positions
+  // that the standard reconciler (which only touches existing records) can't see.
+  // Writes diffs to data/wallet_journal_diff.json + logs [RECONCILE-DIFF] warnings.
+  setInterval(() => {
+    import("./ARB/ttReconcile.js")
+      .then(m => m.runWalletJournalDiff?.())
+      .catch(err => console.error(`[RECONCILE-DIFF] hourly diff failed: ${(err as Error).message}`));
+  }, 60 * 60 * 1000);
+  // Also run once ~60s after startup so new instances see the state early.
+  setTimeout(() => {
+    import("./ARB/ttReconcile.js")
+      .then(m => m.runWalletJournalDiff?.())
+      .catch(() => { /* swallow first-run errors */ });
+  }, 60_000);
 
   // -- Build conditionId index for settlement filtering --
   const { conditionIds: watchedConditions, conditionToSlug } = await buildConditionIdIndex(watchlist);
