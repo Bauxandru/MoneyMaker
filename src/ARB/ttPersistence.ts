@@ -304,11 +304,29 @@ export function loadArbTrades(): ArbTradeRecord[] {
   } catch { _arbTradesCache = []; _arbTradesCacheTs = now; return []; }
 }
 
+// Debounced dashboard push on every write — reconcile writes can storm-burst
+// (one save per field change across hundreds of trades), so coalesce into a
+// single push after a short quiet period. Covers logArbTrade, resolveArbTrade,
+// and reconciliation paths uniformly.
+let _pushDebounceTimer: ReturnType<typeof setTimeout> | null = null;
+const PUSH_DEBOUNCE_MS = Number(process.env.DASHBOARD_PUSH_DEBOUNCE_MS ?? 2000);
+
+function schedulePush(trades: ArbTradeRecord[]): void {
+  // Skip if push not configured (saves one loadMetrics call per save).
+  if (!process.env.DASHBOARD_PUSH_URL || !process.env.LICENSE_TOKEN) return;
+  if (_pushDebounceTimer) clearTimeout(_pushDebounceTimer);
+  _pushDebounceTimer = setTimeout(() => {
+    _pushDebounceTimer = null;
+    pushTradeData(trades, loadMetrics()).catch(() => {});
+  }, PUSH_DEBOUNCE_MS);
+}
+
 export function saveArbTrades(trades: ArbTradeRecord[]): void {
   atomicWriteFileSync(ARB_LOG_PATH, JSON.stringify(trades));
   // Invalidate cache on write so next read picks up fresh data
   _arbTradesCache = trades;
   _arbTradesCacheTs = Date.now();
+  schedulePush(trades);
 }
 
 export function logArbTrade(record: ArbTradeRecord): void {
@@ -326,8 +344,7 @@ export function logArbTrade(record: ArbTradeRecord): void {
     console.log(`[PENDING] Completed pending fill ${_activePendingFillId}`);
     setActivePendingFillId(null);
   }
-  // Push updated trades to central dashboard (fire-and-forget)
-  pushTradeData(trades, loadMetrics()).catch(() => {});
+  // Note: the dashboard push is fired automatically by saveArbTrades (debounced).
 }
 
 export function resolveArbTrade(kalTicker: string, updates: Partial<ArbTradeRecord>, tradeId?: string): void {
