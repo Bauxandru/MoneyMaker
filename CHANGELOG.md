@@ -54,3 +54,7 @@ Categories: `FEATURE`, `FIX`, `REFACTOR`, `CONFIG`, `SAFETY`, `HEDGE`, `RECONCIL
 [2026-04-16] SAFETY: RPC fallback promotion requires chainId match + two consistent balanceOf reads; adoption now logged at warn level (polyChain.ts)
 [2026-04-16] PERF: Hard cap of 500 samples per key on _priceHistory — defensive against clock-skew pruning failure (ttWebSocket.ts)
 [2026-04-16] DOCS: CLAUDE.md — corrected line counts; tagged known limitations [important]/[cosmetic]; added Windows/scratch-file notes; added test-coverage pointer; documented PARALLEL_MODE exception to Kalshi-first invariant; generalised Co-Authored-By trailer (CLAUDE.md)
+[2026-04-16] FIX: Dashboard — unified backfill detection via isBackfillTrade(); previous startsWith("backfill") missed every arb-backfill-* record and serverId=backfill/auto-backfill tag, leaking 26 backfill trades (-$3.36 P&L) into botRealizedPnl stats (dashboard.ts)
+[2026-04-16] FIX: Dashboard — scalar-settled trades now display SCALAR badge instead of OK/LOSS to prevent misreading fractional payouts as binary wins/losses (dashboard.ts)
+[2026-04-16] FIX: Dashboard — NO FILL flag restricted to status="hedging"; resolved hedge-complete trades with legitimate kalCost=0 no longer get the red "NO FILL" warning (dashboard.ts)
+[2026-04-16] FIX: Dashboard — duration calc guards against NaN / negative ms from clock-skew or corrupted timestamps (dashboard.ts)

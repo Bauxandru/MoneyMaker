@@ -168,6 +168,19 @@ interface HedgeEntry {
   }]>;
 }
 
+/** Unified backfill detection: catches both legacy `backfill-*` IDs and the
+ *  newer `arb-backfill-*` IDs / `serverId` tags used by ttReconcile auto-backfill
+ *  and the standalone backfill scripts. Previous code only matched `startsWith("backfill")`,
+ *  which leaks every `arb-backfill-pm-*` / `arb-backfill-kal-*` record into bot P&L stats. */
+function isBackfillTrade(t: ArbTrade): boolean {
+  if (!t) return false;
+  const id = t.id || "";
+  if (id.startsWith("backfill") || id.startsWith("arb-backfill")) return true;
+  const sid = (t as unknown as { serverId?: string }).serverId;
+  if (sid === "backfill" || sid === "auto-backfill") return true;
+  return false;
+}
+
 function validateTrade(t: ArbTrade): string[] {
   const w: string[] = [];
   // 1. Cost sum mismatch
@@ -201,7 +214,7 @@ function validateTrade(t: ArbTrade): string[] {
   //    Exception: PM-initial hedge-complete trades can legitimately have kalCost=0
   //    when the hedge went entirely to PM opposite token (no KAL trade needed).
   //    Similarly, KAL-initial trades can have pmCost=0 if hedge went to KAL NO.
-  if (t.status === "resolved" && !t.id.startsWith("backfill")) {
+  if (t.status === "resolved" && !isBackfillTrade(t)) {
     const isPmOppHedge = t.resolutionMethod === "hedge-complete" && t.initialExchange === "pm" && t.kalCost === 0;
     const isKalOppHedge = t.resolutionMethod === "hedge-complete" && t.initialExchange === "kal" && t.pmCost === 0;
     if (t.kalCost === 0 && t.kalFillPrice === 0 && t.resolutionMethod !== "settlement" && t.resolutionMethod !== "market-settled" && !isPmOppHedge) {
@@ -375,7 +388,7 @@ function computeStats(trades: ArbTrade[]) {
   let takerFees = 0;
 
   for (const t of trades) {
-    const isBackfill = t.id.startsWith("backfill");
+    const isBackfill = isBackfillTrade(t);
     if (t._maxPnl != null) {
       totalMaxPnl += t._maxPnl;
       missedPnl += t._maxPnl - (t.realizedPnl ?? 0);
@@ -2654,10 +2667,15 @@ function renderTrades(trades) {
   }
 
   tbody.innerHTML = sorted.map(function(t, i) {
-    const isBackfill = t.id.indexOf("backfill") === 0;
+    // Backfill detection must match the server-side isBackfillTrade():
+    // legacy backfill-*, arb-backfill-*, serverId=backfill/auto-backfill all count.
+    const isBackfill = (t.id && (t.id.indexOf("backfill") === 0 || t.id.indexOf("arb-backfill") === 0))
+      || t.serverId === "backfill" || t.serverId === "auto-backfill";
     const dirLabel = t.dir || "?";
     const kalSide = (dirLabel === "C" || dirLabel === "D" || dirLabel === "G" || dirLabel === "H" || dirLabel === "I") ? "NO" : "YES";
-    const kalNoFill = t.kalCost === 0 && t.kalFillPrice === 0 && t.status !== "filled";
+    // NO FILL flag is meaningful only while a trade is still "hedging".
+    // Once resolved, kalCost=0 is legitimate for PM-opposite hedge-complete trades.
+    const kalNoFill = t.kalCost === 0 && t.kalFillPrice === 0 && t.status === "hedging";
 
     var kalStr = kalNoFill
       ? esc(shortTicker(t.kalTicker)) + ' <span style="color:#f85149;font-size:10px">NO FILL</span>'
@@ -2665,10 +2683,14 @@ function renderTrades(trades) {
     const initPmPriceTemp = t.pmFillPrice;
     var pmStr = t.pmOutcome ? esc(t.pmOutcome) + " @" + (initPmPriceTemp > 0 ? initPmPriceTemp.toFixed(2) : "--") : (isBackfill ? "KAL-only" : "--");
     const scalarBadge = t.scalarSettlement ? '<span class="badge badge-scalar">SCALAR</span>' : '';
-    var statusBadge = (t.status === "resolved"
-      ? (t.realizedPnl != null && t.realizedPnl < 0 ? '<span class="badge badge-loss">LOSS</span>' : '<span class="badge badge-resolved">OK</span>')
-      : t.status === "hedging" ? '<span class="badge badge-hedging">HDG</span>'
-      : '<span class="badge badge-filled">FILL</span>') + scalarBadge;
+    // Scalar-settled trades are neither a clean win nor loss — suppress OK/LOSS
+    // and show SCALAR in the status cell to avoid misreading a fractional payout.
+    var statusBadge = t.scalarSettlement
+      ? scalarBadge
+      : ((t.status === "resolved"
+          ? (t.realizedPnl != null && t.realizedPnl < 0 ? '<span class="badge badge-loss">LOSS</span>' : '<span class="badge badge-resolved">OK</span>')
+          : t.status === "hedging" ? '<span class="badge badge-hedging">HDG</span>'
+          : '<span class="badge badge-filled">FILL</span>'));
     // For PM-hedged trades (KAL never filled, hedge done on PM), pmCost IS the initial cost
     const initPmPrice = t.pmFillPrice || 0;
 
@@ -2686,7 +2708,7 @@ function renderTrades(trades) {
     const isOpen = expandedRows.has(i);
 
     const durStr = t.resolvedTs && t.ts
-      ? (function() { var ms = new Date(t.resolvedTs).getTime() - new Date(t.ts).getTime(); var s = Math.floor(ms/1000); if (s < 60) return s + 's'; var m = Math.floor(s/60); if (m < 60) return m + 'm'; var h = Math.floor(m/60); return h + 'h' + (m%60) + 'm'; })()
+      ? (function() { var ms = new Date(t.resolvedTs).getTime() - new Date(t.ts).getTime(); if (!isFinite(ms) || ms < 0) return ''; var s = Math.floor(ms/1000); if (s < 60) return s + 's'; var m = Math.floor(s/60); if (m < 60) return m + 'm'; var h = Math.floor(m/60); return h + 'h' + (m%60) + 'm'; })()
       : '';
     const resolvedCell = t.resolvedTs
       ? fmtDate(t.resolvedTs) + (durStr ? ' <span style="color:#8b949e;font-size:10px">(' + durStr + ')</span>' : '')
