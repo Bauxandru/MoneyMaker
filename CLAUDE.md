@@ -14,6 +14,16 @@
 - Check actual runtime behavior (logs, data files) before and after changes when possible.
 - When fixing bugs, verify the fix addresses the actual root cause found in data, not a hypothesized one.
 
+## Environment
+
+- **Windows host.** Paths use backslashes in raw PowerShell, forward slashes inside this bash shell. `NUL` on Windows = `/dev/null` in bash. Several runners are `.ps1` (`run_drytest.ps1`, `run_live_tennis.ps1`, `run_live_dota2.ps1`).
+- **Line endings.** Don't mass-convert CRLF↔LF; git and the Node runtime handle both. Only normalise if a single file's endings are visibly mixed.
+
+## Scratch files
+
+- Files named `tmp_*.ts|.mts|.cjs|.mjs|.js` and `_debug*` / `_check*` at the repo root are ad-hoc investigation scripts. Do not commit them, do not delete them unless the user asks — they may be active drafts.
+- When writing a new scratch script, prefix it with `tmp_` so the existing gitignore patterns catch it.
+
 ---
 
 ## Project Structure
@@ -32,9 +42,9 @@
 | `ttDiscovery.ts` | Cross-platform pair detection (Kalshi <-> Polymarket) |
 | `ttWebSocket.ts` | Live orderbook feeds + momentum tracking |
 | `ttPmOrders.ts` | Polymarket CLOB client and order management |
-| `ttExecution.ts` | Core arbitrage execution engine (~1800 lines) |
-| `ttHedge.ts` | Hedge-mode logic for unhedged positions |
-| `ttReconcile.ts` | Position reconciliation and ghost-fill handling (~1000 lines) |
+| `ttExecution.ts` | Core arbitrage execution engine (~3800 lines) |
+| `ttHedge.ts` | Hedge-mode logic for unhedged positions (~2800 lines) |
+| `ttReconcile.ts` | Position reconciliation and ghost-fill handling (~2200 lines) |
 | `ttEventLog.ts` | Audit trail for trading events |
 | `ttAuditLog.ts` | Structured audit logging for debugging |
 | `ttNameMatch.ts` | Cross-platform entity name matching |
@@ -128,7 +138,7 @@ Kalshi is executed first because:
 
 **These rules exist to prevent real money losses. Do not remove, weaken, or bypass them.**
 
-1. **Never execute the PM leg without confirmed Kalshi fill.** The PM order is only placed after Kalshi fill confirmation. This is the core safety guarantee — Kalshi-first execution means we never have naked PM exposure.
+1. **Never execute the PM leg without confirmed Kalshi fill.** The PM order is only placed after Kalshi fill confirmation. This is the core safety guarantee — Kalshi-first execution means we never have naked PM exposure. *Exception:* `PARALLEL_MODE=true` races both legs simultaneously and relies on hedge-mode recovery to close any unmatched side. This breaks the invariant in exchange for latency; only enable it when KAL API latency is known stable and hedge capacity is available. The default is `false`.
 
 2. **Reject edges > 45%.** Edges above 0.45 are almost certainly data errors (stale orderbook, mismatched markets). The bot aborts and session-skips. Esports/tennis can legitimately show 20-35% edges due to thin liquidity, but >45% is always suspicious.
 
@@ -274,6 +284,17 @@ These Maps are the **primary price source** during execution. The main loop read
 
 ## Reconciliation
 
+### Test coverage (what is and is not tested)
+
+Test files under `src/ARB/*.test.ts` (run with `npm run test`):
+- `ttConfig.test.ts` — fee math only
+- `ttDiscovery.test.ts` — helper functions (not the main discovery loop)
+- `ttHedge.test.ts` — `isScalarSettlement` only (not `runHedgeCycle`)
+- `ttNameMatch.test.ts` — reasonably thorough
+- `ttPersistence.test.ts`, `ttPmOrders.test.ts`, `ttWebSocket.test.ts` — smoke-level
+
+**Untested:** `ttExecution.ts` (`executeArb`, `monitorLoop`), the four reconciliation phases in `ttReconcile.ts`, `runHedgeCycle` in `ttHedge.ts`, ghost-fill recovery. Assume any change to these lands without a safety net — walk the code path carefully and verify invariants manually.
+
 ### When It Runs
 - **Startup** — `reconcilePositions("startup")` — initial state repair
 - **Hourly** — `setInterval` in `runARB.ts`
@@ -331,23 +352,23 @@ These Maps are the **primary price source** during execution. The main loop read
 
 ## Known Limitations & Technical Debt
 
-These are known issues. Do not waste time "discovering" them — they're documented here intentionally.
+These are known issues. Do not waste time "discovering" them — they're documented here intentionally. Tags: **[important]** = watch for regressions / fix when related work touches it, **[cosmetic]** = acknowledged, low priority.
 
-1. **Pending fills have no expiration.** If execution crashes after creating a pending fill but before marking it complete, the record stays forever. Ghost detector handles some cases but a 15-min timeout would be safer.
+1. **[important] Fractional share rounding.** PM can return fractional shares (e.g., 11.55 instead of 11). Kalshi only supports integers. Rounding is handled ad-hoc throughout the codebase rather than with fixed-point math.
 
-2. **Hedge state cleanup lag.** Resolved trades can linger in `hedge_state.json` after the trade is marked resolved in `arb_trades.json`. Reconciliation eventually cleans this up but there's a window of inconsistency.
+2. **[important] Reconciliation timestamp matching is heuristic.** Phase (c) matches PM fills by timestamp within +-1 hour. Multiple trades in the same window can be mis-assigned. The `usedPmIdx` / `otherKalClaimedC` claim-sets in `ttReconcile.ts` prevent the worst cases — **do not remove them**. There's no direct fill-to-trade ID linkage.
 
-3. **Fractional share rounding.** PM can return fractional shares (e.g., 11.55 instead of 11). Kalshi only supports integers. Rounding is handled ad-hoc throughout the codebase rather than with fixed-point math.
+3. **[important] PM data-api avgPrice may differ from fill price.** When on-chain RPC fails and data-api is used as fallback, the reported price may be market price, not actual fill price. Binary market price inversion guards exist but edge cases remain.
 
-4. **Reconciliation timestamp matching is heuristic.** Phase (c) matches PM fills by timestamp within +-1 hour. Multiple trades in the same window can be mis-assigned. There's no direct fill-to-trade ID linkage.
+4. **[cosmetic] Pending fills have no expiration.** If execution crashes after creating a pending fill but before marking it complete, the record stays forever. Ghost detector handles some cases; a 15-min startup sweep now exists but runtime expiration does not.
 
-5. **No running P&L on hedge positions.** Hedging trades don't show estimated profit/loss until resolved. Capital tied up in hedges is a black box until resolution.
+5. **[cosmetic] Hedge state cleanup lag.** Resolved trades can linger in `hedge_state.json` after the trade is marked resolved in `arb_trades.json`. Reconciliation eventually cleans this up but there's a window of inconsistency.
 
-6. **No slippage tracking.** Projected edge at discovery time is not compared to actual fill prices. No metric for how much slippage occurs.
+6. **[cosmetic] No running P&L on hedge positions.** Hedging trades don't show estimated profit/loss until resolved. Capital tied up in hedges is a black box until resolution.
 
-7. **Session skip set not synced with trade status.** `sessionSkipSet` blocks re-arbing a match for the cooldown period, but doesn't check if the existing trade is actually still active/hedging.
+7. **[cosmetic] No slippage tracking.** Projected edge at discovery time is not compared to actual fill prices. No metric for how much slippage occurs.
 
-8. **PM data-api avgPrice may differ from fill price.** When on-chain RPC fails and data-api is used as fallback, the reported price may be market price, not actual fill price. Binary market price inversion guards exist but edge cases remain.
+8. **[cosmetic] Session skip set is session-wide, not status-aware.** `sessionSkipSet` blocks re-arbing a match for the entire session; at startup it's seeded from `recent (3 days)` OR `active (hedging/filled)` trades, so old-but-active positions are covered. There's no runtime sync — if a hedging trade resolves mid-session the match stays skipped, which is the intended conservative behaviour.
 
 ---
 
@@ -418,7 +439,7 @@ asking first**, provided:
 - The pre-commit secret scanner hook passes.
 - The commit message uses the project's style: short subject line
   (under 70 chars), bulleted body explaining *why* and *what*,
-  `Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>`
+  `Co-Authored-By: Claude <noreply@anthropic.com>` (or the current model identifier)
   trailer.
 
 This authorization **overrides** the default global "never commit

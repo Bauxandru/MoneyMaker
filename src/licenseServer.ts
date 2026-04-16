@@ -7,7 +7,7 @@ import https from "https";
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from "fs";
 import { join, dirname } from "path";
 import { fileURLToPath } from "url";
-import { execSync } from "child_process";
+import { spawnSync } from "child_process";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -157,10 +157,19 @@ function ensureSelfSignedCert(): { key: string; cert: string } {
   if (!existsSync(CERTS_DIR)) mkdirSync(CERTS_DIR, { recursive: true });
 
   try {
-    execSync(
-      `openssl req -x509 -newkey rsa:2048 -keyout "${keyPath}" -out "${certPath}" -days 365 -nodes -subj "/CN=arb-license-server"`,
-      { stdio: "pipe" }
+    // spawnSync with shell:false avoids shell-metacharacter injection through
+    // keyPath/certPath (which are built from CERTS_DIR derived from ROOT).
+    const r = spawnSync(
+      "openssl",
+      [
+        "req", "-x509", "-newkey", "rsa:2048",
+        "-keyout", keyPath, "-out", certPath,
+        "-days", "365", "-nodes",
+        "-subj", "/CN=arb-license-server",
+      ],
+      { stdio: "pipe", shell: false }
     );
+    if (r.status !== 0) throw new Error(`openssl exited ${r.status}: ${r.stderr?.toString() ?? ""}`);
     console.log("[SSL] Self-signed certificate created (valid 365 days)");
   } catch {
     console.warn("[SSL] openssl not found -- falling back to HTTP only");

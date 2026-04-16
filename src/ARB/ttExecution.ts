@@ -1090,7 +1090,7 @@ export async function executeArb(
             kalTicker: kalLeg.ticker, kalFillPrice: pcAvgPrice,
             kalCost: kalCostActual, kalFees: pcFees,
             pmOutcome: pmLeg.outcome, pmSlug: entry.pmSlug, pmTokenId: pmLeg.tokenId,
-            pmFillPrice: pmAsk, pmCost: pmCostMatched, pmFees: pmFeePaid(kalFilled, pmAsk, pmLeg),
+            pmFillPrice: pmAsk, pmCost: pmCostMatched, pmFees: pmFeePaid(matchedShares, pmAsk, pmLeg),
             totalCost: Math.round((kalCostActual + pcFees + pmCostMatched) * 100) / 100,
             projectedEdge: edge, projectedProfit: matchedShares * edge,
             status: unhedgedPm > 0 ? "filled" : "resolved",
@@ -2129,7 +2129,7 @@ export async function executeArb3Leg(
           pmOppLeg: null,
           pmCostBasis: 0,
           kalLeg: f.leg.kalLeg,
-          kalCostBasis: f.fillPrice + (f.kalFees ?? 0) / shares,
+          kalCostBasis: shares > 0 ? f.fillPrice + (f.kalFees ?? 0) / shares : f.fillPrice,
           kalSide: "yes",
           sharesHeld: shares,
           initialShares: shares,
@@ -2323,6 +2323,24 @@ export async function monitorLoop(watchlist: WatchEntry[]): Promise<void> {
   // Supports MULTIPLE simultaneous hedges (e.g. Tirante on PM + Elegance on Kalshi).
   // Fetch all Kalshi positions in ONE API call — reused by resume loop + detectUnhedgedKal.
   const kalPosMap = await getKalshiPositionMap();
+
+  // Seed sessionSkipSet from on-chain Kalshi positions — orphan tickers
+  // (prior-session shares not tracked in arb_trades.json) must also block re-arbing,
+  // otherwise a ticker with leftover shares can double-fire the consolidation reconciler.
+  {
+    let onchainAdded = 0;
+    for (const [ticker, p] of kalPosMap) {
+      if ((p.yesCount || 0) <= 0 && (p.noCount || 0) <= 0) continue;
+      const mc = matchCodePrefix(ticker);
+      if (mc && !sessionSkipSet.has(mc)) {
+        sessionSkipSet.add(mc);
+        onchainAdded += 1;
+      }
+    }
+    if (onchainAdded > 0) {
+      console.log(`[STARTUP] Added ${onchainAdded} match(es) to sessionSkipSet from on-chain Kalshi positions`);
+    }
+  }
 
   let hedgeStates: HedgeState[] = loadHedgeStates();
   setAllHedgeStates(hedgeStates);
@@ -2745,7 +2763,7 @@ export async function monitorLoop(watchlist: WatchEntry[]): Promise<void> {
       console.error(`[WATCHDOG] cycle=${cycle} STUCK at step="${_step}" for >60s!`);
     }, 60_000);
     const watchdogKill = setTimeout(() => {
-      console.error(`[WATCHDOG] cycle=${cycle} STUCK at step="${_step}" for >5 MINUTES. Auto-restarting...`);
+      console.error(`[WATCHDOG] cycle=${cycle} STUCK at step="${_step}" for >5 MINUTES. Exiting with code 1 — supervisor (run-bot.bat / npm run trade:arb:auto / pm2) must restart.`);
       process.exit(1);
     }, 5 * 60_000);
 
@@ -3089,28 +3107,45 @@ export async function monitorLoop(watchlist: WatchEntry[]): Promise<void> {
         }
       }
     }
-    // REST fallback for tokens without WS data (with 3s timeout to prevent blocking)
+    // REST fallback for tokens without WS data (with 3s timeout to prevent blocking).
+    // IMPORTANT: cap at 40 tokens per cycle. When PM CLOB is slow, abandoned Promise.race
+    // calls from prior cycles keep their rate-limiter slot reservations, pushing
+    // nextAllowedAt minutes into the future. Capping restNeeded prevents queue runaway.
+    // Also use a single batch (no loop) — one Promise.race per cycle, max 40 concurrent.
     if (restNeeded.length > 0) {
-      const PM_BATCH_SIZE = 20;
+      const PM_REST_MAX = 40;
       const PM_PRICE_TIMEOUT_MS = 3_000;
-      for (let i = 0; i < restNeeded.length; i += PM_BATCH_SIZE) {
-        const batch = restNeeded.slice(i, i + PM_BATCH_SIZE);
-        try {
-          const results = await Promise.race([
-            Promise.all(batch.map(({ tid }) => fetchPmAskDirect(tid, clobBase).then(p => ({ tid, p })).catch(() => ({ tid, p: null as number | null })))),
-            new Promise<never>((_, rej) => setTimeout(() => rej(new Error("pm-prices-timeout")), PM_PRICE_TIMEOUT_MS)),
-          ]);
-          for (const { tid, p } of results) {
-            if (p !== null) pmPriceMap.set(tid, p);
-          }
-        } catch {
-          console.warn(`[POLL] PM price batch timed out (${PM_PRICE_TIMEOUT_MS / 1000}s) — using WS/cached data`);
-          break; // skip remaining batches
+      const batch = restNeeded.slice(0, PM_REST_MAX);
+      try {
+        const results = await Promise.race([
+          Promise.all(batch.map(({ tid }) => fetchPmAskDirect(tid, clobBase).then(p => ({ tid, p })).catch(() => ({ tid, p: null as number | null })))),
+          new Promise<never>((_, rej) => setTimeout(() => rej(new Error("pm-prices-timeout")), PM_PRICE_TIMEOUT_MS)),
+        ]);
+        for (const { tid, p } of results) {
+          if (p !== null) pmPriceMap.set(tid, p);
         }
+      } catch {
+        console.warn(`[POLL] PM price batch timed out (${PM_PRICE_TIMEOUT_MS / 1000}s) — using WS/cached data`);
       }
     }
 
+    // Cumulative budgets for the watchlist scan — per-entry timeouts were capped
+    // at 2s each, but with ~400 entries and PM CLOB congestion, sequential hits
+    // could still burn 5+ min (observed pm-prices watchdog stalls). These caps
+    // ensure the entire pm-prices step never exceeds a bounded time.
+    const _pmPricesBudgetStart = Date.now();
+    const PM_PRICES_BUDGET_MS = 8000;
+    const COIN_FLIP_BUDGET_MS = 3000;
+    let _coinFlipSpentMs = 0;
+    let _pmPricesBudgetLogged = false;
     for (const entry of watchlist) {
+      if (Date.now() - _pmPricesBudgetStart > PM_PRICES_BUDGET_MS) {
+        if (!_pmPricesBudgetLogged) {
+          console.warn(`[POLL] pm-prices budget exhausted (${PM_PRICES_BUDGET_MS}ms) — skipping remaining ${watchlist.length - watchlist.indexOf(entry)} entries this cycle`);
+          _pmPricesBudgetLogged = true;
+        }
+        break;
+      }
       if (sessionSkipSet.has(entry.matchCode)) {
         statusLines.push(`  ${entry.kal1.surname} vs ${entry.kal2.surname}  [session-skip]`);
         continue;
@@ -3155,14 +3190,23 @@ export async function monitorLoop(watchlist: WatchEntry[]): Promise<void> {
         if (isCoinFlipAsk(pm1Ask) && isCoinFlipAsk(pm2Ask)) {
           let bid1 = getWsPmBestBid(entry.pm1.tokenId);
           let bid2 = getWsPmBestBid(entry.pm2.tokenId);
-          // REST fallback for bids when WS has no data (parallel fetch)
-          if (bid1 === null || bid2 === null) {
-            const [newBid1, newBid2] = await Promise.all([
-              bid1 === null ? fetchPmBidDirect(entry.pm1.tokenId, clobBase).catch(() => null) : Promise.resolve(bid1),
-              bid2 === null ? fetchPmBidDirect(entry.pm2.tokenId, clobBase).catch(() => null) : Promise.resolve(bid2),
-            ]);
-            if (bid1 === null) bid1 = newBid1;
-            if (bid2 === null) bid2 = newBid2;
+          // REST fallback for bids when WS has no data (parallel fetch).
+          // 2s per-call + 3s cumulative cap: N × 2s sequential was the root cause of
+          // 5+ min pm-prices watchdog stalls when many 50/50 markets + PM CLOB lag.
+          if ((bid1 === null || bid2 === null) && _coinFlipSpentMs < COIN_FLIP_BUDGET_MS) {
+            const _cfStart = Date.now();
+            try {
+              const [newBid1, newBid2] = await Promise.race([
+                Promise.all([
+                  bid1 === null ? fetchPmBidDirect(entry.pm1.tokenId, clobBase).catch(() => null) : Promise.resolve(bid1),
+                  bid2 === null ? fetchPmBidDirect(entry.pm2.tokenId, clobBase).catch(() => null) : Promise.resolve(bid2),
+                ]),
+                new Promise<[null, null]>(resolve => setTimeout(() => resolve([null, null]), 2000)),
+              ]);
+              if (bid1 === null) bid1 = newBid1;
+              if (bid2 === null) bid2 = newBid2;
+            } catch { /* fall through with nulls */ }
+            _coinFlipSpentMs += Date.now() - _cfStart;
           }
           if (!coinFlipWarned.has(entry.matchCode)) {
             coinFlipWarned.add(entry.matchCode);
@@ -3504,13 +3548,19 @@ export async function monitorLoop(watchlist: WatchEntry[]): Promise<void> {
         // just waiting for liquidity. Only hard aborts (order failures) trigger cooldown.
         if (!sessionSkip && !unhedged) {
           if (abortReason === "soft") {
-            // Soft abort — light cooldown (60s after 3 consecutive) to prevent spam
+            // Soft abort (depth/edge insufficient) — short cooldown on the FIRST abort.
+            // Depth shortage is usually persistent over several seconds, so repeatedly
+            // re-running the full depth check (incl. REST book fallback when WS is
+            // stale) just wastes rate-limiter budget. 15s gives the book time to move
+            // without spamming; 3+ consecutive aborts escalates to 60s.
             const sc = abortCountMap.get(bestEntry.matchCode) ?? { count: 0, cooldownUntil: 0 };
             sc.count++;
             if (sc.count >= 3) {
               sc.cooldownUntil = Date.now() + 60_000;
               console.log(`[SOFT COOLDOWN] ${bestEntry.kal1.surname} vs ${bestEntry.kal2.surname} — ${sc.count} soft aborts, pausing 60s`);
               sc.count = 0;
+            } else {
+              sc.cooldownUntil = Date.now() + 15_000;
             }
             abortCountMap.set(bestEntry.matchCode, sc);
           } else {

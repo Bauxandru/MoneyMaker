@@ -81,6 +81,10 @@ function licensePost(url: string, body: object): Promise<{ status: number; data:
     const isHttps = parsed.protocol === "https:";
     const mod = isHttps ? https : http;
 
+    // Self-signed certs are only accepted when LICENSE_ALLOW_SELFSIGNED=1 is set
+    // explicitly. Defaulting to strict TLS prevents MITM against the license
+    // server on untrusted networks. Self-hosted deployments opt in via env.
+    const allowSelfSigned = process.env.LICENSE_ALLOW_SELFSIGNED === "1";
     const options: https.RequestOptions = {
       hostname: parsed.hostname,
       port: parsed.port || (isHttps ? 443 : 80),
@@ -88,8 +92,7 @@ function licensePost(url: string, body: object): Promise<{ status: number; data:
       method: "POST",
       headers: { "Content-Type": "application/json" },
       timeout: 10_000,
-      // Accept self-signed certs for license server only
-      ...(isHttps ? { rejectUnauthorized: false } : {}),
+      ...(isHttps && allowSelfSigned ? { rejectUnauthorized: false } : {}),
     };
 
     const req = mod.request(options, (res) => {

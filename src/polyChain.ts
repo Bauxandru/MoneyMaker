@@ -72,14 +72,28 @@ export async function getOnChainBalanceWithFallback(tokenId: string): Promise<nu
     try {
       console.log(`  [CHAIN] Trying fallback RPC: ${fallback}`);
       const provider = new JsonRpcProvider(fallback, chainId, { staticNetwork: true });
+      // Sanity check: fallback must report the configured chainId.
+      // Prevents silently adopting a fork/testnet RPC that happens to answer.
+      const net = await provider.getNetwork();
+      if (Number(net.chainId) !== chainId) {
+        console.warn(`  [CHAIN] Fallback ${fallback} reports chainId=${net.chainId}, expected ${chainId} — rejecting.`);
+        continue;
+      }
       const ctf = getCTFContract(provider);
       const wallet = getWalletAddress();
-      const rawBalance: bigint = await ctf.balanceOf(wallet, BigInt(tokenId));
-      const shares = bigintToShares(rawBalance);
-      // This fallback works -- adopt it as the primary provider
+      // Two independent reads must agree before we trust this RPC enough
+      // to promote it. Guards against a flaky / mis-serving endpoint feeding
+      // stale or attacker-controlled balance data.
+      const raw1: bigint = await ctf.balanceOf(wallet, BigInt(tokenId));
+      const raw2: bigint = await ctf.balanceOf(wallet, BigInt(tokenId));
+      if (raw1 !== raw2) {
+        console.warn(`  [CHAIN] Fallback ${fallback} returned inconsistent balances (${raw1} vs ${raw2}) — rejecting.`);
+        continue;
+      }
+      const shares = bigintToShares(raw1);
       _httpProvider = provider;
       _ctfContract = null; // reset so it picks up new provider
-      console.log(`  [CHAIN] Fallback RPC ${fallback} succeeded. Adopting as primary.`);
+      console.warn(`  [CHAIN] Fallback RPC ${fallback} adopted as primary (chainId=${chainId}, consistent reads).`);
       return Math.round(shares);
     } catch {
       continue;

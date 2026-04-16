@@ -116,7 +116,7 @@ export function saveHedgeStates(states: HedgeState[]): void {
         lastCompleteExchange: s.lastCompleteExchange,
         pmOnlyCycles: s.pmOnlyCycles,
       }));
-      atomicWriteFileSync(HEDGE_STATE_PATH, JSON.stringify(data, null, 2));
+      atomicWriteFileSync(HEDGE_STATE_PATH, JSON.stringify(data));
     }
   } catch (err) {
     console.error(`[HEDGE] Failed to save hedge state: ${(err as Error).message}`);
@@ -226,7 +226,7 @@ export function recoverOrphanedHedgeTrades(): HedgeState[] {
       lastCompleteExchange: hs.lastCompleteExchange,
       pmOnlyCycles: hs.pmOnlyCycles,
     }));
-    atomicWriteFileSync(HEDGE_STATE_PATH, JSON.stringify(data, null, 2));
+    atomicWriteFileSync(HEDGE_STATE_PATH, JSON.stringify(data));
     console.log(`[RECOVERY] Saved ${recovered.length} recovered hedge state(s)`);
   }
 
@@ -243,7 +243,7 @@ export function loadPendingFills(): PendingFill[] {
 }
 
 export function savePendingFills(fills: PendingFill[]): void {
-  atomicWriteFileSync(PENDING_FILLS_PATH, JSON.stringify(fills, null, 2));
+  atomicWriteFileSync(PENDING_FILLS_PATH, JSON.stringify(fills));
 }
 
 export function addPendingFill(fill: PendingFill): void {
@@ -305,7 +305,7 @@ export function loadArbTrades(): ArbTradeRecord[] {
 }
 
 export function saveArbTrades(trades: ArbTradeRecord[]): void {
-  atomicWriteFileSync(ARB_LOG_PATH, JSON.stringify(trades, null, 2));
+  atomicWriteFileSync(ARB_LOG_PATH, JSON.stringify(trades));
   // Invalidate cache on write so next read picks up fresh data
   _arbTradesCache = trades;
   _arbTradesCacheTs = Date.now();
@@ -372,7 +372,7 @@ export function appendMetric(m: ExecMetric): void {
   const metrics = loadMetrics();
   metrics.push(m);
   if (metrics.length > 500) metrics.splice(0, metrics.length - 500);
-  atomicWriteFileSync(METRICS_PATH, JSON.stringify(metrics, null, 2));
+  atomicWriteFileSync(METRICS_PATH, JSON.stringify(metrics));
 }
 
 // --- Depth opportunity persistence -------------------------------------------

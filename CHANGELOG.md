@@ -45,3 +45,12 @@ Categories: `FEATURE`, `FIX`, `REFACTOR`, `CONFIG`, `SAFETY`, `HEDGE`, `RECONCIL
 [2026-04-14] FEATURE: Dashboard push system — remote bots push trades to central dashboard via /api/ingest with shared secret auth. (dashboard.ts, dashboardPush.ts, build/build.mjs)
 [2026-04-14] FIX: Breakeven cap bypass when Kalshi API returns 0 fill cost — now uses WS fill data (primary), then limit price estimate (fallback). Added KAL fill buffer to WS module. (ttExecution.ts, ttWebSocket.ts)
 [2026-04-14] CONFIG: Split dashboard mode — each server runs its own dashboard. Removed push config from home .env.
+[2026-04-16] FIX: Division-by-zero guard in orphan recovery kalCostBasis — ternary on shares>0 prevents NaN in unhedged-position records (ttExecution.ts)
+[2026-04-16] FIX: PM fee undercount on post-cancel partial-fill path — pmFeePaid(matchedShares,…) now matches the shares/pmCost recorded for the trade (ttExecution.ts)
+[2026-04-16] PERF: Dropped pretty-print on hot-path JSON writes (hedge state, arb trades, pending fills, metrics) — ~40-60% I/O reduction on save (ttPersistence.ts)
+[2026-04-16] SAFETY: Broadened isScalarSettlement to also match "void"/"voided"/"cancelled" results; prior check would have fallen through to binary P&L math (ttHedge.ts)
+[2026-04-16] SAFETY: License-server cert generation now uses spawnSync(openssl, [...], shell:false) — eliminates shell-metacharacter path injection (licenseServer.ts)
+[2026-04-16] SAFETY: License client defaults to strict TLS; self-signed certs only accepted when LICENSE_ALLOW_SELFSIGNED=1 (licenseClient.ts)
+[2026-04-16] SAFETY: RPC fallback promotion requires chainId match + two consistent balanceOf reads; adoption now logged at warn level (polyChain.ts)
+[2026-04-16] PERF: Hard cap of 500 samples per key on _priceHistory — defensive against clock-skew pruning failure (ttWebSocket.ts)
+[2026-04-16] DOCS: CLAUDE.md — corrected line counts; tagged known limitations [important]/[cosmetic]; added Windows/scratch-file notes; added test-coverage pointer; documented PARALLEL_MODE exception to Kalshi-first invariant; generalised Co-Authored-By trailer (CLAUDE.md)

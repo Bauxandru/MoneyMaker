@@ -385,7 +385,9 @@ export function collectOpenPositions(watchlist: WatchEntry[]): OpenPosition[] {
 /** Check if a Kalshi market settled as scalar (cancelled/voided). */
 export function isScalarSettlement(mkt: KalshiMarket): boolean {
   const result = pickString(mkt.result ?? "").toLowerCase();
-  if (result === "scalar") return true;
+  // "scalar" = fractional payout; "void"/"voided"/"cancelled" = refund-style settlement.
+  // Any non-binary result must trigger emergency-exit handling instead of the binary P&L path.
+  if (result === "scalar" || result === "void" || result === "voided" || result === "cancelled") return true;
 
   // Also check settlement_value for non-binary values.
   // Kalshi sends settlement_value on a 0–1 dollar scale: 1.0 = YES, 0.0 = NO.
@@ -842,6 +844,49 @@ async function verifyPmFillPrice(
 // Per-position lock to prevent concurrent hedge cycles placing duplicate orders
 const _hedgeCycleLocks = new Set<string>();
 
+// Per-position cooldown after PM GTC "crosses the book" — the book has moved such that
+// our maker breakeven-capped bid is marketable, but a taker FAK would bust breakeven.
+// Back off so we stop spamming the CLOB each cycle until the book drifts back.
+const _pmGtcCrossCooldown = new Map<string, number>();
+const PM_GTC_CROSS_COOLDOWN_MS = 30_000;
+
+/** Before placing a PM hedge order, re-check current on-chain balance of the target token
+ *  and cap the order size so we never exceed the intended coverage. Prevents cross-session
+ *  and cross-server over-hedging (observed: 113 DKC held vs 40 KAL T1 needed).
+ *
+ *  Returns the maximum safe order size. 0 means "already fully covered, skip placement".
+ *  Returns the original `requestedShares` unchanged if the on-chain read fails (best-effort).
+ *
+ *  `targetCoverage` is the number of PM shares of this token we want to END UP holding —
+ *  typically `pos.initialShares` (the full KAL exposure we're trying to hedge).
+ */
+async function capPmOrderByOnChain(
+  tokenId: string,
+  requestedShares: number,
+  targetCoverage: number,
+  label: string
+): Promise<number> {
+  if (requestedShares <= 0 || targetCoverage <= 0) return requestedShares;
+  try {
+    const bal = await getOnChainBalance(tokenId);
+    if (bal < 0 || !Number.isFinite(bal)) return requestedShares;
+    const alreadyCovered = Math.floor(bal);
+    if (alreadyCovered >= targetCoverage) {
+      console.warn(`[HEDGE ${label}] On-chain already holds ${alreadyCovered} shares vs target ${targetCoverage} — skipping order (over-hedge guard).`);
+      return 0;
+    }
+    const stillNeeded = Math.max(0, targetCoverage - alreadyCovered);
+    if (stillNeeded < requestedShares) {
+      console.warn(`[HEDGE ${label}] Capping order ${requestedShares} -> ${stillNeeded} shares (on-chain has ${alreadyCovered}/${targetCoverage}, avoiding over-hedge).`);
+      return stillNeeded;
+    }
+    return requestedShares;
+  } catch (e) {
+    console.warn(`[HEDGE ${label}] On-chain balance check failed: ${(e as Error).message} — proceeding with original ${requestedShares}.`);
+    return requestedShares;
+  }
+}
+
 /** Force-release a hedge cycle lock (used by timeout handler in ttExecution.ts). */
 export function releaseHedgeCycleLock(tradeId: string): void {
   _hedgeCycleLocks.delete(tradeId);
@@ -1126,14 +1171,31 @@ export async function runHedgeCycle(state: HedgeState, clobBase: string): Promis
           const verifyTokenId = pos.heldExchange === "pm"
             ? (pos.pmOppLeg?.tokenId ?? pos.pmLeg.tokenId)
             : pos.pmLeg.tokenId;
+          // After 2 consecutive phantoms on the same CLOB f, rebase pmPreBalance from a
+          // fresh on-chain read. Rationale: the most common real cause is baseline drift
+          // on shared-token positions where pmPreBalance was lazy-initialized AFTER the
+          // fill had already landed, so (bal - preBal) reads 0 forever.
+          if ((ho._phantomLastF ?? -1) === f && (ho._phantomCount ?? 0) >= 2) {
+            try {
+              const freshBal = await getOnChainBalance(verifyTokenId);
+              if (freshBal >= 0) {
+                console.warn(`[HEDGE] Rebasing pmPreBalance after ${ho._phantomCount} phantoms: ${pos.pmPreBalance ?? 0} -> ${freshBal}`);
+                pos.pmPreBalance = freshBal;
+              }
+            } catch { /* next cycle retries */ }
+          }
           const preBal = pos.pmPreBalance ?? 0;
           const verified = await verifyPmFill(verifyTokenId, clobDelta, preBal, "HEDGE-GTC-VERIFY", oid);
           if (verified > 0) {
             filledShares = verified;
             ho.filledSoFar = Math.max(ho.filledSoFar, f);
             pos.pmPreBalance = (preBal + verified); // update baseline for next fill
+            ho._phantomCount = 0;
+            ho._phantomLastF = undefined;
           } else {
-            console.warn(`[HEDGE] PM GTC CLOB says ${clobDelta} filled but on-chain shows 0 — PHANTOM FILL. Not crediting.`);
+            ho._phantomCount = ((ho._phantomLastF ?? -1) === f ? (ho._phantomCount ?? 0) : 0) + 1;
+            ho._phantomLastF = f;
+            console.warn(`[HEDGE] PM GTC CLOB says ${clobDelta} filled but on-chain shows 0 — PHANTOM FILL (${ho._phantomCount}x). Not crediting.`);
             // Don't update filledSoFar — recheck next cycle in case settlement is delayed
           }
         } else if (clobDelta > 0) {
@@ -1694,37 +1756,52 @@ export async function runHedgeCycle(state: HedgeState, clobBase: string): Promis
       // -- PM GTC bid (the only hedge path for PM-held trades) ---------------
       // If PM fails due to insufficient balance, fall back to KAL GTC.
       let pmBalanceFailed = false;
-      if (!placed && pmViable && pos.pmOppLeg) {
+      const pmGtcCooldownKey = `${pos.tradeId}:opp`;
+      const pmGtcCooldownUntil = _pmGtcCrossCooldown.get(pmGtcCooldownKey) ?? 0;
+      if (!placed && pmViable && pos.pmOppLeg && Date.now() >= pmGtcCooldownUntil) {
         const oppTick = pos.pmOppLeg.tickSize || 0.01;
         const oppBidPrice = Math.round(Math.floor(maxOppPrice / oppTick + 1e-9) * oppTick * 1e6) / 1e6;
-        if (oppBidPrice > 0 && sharesNeeded * oppBidPrice >= PM_MARKETABLE_MIN_VALUE) {
+        const cappedOppShares = DRY_RUN
+          ? sharesNeeded
+          : await capPmOrderByOnChain(pos.pmOppLeg.tokenId, sharesNeeded, pos.initialShares, "PM-GTC-OPP");
+        if (cappedOppShares <= 0) {
+          // On-chain shows we're already fully covered on this token — another session
+          // or server hedged for us. Zero out local sharesHeld so the cycle exits cleanly.
+          pos.sharesHeld = 0;
+          saveHedgeState(state);
+          return;
+        }
+        if (oppBidPrice > 0 && cappedOppShares * oppBidPrice >= PM_MARKETABLE_MIN_VALUE) {
           try {
-            const res = await placePmGTCBid(pos.pmOppLeg.tokenId, oppBidPrice, sharesNeeded, oppTick, pos.pmOppLeg.negRisk, DRY_RUN);
+            const res = await placePmGTCBid(pos.pmOppLeg.tokenId, oppBidPrice, cappedOppShares, oppTick, pos.pmOppLeg.negRisk, DRY_RUN);
             const resStr = JSON.stringify(res).toLowerCase();
             if (resStr.includes("not_enough_balance") || resStr.includes("insufficient") || resStr.includes("allowance")) {
-              console.warn(`[HEDGE] PM balance insufficient for ${sharesNeeded}x@${fmtPct(oppBidPrice)}. Falling back to KAL.`);
+              console.warn(`[HEDGE] PM balance insufficient for ${cappedOppShares}x@${fmtPct(oppBidPrice)}. Falling back to KAL.`);
               pmBalanceFailed = true;
+            } else if (resStr.includes("crosses the book")) {
+              _pmGtcCrossCooldown.set(pmGtcCooldownKey, Date.now() + PM_GTC_CROSS_COOLDOWN_MS);
+              console.warn(`[HEDGE] PM GTC bid @${fmtPct(oppBidPrice)} crosses the book — backing off ${PM_GTC_CROSS_COOLDOWN_MS / 1000}s (taker FAK would bust breakeven).`);
             } else if (isPm425(res)) { markPmDown(); }
             else {
               markPmUp();
               const meta = extractPmMeta(res);
               const oid = DRY_RUN ? `dry-pm-opp-${Date.now()}` : String(meta.orderId ?? "");
               if (oid) {
-                activeOrders.set(oid, { role: "complete", exchange: "pm", orderId: oid, price: oppBidPrice, shares: sharesNeeded, filledSoFar: 0, fetchFailures: 0, placedAt: Date.now() });
+                activeOrders.set(oid, { role: "complete", exchange: "pm", orderId: oid, price: oppBidPrice, shares: cappedOppShares, filledSoFar: 0, fetchFailures: 0, placedAt: Date.now() });
                 state.lastCompleteExchange = "pm";
                 saveHedgeState(state);
-                console.log(`\n[HEDGE] Placed PM GTC BID ${sharesNeeded}x${pos.pmOppLeg.outcome}@${fmtPct(oppBidPrice)} (complete-pm). orderId=${oid}`);
-                audit({ module: "hedge", fn: "runHedgeCycle", action: "hedge-gtc-pm-placed", tradeId: pos.tradeId, kalTicker: pos.kalLeg.ticker, shares: sharesNeeded, price: oppBidPrice, context: { orderId: oid, outcome: pos.pmOppLeg.outcome, role: "complete", heldExchange: "pm" } });
+                console.log(`\n[HEDGE] Placed PM GTC BID ${cappedOppShares}x${pos.pmOppLeg.outcome}@${fmtPct(oppBidPrice)} (complete-pm). orderId=${oid}`);
+                audit({ module: "hedge", fn: "runHedgeCycle", action: "hedge-gtc-pm-placed", tradeId: pos.tradeId, kalTicker: pos.kalLeg.ticker, shares: cappedOppShares, price: oppBidPrice, context: { orderId: oid, outcome: pos.pmOppLeg.outcome, role: "complete", heldExchange: "pm" } });
                 appendEvent({
                   type: "order-placed", tradeId: pos.tradeId, exchange: "pm",
                   orderId: oid, role: "hedge-complete", side: pos.pmOppLeg.outcome,
                   ticker: pos.kalLeg.ticker, tokenId: pos.pmOppLeg.tokenId,
-                  requestedShares: sharesNeeded, limitPrice: oppBidPrice, orderType: "GTC",
+                  requestedShares: cappedOppShares, limitPrice: oppBidPrice, orderType: "GTC",
                 } as Omit<OrderPlacedEvent, "seq" | "ts">);
                 if (!DRY_RUN && meta.status === "matched") {
                   // CLOB says matched — verify on-chain before crediting
                   const preBal = pos.pmPreBalance ?? 0;
-                  const verified = await verifyPmFill(pos.pmOppLeg!.tokenId, sharesNeeded, preBal, "HEDGE-GTC-IMM-PM", oid);
+                  const verified = await verifyPmFill(pos.pmOppLeg!.tokenId, cappedOppShares, preBal, "HEDGE-GTC-IMM-PM", oid);
                   if (verified > 0) {
                     pos.sharesHeld = Math.max(0, pos.sharesHeld - verified);
                     pos.hedgeFillCost += verified * oppBidPrice;
@@ -2112,39 +2189,53 @@ export async function runHedgeCycle(state: HedgeState, clobBase: string): Promis
       let placed = false;
       let pmBalanceFailedKH = false;
 
-      if (pmViableKH) {
+      const pmGtcKhCooldownKey = `${pos.tradeId}:leg`;
+      const pmGtcKhCooldownUntil = _pmGtcCrossCooldown.get(pmGtcKhCooldownKey) ?? 0;
+      if (pmViableKH && Date.now() >= pmGtcKhCooldownUntil) {
         // -- Try PM GTC BID for the needed token -----------------------------
         const pmTick = pos.pmLeg.tickSize || 0.01;
         const pmBidPrice = Math.round(Math.floor(maxPmPrice / pmTick + 1e-9) * pmTick * 1e6) / 1e6;
-        if (pmBidPrice > 0 && sharesNeeded * pmBidPrice >= PM_MARKETABLE_MIN_VALUE) {
+        const cappedKhShares = DRY_RUN
+          ? sharesNeeded
+          : await capPmOrderByOnChain(pos.pmLeg.tokenId, sharesNeeded, pos.initialShares, "PM-GTC-KH");
+        if (cappedKhShares <= 0) {
+          // Already fully covered on-chain (another session or server hedged us).
+          pos.sharesHeld = 0;
+          saveHedgeState(state);
+          return;
+        }
+        if (pmBidPrice > 0 && cappedKhShares * pmBidPrice >= PM_MARKETABLE_MIN_VALUE) {
           try {
-            const res = await placePmGTCBid(pos.pmLeg.tokenId, pmBidPrice, sharesNeeded, pmTick, pos.pmLeg.negRisk, DRY_RUN);
+            const res = await placePmGTCBid(pos.pmLeg.tokenId, pmBidPrice, cappedKhShares, pmTick, pos.pmLeg.negRisk, DRY_RUN);
             const resStr = JSON.stringify(res).toLowerCase();
             if (resStr.includes("not_enough_balance") || resStr.includes("insufficient") || resStr.includes("allowance")) {
-              console.warn(`[HEDGE] PM balance insufficient for ${sharesNeeded}x@${fmtPct(pmBidPrice)}. Falling back to KAL.`);
+              console.warn(`[HEDGE] PM balance insufficient for ${cappedKhShares}x@${fmtPct(pmBidPrice)}. Falling back to KAL.`);
               pmBalanceFailedKH = true;
+            } else if (resStr.includes("crosses the book")) {
+              _pmGtcCrossCooldown.set(pmGtcKhCooldownKey, Date.now() + PM_GTC_CROSS_COOLDOWN_MS);
+              console.warn(`[HEDGE] PM GTC bid @${fmtPct(pmBidPrice)} crosses the book — backing off ${PM_GTC_CROSS_COOLDOWN_MS / 1000}s (taker FAK would bust breakeven).`);
             } else if (isPm425(res)) { markPmDown(); }
             else {
               markPmUp();
               const meta = extractPmMeta(res);
               const oid = DRY_RUN ? `dry-pm-complete-${Date.now()}` : String(meta.orderId ?? "");
               if (oid) {
-                activeOrders.set(oid, { role: "complete", exchange: "pm", orderId: oid, price: pmBidPrice, shares: sharesNeeded, filledSoFar: 0, fetchFailures: 0, placedAt: Date.now() });
+                activeOrders.set(oid, { role: "complete", exchange: "pm", orderId: oid, price: pmBidPrice, shares: cappedKhShares, filledSoFar: 0, fetchFailures: 0, placedAt: Date.now() });
                 state.lastCompleteExchange = "pm";
                 saveHedgeState(state);
-                console.log(`\n[HEDGE] Placed PM GTC BID ${sharesNeeded}x${pos.pmLeg.outcome}@${fmtPct(pmBidPrice)} (complete-pm). orderId=${oid}`);
-                audit({ module: "hedge", fn: "runHedgeCycle", action: "hedge-gtc-pm-placed", tradeId: pos.tradeId, kalTicker: pos.kalLeg.ticker, shares: sharesNeeded, price: pmBidPrice, context: { orderId: oid, outcome: pos.pmLeg.outcome, role: "complete", heldExchange: "kal" } });
+                console.log(`\n[HEDGE] Placed PM GTC BID ${cappedKhShares}x${pos.pmLeg.outcome}@${fmtPct(pmBidPrice)} (complete-pm). orderId=${oid}`);
+                audit({ module: "hedge", fn: "runHedgeCycle", action: "hedge-gtc-pm-placed", tradeId: pos.tradeId, kalTicker: pos.kalLeg.ticker, shares: cappedKhShares, price: pmBidPrice, context: { orderId: oid, outcome: pos.pmLeg.outcome, role: "complete", heldExchange: "kal" } });
                 appendEvent({
                   type: "order-placed", tradeId: pos.tradeId, exchange: "pm",
                   orderId: oid, role: "hedge-complete", side: pos.pmLeg.outcome,
                   ticker: pos.kalLeg.ticker, tokenId: pos.pmLeg.tokenId,
-                  requestedShares: sharesNeeded, limitPrice: pmBidPrice, orderType: "GTC",
+                  requestedShares: cappedKhShares, limitPrice: pmBidPrice, orderType: "GTC",
                 } as Omit<OrderPlacedEvent, "seq" | "ts">);
                 placed = true;
                 if (!DRY_RUN && meta.status === "matched") {
                   // CLOB says matched — verify on-chain before crediting
                   const preBal = pos.pmPreBalance ?? 0;
-                  const verified = await verifyPmFill(pos.pmLeg.tokenId, sharesNeeded, preBal, "HEDGE-GTC-IMM-KH", oid);
+                  const verified = await verifyPmFill(pos.pmLeg.tokenId, cappedKhShares, preBal, "HEDGE-GTC-IMM-KH", oid);
                   if (verified > 0) {
                     pos.sharesHeld = Math.max(0, pos.sharesHeld - verified);
                     pos.hedgeFillCost += verified * pmBidPrice;

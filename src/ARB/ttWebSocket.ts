@@ -314,6 +314,9 @@ export function recordPrice(key: string, ask: number): void {
   if (!buf) { buf = []; _priceHistory.set(key, buf); }
   buf.push({ ts: now, ask });
   while (buf.length > 0 && buf[0].ts < now - MOMENTUM_WINDOW_MS) buf.shift();
+  // Hard cap defends against clock-skew scenarios where ts pruning could fail.
+  // MOMENTUM_WINDOW_MS / MOMENTUM_SAMPLE_INTERVAL_MS = ~120; 500 is ~4x safety margin.
+  if (buf.length > 500) buf.splice(0, buf.length - 500);
   // Periodic prune: remove keys with no samples in the last MOMENTUM_WINDOW_MS
   if (now - _lastPrunedTs > PRUNE_INTERVAL_MS) {
     _lastPrunedTs = now;
