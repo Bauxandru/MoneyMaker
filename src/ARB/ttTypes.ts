@@ -222,6 +222,8 @@ export type HedgeOrder = {
   _lastFeeSeen?: number;        // cumulative Kalshi fees from last poll (for delta calc)
   _feeDelta?: number;           // fee increment since last poll
   _lastLogKey?: string;         // dedup key for status logging
+  _phantomCount?: number;       // consecutive phantom-fill verifications on the same CLOB delta
+  _phantomLastF?: number;       // CLOB filled-count that triggered the last phantom verify
 };
 
 export type HedgeState = {
@@ -330,4 +332,7 @@ export type OpenPosition = {
   negRisk: boolean;
   tradeId: string;
   status: "filled" | "hedging" | "resolved";
+  /** Arb direction (A-L). Carried through so scalar-settlement payout logic
+   *  can distinguish YES-side (shares * sv) vs NO-side (shares * (1-sv)). */
+  dir?: string;
 };

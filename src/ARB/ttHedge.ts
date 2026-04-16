@@ -377,6 +377,7 @@ export function collectOpenPositions(watchlist: WatchEntry[]): OpenPosition[] {
       negRisk: pmLeg?.negRisk ?? false,
       tradeId: t.id,
       status: t.status as "filled" | "hedging" | "resolved",
+      dir: t.dir,
     });
   }
   return positions;
@@ -563,8 +564,12 @@ export async function handleCancelledPosition(
       `Kalshi settles at ${fmtPct(svDecimal)} automatically. No PM tokens to sell.`
     );
     // Kalshi payout is automatic. Resolve the trade record.
+    // Scalar payout depends on which side we hold: YES pays shares*sv, NO pays shares*(1-sv).
+    // Previously this only handled YES, understating P&L for NO-side positions in voided markets.
     const kalCost = matchingHs!.position.initialCost + matchingHs!.position.hedgeFillCostKal;
-    const kalPayout = matchingHs!.position.initialShares * svDecimal;
+    const kalSide = matchingHs!.position.kalSide;
+    const effectiveSv = kalSide === "no" ? (1 - svDecimal) : svDecimal;
+    const kalPayout = matchingHs!.position.initialShares * effectiveSv;
     const realizedPnl = Math.round((kalPayout - kalCost) * 100) / 100;
     resolveArbTrade(pos.kalTicker, {
       status: "resolved",
@@ -589,7 +594,10 @@ export async function handleCancelledPosition(
   //    KAL settles automatically at settlement_value. We may still hold PM tokens
   //    that should be sold if above 50c (void settles PM at 50/50).
   if (pos.status === "resolved") {
-    const kalPayout = pos.shares * svDecimal;
+    // Scalar payout depends on kalSide. Derive from dir: NO-side dirs are C/D/G/H/I.
+    const kalSideLocal: "yes" | "no" = ["C", "D", "G", "H", "I"].includes(pos.dir ?? "") ? "no" : "yes";
+    const effectiveSvResolved = kalSideLocal === "no" ? (1 - svDecimal) : svDecimal;
+    const kalPayout = pos.shares * effectiveSvResolved;
     const totalCostPaid = pos.kalCost + pos.pmCost + pos.hedgeCost;
     console.log(
       `[CANC-MON] Resolved trade voided: ${pos.pmOutcome} (${pos.tradeId})\n` +
@@ -772,7 +780,10 @@ export async function handleCancelledPosition(
   }
 
   // Step 7: Resolve trade record
-  const kalPayout = pos.shares * svDecimal;
+  // Scalar payout depends on kalSide. Derive from dir: NO-side = C/D/G/H/I.
+  const kalSideStep7: "yes" | "no" = ["C", "D", "G", "H", "I"].includes(pos.dir ?? "") ? "no" : "yes";
+  const effectiveSvStep7 = kalSideStep7 === "no" ? (1 - svDecimal) : svDecimal;
+  const kalPayout = pos.shares * effectiveSvStep7;
   const pmRevenue = actualShares * sellPrice; // estimated (actual depends on fill)
   const totalRevenue = kalPayout + pmRevenue;
   const totalCostEst = pos.pmCost + pos.kalCost; // PM cost + actual Kalshi cost from trade record
