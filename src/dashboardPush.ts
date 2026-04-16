@@ -2,6 +2,7 @@ import { type ArbTradeRecord, type ExecMetric } from "./types.js";
 
 const PUSH_URL = () => process.env.DASHBOARD_PUSH_URL || "";
 const TOKEN = () => process.env.LICENSE_TOKEN || "";
+const SERVER = () => process.env.SERVER_ID || "";
 
 let _pushInterval: ReturnType<typeof setInterval> | null = null;
 let _latestTrades: ArbTradeRecord[] = [];
@@ -38,6 +39,7 @@ async function _doPush(
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         token,
+        serverId: SERVER(),
         trades,
         metrics,
         timestamp: new Date().toISOString(),

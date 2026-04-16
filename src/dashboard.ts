@@ -1116,7 +1116,7 @@ app.use((req, _res, next) => {
 // -- Multi-user ingest endpoint (bots push here) ----------------------------
 
 app.post("/api/ingest", async (req, res) => {
-  const { token, trades, metrics, timestamp } = req.body || {};
+  const { token, serverId, trades, metrics, timestamp } = req.body || {};
   const ip = extractIp(req);
 
   if (!token) {
@@ -1131,15 +1131,22 @@ app.post("/api/ingest", async (req, res) => {
     return;
   }
 
-  remoteUsers.set(token, {
-    name: auth.name,
+  // Key the remoteUsers map by serverId when the remote bot provides one.
+  // This lets multiple bots share the same ingest secret without overwriting
+  // each other's entries. Falls back to token when no serverId is supplied
+  // (legacy single-bot mode), and to the token itself as a last resort.
+  const keyedBy = (typeof serverId === "string" && serverId) ? serverId : token;
+  const displayName = (typeof serverId === "string" && serverId) ? serverId : auth.name;
+
+  remoteUsers.set(keyedBy, {
+    name: displayName,
     ip,
     trades: trades || [],
     metrics: metrics || [],
     lastSeen: timestamp || new Date().toISOString(),
   });
 
-  console.log(`[DASHBOARD] Ingested data from "${auth.name}" (${ip}): ${(trades || []).length} trades`);
+  console.log(`[DASHBOARD] Ingested data from "${displayName}" (${ip}): ${(trades || []).length} trades`);
   res.json({ ok: true });
 });
 

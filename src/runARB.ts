@@ -111,8 +111,14 @@ async function main() {
   if (process.env.LICENSE_SERVER && process.env.LICENSE_TOKEN) {
     await validateLicense();
     startPeriodicRevalidation();
+    console.log("[TRADER] License validated");
+  }
+  // Start periodic dashboard push whenever a push URL + token are configured,
+  // regardless of whether a license server is in use. This covers the common
+  // shared-secret mode (home dashboard + DASHBOARD_INGEST_SECRET).
+  if (process.env.DASHBOARD_PUSH_URL && process.env.LICENSE_TOKEN) {
     startPeriodicPush();
-    console.log("[TRADER] License validated, dashboard push active");
+    console.log(`[TRADER] Dashboard push active -> ${process.env.DASHBOARD_PUSH_URL}${process.env.SERVER_ID ? ` [as ${process.env.SERVER_ID}]` : ""}`);
   }
 
   if (DRY_RUN) {

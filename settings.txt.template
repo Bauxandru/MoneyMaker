@@ -45,9 +45,17 @@ DRIFT_WARN_USD=5
 # POLY_CLOB_URL=https://clob.polymarket.com
 # KALSHI_BASE_URL=https://api.elections.kalshi.com/trade-api/v2
 
-# ── Dashboard push (for multi-server setups) ──────────────────────────────
-# DASHBOARD_PUSH_URL=http://100.x.x.x:3456
-# DASHBOARD_INGEST_SECRET=your-shared-secret
-
-# ── Server identification (for multi-bot dashboards) ──────────────────────
-# SERVER_ID=home
+# ── Dashboard push (central home dashboard receives trades) ──────────────
+# On this VPS / remote bot:
+#   1. Set DASHBOARD_PUSH_URL to your home dashboard's reachable address
+#      (LAN IP, Tailscale IP 100.x.x.x, or public IP + port forward).
+#   2. Set LICENSE_TOKEN to the SAME value as DASHBOARD_INGEST_SECRET on
+#      the home dashboard. This is how the dashboard authenticates you.
+#   3. Set SERVER_ID to a unique name per VPS (e.g. "vps-frankfurt",
+#      "vps-toronto"). The home dashboard keys each server by this name,
+#      so multiple VPSes can share the same token safely.
+#
+# DASHBOARD_PUSH_URL=http://100.64.1.10:3456
+# LICENSE_TOKEN=your-shared-secret
+# SERVER_ID=vps-frankfurt
+# DASHBOARD_PUSH_INTERVAL_MS=300000   # periodic sync every 5 min (default)
