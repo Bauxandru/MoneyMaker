@@ -2940,8 +2940,13 @@ export async function monitorLoop(watchlist: WatchEntry[]): Promise<void> {
               const kalCostR = isPmInitial
                 ? Math.round((p.hedgeFillCostKal + hedgeKalFees) * 100) / 100
                 : Math.round((p.initialCost + p.hedgeFillCostKal + hedgeKalFees) * 100) / 100;
+              // PM-initial + PM-opposite hedge path: hedgeFillCostPm holds the opposite-token
+              // purchase cost. Previously this was omitted from pmCostR, inflating the
+              // reported P&L by exactly the hedge cost. Include it here so totalCost matches
+              // what was actually spent. hedgeFillCostPm is 0 on the more common KAL-hedge
+              // path, so this is safe for both branches.
               const pmCostR = isPmInitial
-                ? Math.round(p.initialCost * 100) / 100
+                ? Math.round((p.initialCost + p.hedgeFillCostPm) * 100) / 100
                 : Math.round(p.hedgeFillCostPm * 100) / 100;
               const totalCostHedge = Math.round((kalCostR + pmCostR) * 100) / 100;
               const payout = p.initialShares;

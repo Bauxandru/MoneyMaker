@@ -5023,16 +5023,28 @@ async function reconcilePositions(trigger: string = "startup"): Promise<void> {
 
   // Defensive invariant: totalCost MUST equal kalCost + pmCost (+ hedgeCost when one leg is 0) for resolved trades.
   // kalCost already includes kalFees (baked in at resolve time). hedgeCost is only additive for hedge-only legs.
+  // GUARDS (mirror ttReconcile.ts):
+  //  - Skip trades with initialExchange set (new-style). verifyAndFixPnl() already computed
+  //    their totalCost with smarter hedge-cost logic that avoids double-counting merged costs.
+  //  - Skip past-day resolved trades -- records are finalized.
+  //  - P&L fix only runs for hedge-complete (payout = shares guaranteed). Settlement-method
+  //    trades have conditional payouts (win/lose) and are handled correctly by the
+  //    settlement-aware pass above. Without this guard the invariant pass would clobber
+  //    negative P&L values into positive "shares - cost" numbers, causing oscillation
+  //    against the settlement pass on subsequent reconcile runs.
+  const todayUtcDate = new Date().toISOString().slice(0, 10);
   for (const trade of trades) {
     if (trade.status !== "resolved") continue;
+    const tradeDate = (trade.resolvedTs ?? trade.ts ?? "").slice(0, 10);
+    if (tradeDate && tradeDate < todayUtcDate) continue;
+    if (trade.initialExchange) continue;
     const expected = totalCostForTrade(trade);
     if (Math.abs(trade.totalCost - expected) > 0.01) {
       console.log(`[RECONCILE]   Invariant fix: ${trade.match} totalCost $${trade.totalCost.toFixed(2)}->$${expected.toFixed(2)} (kalCost+hedgeCost+pmCost)`);
       trade.totalCost = expected;
       changed = true;
     }
-    // Also fix P&L if it doesn't match shares - totalCost
-    if (trade.realizedPnl != null) {
+    if (trade.realizedPnl != null && trade.resolutionMethod === "hedge-complete") {
       const correctPnl = Math.round((trade.shares - expected) * 100) / 100;
       if (Math.abs(trade.realizedPnl - correctPnl) > 0.01) {
         console.log(`[RECONCILE]   P&L fix: ${trade.match} realizedPnl $${trade.realizedPnl.toFixed(2)}->$${correctPnl.toFixed(2)}`);
