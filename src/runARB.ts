@@ -283,6 +283,16 @@ async function main() {
       .catch(err => console.warn(`[AUTO-BACKFILL] skipped: ${(err as Error).message}`));
   }
 
+  // Wallet-first startup: pair orphan backfills via Discovery, rebuild hedge_state
+  // for hedging trades that lack one, enrich positions with watchlist metadata,
+  // and purge stale entries. Opt-in via WALLET_FIRST_STARTUP=true.
+  if (process.env.WALLET_FIRST_STARTUP === "true") {
+    console.log("[STARTUP] WALLET_FIRST_STARTUP=true — running wallet-first reconstruction");
+    import("./ARB/ttWalletFirst.js")
+      .then(m => m.runWalletFirstStartup({ forceDiscovery: process.env.FORCE_DISCOVER === "true" }))
+      .catch(err => console.error(`[WALLET-FIRST] failed: ${(err as Error).message}`));
+  }
+
   reconcilePositions("startup").catch(err =>
     console.error(`[RECONCILE] Startup reconciliation failed: ${(err as Error).message}`)
   );

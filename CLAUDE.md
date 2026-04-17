@@ -48,6 +48,7 @@
 | `ttEventLog.ts` | Audit trail for trading events |
 | `ttAuditLog.ts` | Structured audit logging for debugging |
 | `ttNameMatch.ts` | Cross-platform entity name matching |
+| `ttWalletFirst.ts` | Opt-in startup: pair orphan backfills, rebuild hedge_state, purge stale entries |
 
 ### Module Dependency Graph
 
@@ -342,6 +343,7 @@ Test files under `src/ARB/*.test.ts` (run with `npm run test`):
 | `FORCE_DISCOVER` | `false` | Force fresh discovery ignoring cache |
 | `PM_ONLY_MAX_CYCLES` | `15` | Max cycles for PM-only mode |
 | `STRICT_HEDGE` | `false` | Strict hedge matching |
+| `WALLET_FIRST_STARTUP` | `false` | At startup, pair orphan `arb-backfill-*` trades via Discovery, rebuild missing `hedge_state` entries, enrich with watchlist metadata, purge stale entries. Reduces need to manually sync `hedge_state.json` after drift. Use `FORCE_DISCOVER=true` alongside for a fresh discovery run. |
 
 ### Fee Rates
 - **Kalshi taker:** 7% (`KALSHI_FEE_RATE = 0.07`)
