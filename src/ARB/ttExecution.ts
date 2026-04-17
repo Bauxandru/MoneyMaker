@@ -1661,12 +1661,17 @@ export async function executeArb(
         }
       }
 
+      // Final PM balance check + ghost-fill detection.
+      // These two checks previously made TWO sequential getOnChainBalance calls
+      // on the same tokenId within ~300ms. Collapsed into one fetch; the cached
+      // value is then used both for (a) "did new shares land post-FOK?" and
+      // (b) "do we have enough unclaimed shares from an earlier ghost fill?".
+      let cachedPmBal: number | null = null;
       if (!pmFilled) {
-        // FOK not filled — check on-chain one last time
         try {
-          const bal = await getOnChainBalance(pmLeg.tokenId);
-          if (bal >= pmPreBalance + pmShares) {
-            console.log(`  [PM LEG] Final on-chain check: ${bal - pmPreBalance} new shares found. Proceeding.`);
+          cachedPmBal = await getOnChainBalance(pmLeg.tokenId);
+          if (cachedPmBal >= pmPreBalance + pmShares) {
+            console.log(`  [PM LEG] Final on-chain check: ${cachedPmBal - pmPreBalance} new shares found. Proceeding.`);
             pmFilled = true;
             pmFinalOrderId = fokMeta.orderId ? String(fokMeta.orderId) : "";
           }
@@ -1677,7 +1682,7 @@ export async function executeArb(
         // Before entering hedge mode, check if PM wallet already holds enough shares
         // from a prior ghost fill (e.g., a previous attempt that appeared to fail but actually filled on-chain).
         try {
-          const totalPmBal = await getOnChainBalance(pmLeg.tokenId);
+          const totalPmBal = cachedPmBal ?? await getOnChainBalance(pmLeg.tokenId);
           if (totalPmBal >= pmShares) {
             // Count PM shares already claimed by other active/resolved trades for this token
             const existingTrades = loadArbTrades();

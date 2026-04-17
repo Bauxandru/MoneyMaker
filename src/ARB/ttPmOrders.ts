@@ -327,41 +327,71 @@ export async function waitForPmOrderFill(
   _tokenId?: string,
   _preBalance = 0
 ): Promise<"matched" | "cancelled" | "timeout"> {
-  // Resolve as soon as PM CLOB delivers MATCHED via WS. Per the audit of 42
-  // probe cycles + 11 days of bot history, MATCHED→MINED conversion is 100%
-  // (zero FAILED events ever). Waiting for MINED added ~2-4s of unnecessary
-  // delay per execution. To revert to the slower on-chain wait, set
-  // PM_REQUIRE_MINED=true in the env.
+  // Race the PM User WS against CLOB polling. Whichever returns a terminal
+  // status first wins. This replaces the previous "WS first, fall to one REST
+  // check on timeout" pattern, which stalled up to 30 min when the WS
+  // disconnected silently (no callers passed a timeoutMs, so the 30-min
+  // safety cap kicked in).
   //
-  // No timeout by default — the PM executor queue can legitimately take
-  // minutes during busy windows. A 30-minute safety cap exists in
-  // waitForPmFillWs to prevent zombie waiters if the WS dies silently.
-  if (isPmUserWsReady()) {
-    const evt = await waitForPmFillWs(orderId, timeoutMs); // requireMined defaults to PM_REQUIRE_MINED env
-    if (evt) {
-      const status = evt.status?.toUpperCase();
-      if (status === "MATCHED" || status === "CONFIRMED" || status === "MINED") {
-        console.log(`  [PM FILL] WS ${status}: ${evt.size} shares @ ${evt.price}`);
-        return "matched";
-      }
-      if (status === "FAILED") return "cancelled";
+  // CLOB /order/{id} typically responds in 100-300 ms and becomes "matched"
+  // the moment the match engine commits. WS delivers MATCHED events with
+  // similar latency but can die silently between reconnects. Racing both
+  // means we pick up MATCHED as soon as EITHER channel sees it — and we
+  // give up after `timeoutMs` instead of waiting forever.
+  //
+  // Per the audit of 42 probe cycles + 11 days of bot history, MATCHED→MINED
+  // conversion is 100% (zero FAILED events). Treating MATCHED as done is safe.
+  const effectiveTimeoutMs = timeoutMs ?? 30_000; // was: undefined → 30-min safety cap
+
+  type Result = "matched" | "cancelled";
+
+  // WS branch: resolve on first terminal event. Rejects on null/timeout so
+  // Promise.any falls through to CLOB polling.
+  const wsBranch = (async (): Promise<Result> => {
+    if (!isPmUserWsReady()) throw new Error("ws-not-ready");
+    const evt = await waitForPmFillWs(orderId, effectiveTimeoutMs);
+    if (!evt) throw new Error("ws-no-event");
+    const status = evt.status?.toUpperCase();
+    if (status === "MATCHED" || status === "CONFIRMED" || status === "MINED") {
+      console.log(`  [PM FILL] WS ${status}: ${evt.size} shares @ ${evt.price}`);
+      return "matched";
     }
-    // WS safety cap fired OR returned null -- fall through to one REST check
-  }
+    if (status === "FAILED") return "cancelled";
+    throw new Error("ws-unknown-status");
+  })();
 
-  // Fallback: single REST check (not a polling loop)
-  try {
+  // CLOB polling branch: 500 ms interval until terminal or deadline.
+  // Uses the rate-limited polyClobFetch queue indirectly via client.getOrder.
+  const clobBranch = (async (): Promise<Result> => {
+    const deadline = Date.now() + effectiveTimeoutMs;
     const { client } = await createPmClient();
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const raw = await (client as any).getOrder(orderId);
-    const resp = raw as PmOrderResponse;
-    const order = resp?.order ?? resp;
-    const status = String(order?.status ?? order?.order_status ?? "");
-    if (status === "matched") return "matched";
-    if (status === "cancelled" || status === "unmatched" || status === "rejected") return "cancelled";
-  } catch { /* best effort */ }
+    while (Date.now() < deadline) {
+      try {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const raw = await (client as any).getOrder(orderId);
+        const resp = raw as PmOrderResponse;
+        const order = resp?.order ?? resp;
+        const status = String(order?.status ?? order?.order_status ?? "");
+        if (status === "matched") {
+          console.log(`  [PM FILL] CLOB poll: matched`);
+          return "matched";
+        }
+        if (status === "cancelled" || status === "unmatched" || status === "rejected") {
+          return "cancelled";
+        }
+      } catch { /* transient CLOB error — retry next tick */ }
+      await new Promise((r) => setTimeout(r, 500));
+    }
+    throw new Error("clob-poll-timeout");
+  })();
 
-  return "timeout";
+  // Promise.any resolves with the first branch that returns a terminal status.
+  try {
+    return await Promise.any([wsBranch, clobBranch]);
+  } catch {
+    // Both branches exhausted their timeouts without seeing a terminal status.
+    return "timeout";
+  }
 }
 
 // --- Kalshi IOC order builder -------------------------------------------------
