@@ -139,7 +139,7 @@ Kalshi is executed first because:
 
 **These rules exist to prevent real money losses. Do not remove, weaken, or bypass them.**
 
-1. **Kalshi-first is the SAFE DEFAULT; PARALLEL_MODE is the SPEED PATH.** Without `PARALLEL_MODE`, the PM order is only placed after Kalshi fill confirmation — the core safety guarantee that prevents naked PM exposure on KAL failure. **Preferred for speed:** set `PARALLEL_MODE=true` in settings.txt. This fires the KAL IOC and PM FOK at the same time via `Promise.all`, saving ~400-600ms on the happy path (empirically the biggest single latency win we have). The trade-off: if KAL fails while PM fills, the bot holds a naked PM leg and enters hedge mode to close it. The hedge cycle is robust (see Hedge State Machine below) and the bot's trade journal correctly tracks PM-initial positions, so parallel execution is our recommended production mode when KAL API latency is stable. Code: [ttExecution.ts:1374](src/ARB/ttExecution.ts#L1374) is the parallel branch; [ttExecution.ts:1590](src/ARB/ttExecution.ts#L1590) detects the PM-already-filled case on KAL failure. **We want orders sent simultaneously.**
+1. **PARALLEL_MODE is the DEFAULT (orders fire simultaneously).** As of 2026-04-17 `PARALLEL_MODE` defaults to `true` — both legs fire at the same time via `Promise.all` at [ttExecution.ts:1390](src/ARB/ttExecution.ts#L1390). Saves ~400-600ms vs the old KAL-first-sequential path (empirically the biggest single latency win). **Trade-off:** if KAL fails while PM fills, the bot holds a naked PM leg and enters hedge mode to close it — [ttExecution.ts:1454](src/ARB/ttExecution.ts#L1454) detects this and returns `makeUnhedged("pm", shares)`. The hedge cycle is robust (see Hedge State Machine below) so parallel is safe in practice. **Safe fallback:** set `PARALLEL_MODE=false` in settings.txt to revert to KAL-first-sequential (the legacy mode that waits for KAL fill before placing PM FAK). Use the fallback only when KAL API latency is known unstable. **We want orders sent simultaneously** — this is the production-speed mode.
 
 2. **Reject edges > 45%.** Edges above 0.45 are almost certainly data errors (stale orderbook, mismatched markets). The bot aborts and session-skips. Esports/tennis can legitimately show 20-35% edges due to thin liquidity, but >45% is always suspicious.
 
@@ -345,7 +345,7 @@ Test files under `src/ARB/*.test.ts` (run with `npm run test`):
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `DRY_RUN` | `true` | **Must be explicitly set to `false` for live trading** |
-| `PARALLEL_MODE` | `false` | **Set to `true` for speed.** Fires KAL IOC + PM FOK simultaneously (saves ~400-600ms vs sequential). See Safety Invariant #1 — if KAL fails, bot enters hedge mode to close the naked PM leg. Recommended in prod when KAL is stable. |
+| `PARALLEL_MODE` | `true` | Fires KAL IOC + PM FAK simultaneously (saves ~400-600ms vs sequential). See Safety Invariant #1 — if KAL fails, bot enters hedge mode to close the naked PM leg. Default ON as of 2026-04-17; set to `false` to revert to the legacy KAL-first-sequential mode (only needed if KAL API is unstable). |
 | `TRADE_USD` | `10` | Budget per arb in USD |
 | `MAX_CONTRACTS` | `999` | Max contracts per leg |
 | `MIN_EDGE` | `0.02` (2%) | Minimum edge to trigger arb |

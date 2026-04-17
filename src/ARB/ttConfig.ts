@@ -44,9 +44,11 @@ export function atomicWriteFileSync(filePath: string, data: string): void {
 // DRY_RUN defaults to TRUE for safety -- must set DRY_RUN=false explicitly
 export const DRY_RUN = boolEnv("DRY_RUN", true);
 export const SERVER_ID = strEnv("SERVER_ID", "");
-// PARALLEL_MODE: fire KAL IOC + PM FAK simultaneously (saves ~400ms but riskier)
-// Default OFF. Set PARALLEL_MODE=true to enable.
-export const PARALLEL_MODE = boolEnv("PARALLEL_MODE", false);
+// PARALLEL_MODE: fire KAL IOC + PM FAK simultaneously — saves ~400-600ms on
+// both-filled arbs. Default ON as of 2026-04-17. To revert to KAL-first
+// sequential execution (safe fallback when KAL is unstable), set
+// PARALLEL_MODE=false in settings.txt. See CLAUDE.md Safety Invariant #1.
+export const PARALLEL_MODE = boolEnv("PARALLEL_MODE", true);
 export const TRADE_USD = numEnv("TRADE_USD", 10);
 export const MAX_CONTRACTS = Math.max(1, Math.floor(numEnv("MAX_CONTRACTS", 999)));
 export const MIN_EDGE = numEnv("MIN_EDGE", 0.02);
