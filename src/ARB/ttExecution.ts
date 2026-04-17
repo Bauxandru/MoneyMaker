@@ -909,13 +909,14 @@ export async function executeArb(
         const oppAskNow = await fetchPmAsk(pmOppLeg!.tokenId, process.env.POLY_CLOB_URL ?? "https://clob.polymarket.com").catch(() => null);
         if (oppAskNow !== null) {
           const hedgeCostPm = hedged * oppAskNow;
-          const totalCostFull = pmFilled * pmAsk + hedgeCostPm;
+          const pmFeesImm = pmFeePaid(pmFilled, pmAsk, pmLeg);
+          const totalCostFull = pmFilled * pmAsk + pmFeesImm + hedgeCostPm;
           logArbTrade({
             id: `arb-${Date.now()}`, ts: new Date().toISOString(),
             match: `${entry.kal1.surname} vs ${entry.kal2.surname}`,
             dir, shares: pmFilled, kalTicker: kalLeg.ticker, kalFillPrice: 0, kalCost: 0,
             pmOutcome: pmLeg.outcome, pmSlug: entry.pmSlug, pmTokenId: pmLeg.tokenId,
-            pmFillPrice: pmAsk, pmCost: pmFilled * pmAsk, pmFees: pmFeePaid(pmFilled, pmAsk, pmLeg), totalCost: totalCostFull,
+            pmFillPrice: pmAsk, pmCost: pmFilled * pmAsk, pmFees: pmFeesImm, totalCost: totalCostFull,
             projectedEdge: edge, projectedProfit: pmFilled * edge,
             status: "resolved", resolutionMethod: "hedge-complete",
             hedgeCost: hedgeCostPm, realizedPnl: Math.round((pmFilled - totalCostFull) * 100) / 100,
@@ -1033,7 +1034,8 @@ export async function executeArb(
           const oppAskNow = pmOppLeg ? await fetchPmAsk(pmOppLeg.tokenId, clobBase).catch(() => null) : null;
           const hedgeCostPm = Math.round(unhedgedCount * (oppAskNow ?? (1 - pmAsk)) * 100) / 100;
           const pmCostFull = Math.round(pmFilled * pmAsk * 100) / 100;
-          const totalCostResolved = Math.round((kalCostPartial + kalFeesTotal + pmCostFull + hedgeCostPm) * 100) / 100;
+          const pmFeesResolved = pmFeePaid(pmFilled, pmAsk, pmLeg);
+          const totalCostResolved = Math.round((kalCostPartial + kalFeesTotal + pmCostFull + pmFeesResolved + hedgeCostPm) * 100) / 100;
           logArbTrade({
             id: `arb-${Date.now()}`, ts: new Date().toISOString(),
             match: `${entry.kal1.surname} vs ${entry.kal2.surname}`,
@@ -1060,6 +1062,7 @@ export async function executeArb(
           // Log a "filled" trade for the kalFilled matched shares (PM+KAL) so costs aren't lost.
           if (kalFilled > 0) {
             const pmCostMatched = Math.round(kalFilled * pmAsk * 100) / 100;
+            const pmFeesMatched = pmFeePaid(kalFilled, pmAsk, pmLeg);
             logArbTrade({
               id: `arb-${Date.now()}-partial`, ts: new Date().toISOString(),
               match: `${entry.kal1.surname} vs ${entry.kal2.surname}`,
@@ -1067,11 +1070,11 @@ export async function executeArb(
               kalTicker: kalLeg.ticker, kalFillPrice: actualKalPricePartial,
               kalCost: kalCostPartial, kalFees: kalFeesTotal,
               pmOutcome: pmLeg.outcome, pmSlug: entry.pmSlug, pmTokenId: pmLeg.tokenId,
-              pmFillPrice: pmAsk, pmCost: pmCostMatched, pmFees: pmFeePaid(kalFilled, pmAsk, pmLeg),
-              totalCost: Math.round((kalCostPartial + kalFeesTotal + pmCostMatched) * 100) / 100,
+              pmFillPrice: pmAsk, pmCost: pmCostMatched, pmFees: pmFeesMatched,
+              totalCost: Math.round((kalCostPartial + kalFeesTotal + pmCostMatched + pmFeesMatched) * 100) / 100,
               projectedEdge: edge, projectedProfit: kalFilled * edge,
               status: "filled",
-              realizedPnl: Math.round((kalFilled - kalCostPartial - kalFeesTotal - pmCostMatched) * 100) / 100,
+              realizedPnl: Math.round((kalFilled - kalCostPartial - kalFeesTotal - pmCostMatched - pmFeesMatched) * 100) / 100,
               initialExchange: "pm",
             });
             console.log(`  [PARTIAL FILL] Logged ${kalFilled} matched shares (KAL+PM). ${remaining} still unhedged.`);
@@ -1110,6 +1113,7 @@ export async function executeArb(
           const kalCostActual = Math.round(pcFillCost * 100) / 100;
           // PM cost must match the MATCHED shares, not total PM fills
           const pmCostMatched = Math.round(matchedShares * pmAsk * 100) / 100;
+          const pmFeesMatched = pmFeePaid(matchedShares, pmAsk, pmLeg);
           logArbTrade({
             id: `arb-${Date.now()}`, ts: new Date().toISOString(),
             match: `${entry.kal1.surname} vs ${entry.kal2.surname}`,
@@ -1117,14 +1121,14 @@ export async function executeArb(
             kalTicker: kalLeg.ticker, kalFillPrice: pcAvgPrice,
             kalCost: kalCostActual, kalFees: pcFees,
             pmOutcome: pmLeg.outcome, pmSlug: entry.pmSlug, pmTokenId: pmLeg.tokenId,
-            pmFillPrice: pmAsk, pmCost: pmCostMatched, pmFees: pmFeePaid(matchedShares, pmAsk, pmLeg),
-            totalCost: Math.round((kalCostActual + pcFees + pmCostMatched) * 100) / 100,
+            pmFillPrice: pmAsk, pmCost: pmCostMatched, pmFees: pmFeesMatched,
+            totalCost: Math.round((kalCostActual + pcFees + pmCostMatched + pmFeesMatched) * 100) / 100,
             projectedEdge: edge, projectedProfit: matchedShares * edge,
             status: unhedgedPm > 0 ? "filled" : "resolved",
             resolutionMethod: unhedgedPm > 0 ? undefined : "both-legs",
             resolvedTs: unhedgedPm > 0 ? undefined : new Date().toISOString(),
             initialExchange: "pm",
-            realizedPnl: Math.round((matchedShares - kalCostActual - pcFees - pmCostMatched) * 100) / 100,
+            realizedPnl: Math.round((matchedShares - kalCostActual - pcFees - pmCostMatched - pmFeesMatched) * 100) / 100,
           });
           printTimings();
           metric.firstLegFilled = pmFilled;
@@ -1175,6 +1179,7 @@ export async function executeArb(
               ? Math.round((lateKalFillCost / kalLateFilledCount) * 100) / 100 : kalAsk;
             const kalCostLate = Math.round(lateKalFillCost * 100) / 100;
             const pmCostLate = Math.round(pmFilled * pmAsk * 100) / 100;
+            const pmFeesLate = pmFeePaid(pmFilled, pmAsk, pmLeg);
             logArbTrade({
               id: `arb-${Date.now()}`, ts: new Date().toISOString(),
               match: `${entry.kal1.surname} vs ${entry.kal2.surname}`,
@@ -1182,13 +1187,13 @@ export async function executeArb(
               kalTicker: kalLeg.ticker, kalFillPrice: lateKalAvg,
               kalCost: kalCostLate, kalFees: lateKalFees,
               pmOutcome: pmLeg.outcome, pmSlug: entry.pmSlug, pmTokenId: pmLeg.tokenId,
-              pmFillPrice: pmAsk, pmCost: pmCostLate, pmFees: pmFeePaid(pmFilled, pmAsk, pmLeg),
-              totalCost: Math.round((kalCostLate + lateKalFees + pmCostLate) * 100) / 100,
+              pmFillPrice: pmAsk, pmCost: pmCostLate, pmFees: pmFeesLate,
+              totalCost: Math.round((kalCostLate + lateKalFees + pmCostLate + pmFeesLate) * 100) / 100,
               projectedEdge: edge, projectedProfit: pmFilled * edge,
               status: "filled", initialExchange: "pm",
-              realizedPnl: Math.round((Math.min(kalLateFilledCount, pmFilled) - kalCostLate - lateKalFees - pmCostLate) * 100) / 100,
+              realizedPnl: Math.round((Math.min(kalLateFilledCount, pmFilled) - kalCostLate - lateKalFees - pmCostLate - pmFeesLate) * 100) / 100,
             });
-            console.log(`  [RACE RECOVERY] Trade logged as KAL-filled (not hedged). P&L=$${(Math.min(kalLateFilledCount, pmFilled) - kalCostLate - lateKalFees - pmCostLate).toFixed(2)}`);
+            console.log(`  [RACE RECOVERY] Trade logged as KAL-filled (not hedged). P&L=$${(Math.min(kalLateFilledCount, pmFilled) - kalCostLate - lateKalFees - pmCostLate - pmFeesLate).toFixed(2)}`);
             printTimings();
             metric.firstLegFilled = pmFilled;
             metric.secondLegFilled = kalLateFilledCount;
@@ -1202,13 +1207,14 @@ export async function executeArb(
         const oppAskNow = await fetchPmAsk(pmOppLeg!.tokenId, process.env.POLY_CLOB_URL ?? "https://clob.polymarket.com").catch(() => null);
         if (oppAskNow !== null) {
           const hedgeCostPm = hedged * oppAskNow;
-          const totalCostFull = pmFilled * pmAsk + hedgeCostPm;
+          const pmFeesImm2 = pmFeePaid(pmFilled, pmAsk, pmLeg);
+          const totalCostFull = pmFilled * pmAsk + pmFeesImm2 + hedgeCostPm;
           logArbTrade({
             id: `arb-${Date.now()}`, ts: new Date().toISOString(),
             match: `${entry.kal1.surname} vs ${entry.kal2.surname}`,
             dir, shares: pmFilled, kalTicker: kalLeg.ticker, kalFillPrice: 0, kalCost: 0,
             pmOutcome: pmLeg.outcome, pmSlug: entry.pmSlug, pmTokenId: pmLeg.tokenId,
-            pmFillPrice: pmAsk, pmCost: pmFilled * pmAsk, pmFees: pmFeePaid(pmFilled, pmAsk, pmLeg), totalCost: totalCostFull,
+            pmFillPrice: pmAsk, pmCost: pmFilled * pmAsk, pmFees: pmFeesImm2, totalCost: totalCostFull,
             projectedEdge: edge, projectedProfit: pmFilled * edge,
             status: "resolved", resolutionMethod: "hedge-complete",
             hedgeCost: hedgeCostPm, realizedPnl: Math.round((pmFilled - totalCostFull) * 100) / 100,
@@ -1774,7 +1780,7 @@ export async function executeArb(
         pmFillPrice: pmAsk,
         pmCost: partialPmCost,
         pmFees: pmFeePaid(pmFilled ? pmShares : kalFilled, pmAsk, pmLeg),
-        totalCost: Math.round((partialKalCost + partialPmCost) * 100) / 100,
+        totalCost: Math.round((partialKalCost + (kalFeesTotal ?? 0) + partialPmCost + pmFeePaid(pmFilled ? pmShares : kalFilled, pmAsk, pmLeg)) * 100) / 100,
         projectedEdge: edge,
         projectedProfit,
         initialExchange: "pm",
@@ -2265,10 +2271,15 @@ export async function executeArb3Leg(
   // ── All 3 legs filled! ──────────────────────────────────────────────────────
   const totalFilledCost = filled.reduce((s, f) => s + f.fillCost, 0);
   const totalKalFees = filled.reduce((s, f) => s + (f.kalFees ?? 0), 0);
-  const realizedProfit = shares - totalFilledCost;
+  // PM fees: sum pmFeePaid for each PM leg's actual fill
+  const totalPmFees3Leg = filled
+    .filter(f => f.leg.exchange === "pm")
+    .reduce((s, f) => s + pmFeePaid(shares, f.fillPrice, f.leg.pmLeg), 0);
+  const totalWithFees3Leg = totalFilledCost + totalKalFees + totalPmFees3Leg;
+  const realizedProfit = shares - totalWithFees3Leg;
   console.log(
     `\n${ts()} [3LEG SUCCESS] All 3 legs filled!` +
-    `  shares=${shares}  cost=$${totalFilledCost.toFixed(2)}  profit=$${realizedProfit.toFixed(2)}  kalFees=$${totalKalFees.toFixed(3)}`
+    `  shares=${shares}  cost=$${totalWithFees3Leg.toFixed(2)} (principal=$${totalFilledCost.toFixed(2)} kalFees=$${totalKalFees.toFixed(3)} pmFees=$${totalPmFees3Leg.toFixed(3)})  profit=$${realizedProfit.toFixed(2)}`
   );
 
   // Record completed arb trade — use first KAL leg's ticker as primary
@@ -2289,7 +2300,8 @@ export async function executeArb3Leg(
     pmTokenId: firstPm?.leg.pmLeg.tokenId ?? legs[0].pmLeg.tokenId,
     pmFillPrice: firstPm?.fillPrice ?? 0,
     pmCost: filled.filter(f => f.leg.exchange === "pm").reduce((s, f) => s + f.fillCost, 0),
-    totalCost: totalFilledCost,
+    pmFees: totalPmFees3Leg,
+    totalCost: totalWithFees3Leg,
     projectedEdge: edge, projectedProfit: shares * edge,
     realizedPnl: Math.round(realizedProfit * 100) / 100,
     resolvedTs: new Date().toISOString(),
@@ -3003,26 +3015,24 @@ export async function monitorLoop(watchlist: WatchEntry[]): Promise<void> {
               const pmCostR = isPmInitial
                 ? Math.round((p.initialCost + p.hedgeFillCostPm) * 100) / 100
                 : Math.round(p.hedgeFillCostPm * 100) / 100;
-              const totalCostHedge = Math.round((kalCostR + pmCostR) * 100) / 100;
+              const pmFillPriceR = isPmInitial
+                ? p.pmCostBasis
+                : (p.hedgeFillCostPm > 0 ? Math.round((p.hedgeFillCostPm / p.initialShares) * 100) / 100 : 0);
+              // PM taker fee on the PM leg — was previously display-only (stored on
+              // the record but NOT added to totalCost), so realizedPnl over-stated the
+              // true P&L by exactly this amount. Now included in totalCostHedge below
+              // so dashboard -$0.02 == wallet -$0.02.
+              const pmFeesEst = pmFillPriceR > 0 && p.initialShares > 0
+                ? Math.round(pmFeePaid(p.initialShares, pmFillPriceR, p.pmLeg) * 100) / 100
+                : 0;
+              const totalCostHedge = Math.round((kalCostR + pmCostR + pmFeesEst) * 100) / 100;
               const payout = p.initialShares;
               const realizedPnl = Math.round((payout - totalCostHedge) * 100) / 100;
               console.log(
                 `\n[HEDGE] ${name} resolved! initialCost=$${p.initialCost.toFixed(2)}` +
-                ` hedgeCost=$${p.hedgeFillCost.toFixed(2)} kalFees=$${p.kalFees.toFixed(2)}` +
+                ` hedgeCost=$${p.hedgeFillCost.toFixed(2)} kalFees=$${p.kalFees.toFixed(2)} pmFees=$${pmFeesEst.toFixed(2)}` +
                 ` total=$${totalCostHedge.toFixed(2)} payout=$${payout.toFixed(2)} P&L=$${realizedPnl.toFixed(2)}`
               );
-              const pmFillPriceR = isPmInitial
-                ? p.pmCostBasis
-                : (p.hedgeFillCostPm > 0 ? Math.round((p.hedgeFillCostPm / p.initialShares) * 100) / 100 : 0);
-              // pmFees is display-only — matches the pattern used by all other
-              // hedge-complete/settlement resolve sites (ttExecution.ts:891/1017/1043/
-              // 1093/1158/1184 and ttHedge.ts:1092). Without this, the dashboard's
-              // "Fees" column understates by the PM taker fee (~$0.04-0.10 per trade).
-              // totalCost/kalCost/pmCost are already fee-inclusive for hedge-complete,
-              // so setting pmFees here is purely a display aid and does not affect P&L.
-              const pmFeesEst = pmFillPriceR > 0 && p.initialShares > 0
-                ? Math.round(pmFeePaid(p.initialShares, pmFillPriceR, p.pmLeg) * 100) / 100
-                : 0;
               resolveArbTrade(p.kalLeg.ticker, {
                 status: "resolved",
                 resolvedTs: new Date().toISOString(),

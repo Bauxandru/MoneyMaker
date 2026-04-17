@@ -26,7 +26,7 @@ import {
   pmFeePaid,
   TRADE_USD,
   MAX_CONTRACTS,
-  HEDGE_TARGET,
+  HEDGE_TARGET, HEDGE_MIN_MARGIN_PER_SHARE,
   STRICT_HEDGE,
   PM_ONLY_MAX_CYCLES,
   MIN_EDGE,
@@ -1177,7 +1177,12 @@ export async function runHedgeCycle(state: HedgeState, clobBase: string): Promis
       const kalSettleCost = Math.round(kalSettleRaw * 100) / 100;
       const kalSettleFees = Math.round(pos.kalFees * 100) / 100;
       const pmSettleCost = Math.round(pmSettleTotal * 100) / 100;
-      const settleTotal = Math.round((kalSettleCost + kalSettleFees + pmSettleCost) * 100) / 100;
+      const pmSettleFees = pmSettleTotal > 0
+        ? Math.round(pmFeePaid(pos.initialShares, pmSettleTotal / pos.initialShares, pos.pmLeg) * 100) / 100
+        : 0;
+      // Subtract pmSettleFees from settlePnl too — fees are real cost
+      settlePnl = Math.round((settlePnl - pmSettleFees) * 100) / 100;
+      const settleTotal = Math.round((kalSettleCost + kalSettleFees + pmSettleCost + pmSettleFees) * 100) / 100;
       resolveArbTrade(pos.kalLeg.ticker, {
         status: "resolved",
         resolvedTs: new Date().toISOString(),
@@ -1187,9 +1192,7 @@ export async function runHedgeCycle(state: HedgeState, clobBase: string): Promis
         kalCost: kalSettleCost,
         kalFees: kalSettleFees,
         pmCost: pmSettleCost,
-        pmFees: pmSettleTotal > 0
-          ? pmFeePaid(pos.initialShares, pmSettleTotal / pos.initialShares, pos.pmLeg)
-          : 0,
+        pmFees: pmSettleFees,
         totalCost: settleTotal,
         kalFillPrice: kalSettleRaw > 0
           ? Math.round((kalSettleRaw / pos.initialShares) * 100) / 100
@@ -1541,11 +1544,13 @@ export async function runHedgeCycle(state: HedgeState, clobBase: string): Promis
     // PM GTC placed above ask fills as TAKER (3% fee). Reserve for it.
     const estPmOppPrice = 1 - pos.pmCostBasis - hedgeEdge;
     const pmOppFeeReserve = pmFeeRateFor(pos.pmOppLeg) * estPmOppPrice * (1 - estPmOppPrice);
-    const maxKalPrice = 1 - pos.pmCostBasis - hedgeEdge - kalFeeReserve;
-    const maxOppPrice = 1 - pos.pmCostBasis - hedgeEdge - pmOppFeeReserve;
+    // HEDGE_MIN_MARGIN_PER_SHARE: hard floor below fee-adjusted breakeven — absorbs
+    // drift from fractional fills, per-market fee variance, maker/taker swings.
+    const maxKalPrice = 1 - pos.pmCostBasis - hedgeEdge - kalFeeReserve - HEDGE_MIN_MARGIN_PER_SHARE;
+    const maxOppPrice = 1 - pos.pmCostBasis - hedgeEdge - pmOppFeeReserve - HEDGE_MIN_MARGIN_PER_SHARE;
     // Safety: log breakeven calculation on first hedge cycle
     if (!state.lastCompleteExchange) {
-      console.log(`[HEDGE] PM-held breakeven: pmCostBasis=${fmtPct(pos.pmCostBasis)} maxKalPrice=${fmtPct(maxKalPrice)} maxOppPrice=${fmtPct(maxOppPrice)} shares=${sharesNeeded}`);
+      console.log(`[HEDGE] PM-held breakeven: pmCostBasis=${fmtPct(pos.pmCostBasis)} maxKalPrice=${fmtPct(maxKalPrice)} maxOppPrice=${fmtPct(maxOppPrice)} shares=${sharesNeeded} (margin=${fmtPct(HEDGE_MIN_MARGIN_PER_SHARE)}/sh)`);
     }
 
     // -- PM-held hedge strategy:
@@ -2098,10 +2103,12 @@ export async function runHedgeCycle(state: HedgeState, clobBase: string): Promis
     // fee = PM_FEE_RATE × price × (1 - price). Estimate at the expected fill price.
     const estPmFillPrice = 1 - pos.kalCostBasis - hedgeEdge2;
     const pmFeeReserve = pmFeeRateFor(pos.pmLeg) * estPmFillPrice * (1 - estPmFillPrice);
-    const maxPmPrice = 1 - pos.kalCostBasis - hedgeEdge2 - pmFeeReserve;
+    // HEDGE_MIN_MARGIN_PER_SHARE: hard floor below fee-adjusted breakeven — absorbs
+    // drift from fractional fills, per-market fee variance, maker/taker swings.
+    const maxPmPrice = 1 - pos.kalCostBasis - hedgeEdge2 - pmFeeReserve - HEDGE_MIN_MARGIN_PER_SHARE;
     // Safety: log breakeven calculation on first hedge cycle
     if (!state.lastCompleteExchange) {
-      console.log(`[HEDGE] KAL-held breakeven: kalCostBasis=${fmtPct(pos.kalCostBasis)} maxPmPrice=${fmtPct(maxPmPrice)} shares=${sharesNeeded}`);
+      console.log(`[HEDGE] KAL-held breakeven: kalCostBasis=${fmtPct(pos.kalCostBasis)} maxPmPrice=${fmtPct(maxPmPrice)} shares=${sharesNeeded} (margin=${fmtPct(HEDGE_MIN_MARGIN_PER_SHARE)}/sh)`);
     }
     const hedgeKalSide: "yes" | "no" = pos.kalSide === "yes" ? "no" : "yes";
 
@@ -2293,13 +2300,17 @@ export async function runHedgeCycle(state: HedgeState, clobBase: string): Promis
           // Full attribution achieved. Emit events using the ACTUAL attributed share
           // count (attributedShares === pos.initialShares at this point — verified by
           // the guards above).
-          const totalCost = Math.round((pos.initialCost + fillCost) * 100) / 100;
+          const pmFeesAttr = Math.round(pmFeePaid(attributedShares, fillPrice, pos.pmLeg) * 100) / 100;
+          // totalCost MUST include pos.kalFees + pmFees so realizedPnl is the true net.
+          // Previously this only summed initialCost + fillCost, omitting both fee buckets
+          // and over-stating P&L by ~$0.05-0.20 per trade.
+          const totalCost = Math.round((pos.initialCost + pos.kalFees + fillCost + pmFeesAttr) * 100) / 100;
           try {
             appendEvent({
               type: "fill-detected", tradeId: pos.tradeId, exchange: "pm",
               orderId: "", ticker: pos.kalLeg.ticker, tokenId: pos.pmLeg.tokenId,
               side: pos.pmLeg.outcome, fillShares: attributedShares, fillPrice,
-              fillCost, fees: pmFeePaid(attributedShares, fillPrice, pos.pmLeg),
+              fillCost, fees: pmFeesAttr,
               cumulativeFilled: attributedShares, source: "fills-reconcile",
             } as Omit<FillDetectedEvent, "seq" | "ts">);
             appendEvent({
@@ -2314,7 +2325,8 @@ export async function runHedgeCycle(state: HedgeState, clobBase: string): Promis
             resolutionMethod: "hedge-reconciled-onchain",
             pmFillPrice: fillPrice,
             pmCost: fillCost,
-            pmFees: pmFeePaid(attributedShares, fillPrice, pos.pmLeg),
+            pmFees: pmFeesAttr,
+            kalFees: pos.kalFees,
             totalCost,
             hedgeCost: 0,
             realizedPnl: Math.round((pos.initialShares - totalCost) * 100) / 100,

@@ -355,6 +355,7 @@ Test files under `src/ARB/*.test.ts` (run with `npm run test`):
 | `MAX_CONSECUTIVE_ERRORS` | `5` | Circuit breaker threshold |
 | `MAX_HEDGE_POSITIONS` | `8` | Max concurrent hedge positions |
 | `MAX_MARKET_EXPOSURE_USD` | `2 × TRADE_USD` | Hard cap on lifetime $ committed per Kalshi market (`kalCost + pmCost + hedgeCost` summed across every bot trade on the same `kalTicker`). Guards against compound stacking (Arsenal 2026-04-17 incident). Short-circuits `executeArb` / `executeArb3Leg` with `abort-safety:market-exposure-cap`. Set to `0` to disable. |
+| `HEDGE_MIN_MARGIN_PER_SHARE` | `0.005` ($0.005/share) | Hard floor subtracted from fee-adjusted hedge breakeven in `runHedgeCycle` (both PM-held `maxOppPrice` and KAL-held `maxPmPrice`). Absorbs drift from fractional PM fills, per-market fee-rate variance, and maker/taker swings so `hedge-complete` trades net ≥ 0 instead of randomly scoring −$0.02. Default gives $0.035 buffer per 7-share arb. Set to `0` to accept razor-thin fills at exact breakeven. |
 | `DISCOVERY_CACHE_TTL_MS` | `21,600,000` (6h) | Discovery cache lifetime (0 = date-based, stale at midnight UTC) |
 | `LIVE_ONLY` | `false` | Skip pre-match trades |
 | `FORCE_DISCOVER` | `false` | Force fresh discovery ignoring cache |

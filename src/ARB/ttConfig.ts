@@ -70,6 +70,16 @@ export const TRADE_COOLDOWN_MS = numEnv("TRADE_COOLDOWN_MS", numEnv("TRADE_LOOP_
 
 // HEDGE_TARGET: "payout" = hedge fills accepted at breakeven (1 - costBasis)
 export const HEDGE_TARGET = strEnv("HEDGE_TARGET", "payout") === "payout" ? "payout" : "profit";
+// HEDGE_MIN_MARGIN_PER_SHARE: hard floor the hedge-complete GTC bid below the
+// fee-adjusted breakeven, in $/share. Protects against drift that can push
+// hedge-complete slightly negative:
+//   - fractional PM fills (e.g. 7 ordered, 6.9 filled -> 0.1 naked KAL share)
+//   - per-market PM fee rate variance vs the gamma-reported rate
+//   - PM fee reserved at taker rate but actual fill was maker or vice-versa
+// Default 0.005 ($0.005/share = $0.035 per 7-share arb) — absorbs the drift
+// we've seen in prod (~$0.02) with headroom. Set to 0 to disable and accept
+// razor-thin fills. Applied in both KAL-held and PM-held hedge breakeven math.
+export const HEDGE_MIN_MARGIN_PER_SHARE = numEnv("HEDGE_MIN_MARGIN_PER_SHARE", 0.005);
 export const STRICT_HEDGE = boolEnv("STRICT_HEDGE", false);
 export const PM_ONLY_MAX_CYCLES = numEnv("PM_ONLY_MAX_CYCLES", 15);
 export const FORCE_DISCOVER = boolEnv("FORCE_DISCOVER", false);
