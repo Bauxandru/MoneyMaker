@@ -739,7 +739,21 @@ const AUDIT_CACHE_MS = 5 * 60 * 1000; // 5 min cache
 
 async function runAudit(): Promise<AuditResult> {
   const t0 = Date.now();
-  const allTrades = loadTrades();
+  // Merge local + all remote-bot ingested trades (deduped by id). Without this,
+  // the audit compares exchange fills against ONLY the local dashboard's journal
+  // — and when the real bot runs on a VPS that pushes via /api/ingest, every
+  // legitimate trade shows up as "untracked-kal-fills" / "untracked-pm-fills"
+  // because the local arb_trades.json doesn't have them yet. Mirrors the merge
+  // in /api/trades.
+  const local = loadTrades();
+  const seen = new Set(local.map(t => t.id));
+  const merged: ArbTrade[] = [...local];
+  for (const data of remoteUsers.values()) {
+    for (const rt of (data.trades || [])) {
+      if (!seen.has(rt.id)) { merged.push(rt as ArbTrade); seen.add(rt.id); }
+    }
+  }
+  const allTrades = merged;
   // Only audit trades on or after the cutoff date
   const trades = allTrades.filter(t => t.ts >= AUDIT_CUTOFF_DATE);
   const discrepancies: AuditDiscrepancy[] = [];
@@ -1206,7 +1220,18 @@ app.get("/api/positions", (_req, res) => {
 });
 
 app.get("/api/stats", (req, res) => {
-  let trades = loadTrades();
+  // Merge local + all remote-bot ingested trades (deduped by id). Mirrors the
+  // merge in /api/trades and runAudit so Total tab's stats match what the
+  // user sees in the trade list — otherwise "OPEN POSITIONS"/"TOTAL P&L"/etc.
+  // only reflect local-journal contents while the actual bot is running on VPS.
+  const local = loadTrades();
+  const seen = new Set(local.map(t => t.id));
+  let trades: ArbTrade[] = [...local];
+  for (const data of remoteUsers.values()) {
+    for (const rt of (data.trades || [])) {
+      if (!seen.has(rt.id)) { trades.push(rt as ArbTrade); seen.add(rt.id); }
+    }
+  }
   const day = req.query.day as string | undefined;
   if (day) trades = trades.filter(t => t.ts && toLocalDateStr(t.ts) === day);
   res.json(computeStats(trades));
