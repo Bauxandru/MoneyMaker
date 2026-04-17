@@ -1192,6 +1192,15 @@ app.get("/api/trades", (_req, res) => {
   res.json(local);
 });
 
+// Local-only trades (no merge with remote bots). Used by the "Me (Local)" tab
+// to show ONLY what this dashboard's own bot logged — complementing the "Total"
+// tab (which merges everything) and per-server tabs.
+app.get("/api/local-trades", (_req, res) => {
+  const local = loadTrades();
+  local.sort((a, b) => (b.ts || "").localeCompare(a.ts || ""));
+  res.json(local);
+});
+
 app.get("/api/positions", (_req, res) => {
   res.json(loadHedges());
 });
@@ -2094,8 +2103,9 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
 </div>
 
 <!-- User tabs (multi-user) -->
-<div id="userTabBar" style="display:none;margin:0 20px 8px;padding:0;border-bottom:2px solid #21262d;">
-  <button class="user-tab active" data-user="local" style="background:none;border:none;color:#58a6ff;padding:8px 18px;font-size:14px;font-family:inherit;cursor:pointer;border-bottom:2px solid #58a6ff;margin-bottom:-2px;">Me (Local)</button>
+<div id="userTabBar" style="display:block;margin:0 20px 8px;padding:0;border-bottom:2px solid #21262d;">
+  <button class="user-tab active" data-user="total" style="background:none;border:none;color:#58a6ff;padding:8px 18px;font-size:14px;font-family:inherit;cursor:pointer;border-bottom:2px solid #58a6ff;margin-bottom:-2px;">Total (<span data-count="total">--</span>)</button>
+  <button class="user-tab" data-user="local" style="background:none;border:none;color:#8b949e;padding:8px 18px;font-size:14px;font-family:inherit;cursor:pointer;border-bottom:2px solid transparent;margin-bottom:-2px;">Me (Local) (<span data-count="local">--</span>)</button>
 </div>
 
 <div class="cards" id="cards"></div>
@@ -3325,21 +3335,24 @@ document.querySelector('[data-tab="orderbook"]').addEventListener("click", funct
 });
 
 // -- Multi-user tab system ------------------------------------
-var currentUser = "local";
+// Tabs: "total" (merged: local + all VPS, deduped) | "local" (local file only) |
+//       per-server tabs (each VPS ingesting via /api/ingest).
+// Default active: "total".
+var currentUser = "total";
 
 function loadRemoteUsers() {
   fetch("/api/remote-users")
     .then(function(r) { return r.json(); })
     .then(function(users) {
       var bar = document.getElementById("userTabBar");
-      if (!users || users.length === 0) { bar.style.display = "none"; return; }
+      // Always visible — "Total" + "Me (Local)" are permanent.
       bar.style.display = "block";
 
-      // Keep the "Me (Local)" button, rebuild remote tabs
-      var existing = bar.querySelectorAll(".user-tab:not([data-user=local])");
+      // Rebuild remote server tabs (anything past "total" and "local")
+      var existing = bar.querySelectorAll(".user-tab:not([data-user=total]):not([data-user=local])");
       existing.forEach(function(el) { el.remove(); });
 
-      users.forEach(function(u) {
+      (users || []).forEach(function(u) {
         var btn = document.createElement("button");
         btn.className = "user-tab" + (currentUser === u.name ? " active" : "");
         btn.dataset.user = u.name;
@@ -3350,20 +3363,35 @@ function loadRemoteUsers() {
         bar.appendChild(btn);
       });
 
-      // Update local button styling
-      var localBtn = bar.querySelector("[data-user=local]");
-      if (localBtn) {
-        localBtn.style.color = currentUser === "local" ? "#58a6ff" : "#8b949e";
-        localBtn.style.borderBottom = currentUser === "local" ? "2px solid #58a6ff" : "2px solid transparent";
-        localBtn.className = "user-tab" + (currentUser === "local" ? " active" : "");
-      }
+      // Refresh count badges on Total and Local buttons
+      Promise.all([
+        fetch("/api/trades").then(function(r){ return r.json(); }).catch(function(){ return []; }),
+        fetch("/api/local-trades").then(function(r){ return r.json(); }).catch(function(){ return []; }),
+      ]).then(function(results) {
+        var totalCount = (results[0] || []).length;
+        var localCount = (results[1] || []).length;
+        var totalSpan = bar.querySelector('[data-count="total"]');
+        var localSpan = bar.querySelector('[data-count="local"]');
+        if (totalSpan) totalSpan.textContent = totalCount;
+        if (localSpan) localSpan.textContent = localCount;
+      });
+
+      // Ensure active-state styling is consistent after rebuild
+      ["total", "local"].forEach(function(key) {
+        var btn = bar.querySelector('[data-user="' + key + '"]');
+        if (btn) {
+          var active = currentUser === key;
+          btn.style.color = active ? "#58a6ff" : "#8b949e";
+          btn.style.borderBottom = active ? "2px solid #58a6ff" : "2px solid transparent";
+          btn.className = "user-tab" + (active ? " active" : "");
+        }
+      });
     })
     .catch(function() {});
 }
 
 function switchUser(userName) {
   currentUser = userName;
-  // Refresh user tab bar styling
   document.querySelectorAll(".user-tab").forEach(function(b) {
     b.classList.remove("active");
     b.style.color = "#8b949e";
@@ -3378,24 +3406,38 @@ function switchUser(userName) {
   fetchAndRender();
 }
 
-// Add click handler to local tab
-document.querySelector("[data-user=local]").addEventListener("click", function() {
-  switchUser("local");
-});
+// Click handlers for the two permanent tabs
+document.querySelector('[data-user="total"]').addEventListener("click", function() { switchUser("total"); });
+document.querySelector('[data-user="local"]').addEventListener("click", function() { switchUser("local"); });
 
-// Override fetchAndRender to support remote user data
+// Override fetchAndRender to support all three modes
 var _originalFetchAndRender = fetchAndRender;
 fetchAndRender = function() {
-  if (currentUser === "local") {
+  if (currentUser === "total") {
+    // Merged view: the existing /api/trades endpoint already unions local +
+    // all remote bots. This is what _originalFetchAndRender hits.
     _originalFetchAndRender();
+  } else if (currentUser === "local") {
+    // Local-only: skip remote ingest data.
+    fetch("/api/local-trades")
+      .then(function(r) { return r.json(); })
+      .then(function(trades) {
+        allTrades = trades;
+        renderTrades(trades);
+        var totalPnl = trades.reduce(function(s, t) { return s + (t.realizedPnl || 0); }, 0);
+        var filled = trades.filter(function(t) { return t.status === "resolved"; }).length;
+        document.getElementById("cards").innerHTML =
+          '<div style="padding:16px 20px;color:#c9d1d9;">Viewing <strong>Me (Local)</strong> -- ' +
+          trades.length + ' trades | ' + filled + ' resolved | PnL: $' + totalPnl.toFixed(2) + '</div>';
+      })
+      .catch(function() {});
   } else {
-    // Fetch remote user trades
+    // Single remote server
     fetch("/api/remote-trades?user=" + encodeURIComponent(currentUser))
       .then(function(r) { return r.json(); })
       .then(function(trades) {
         allTrades = trades;
         renderTrades(trades);
-        // Show basic stats
         var totalPnl = trades.reduce(function(s, t) { return s + (t.realizedPnl || 0); }, 0);
         var filled = trades.filter(function(t) { return t.status === "resolved"; }).length;
         document.getElementById("cards").innerHTML =
