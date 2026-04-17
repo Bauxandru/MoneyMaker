@@ -361,15 +361,39 @@ export function resolveArbTrade(kalTicker: string, updates: Partial<ArbTradeReco
   }
   if (idx === -1) return;
 
-  // Idempotency guard: skip re-resolution of already-resolved trades unless
-  // the caller is explicitly updating a non-status field (e.g. cost repair).
+  // Idempotency guard: refuse to overwrite an already-resolved trade with a
+  // DIFFERENT resolutionMethod. Root cause of the $3.15-type P&L overstatement:
+  // `hedge-reconciled-onchain` (on-chain truth) resolves first, then a hedge
+  // cycle's `hedge-complete` (local tracking) fires ~200ms later with stale
+  // hedgeFillCostPm/initialShares math (e.g. $0.289 / 7 = $0.04/share). On-chain
+  // always wins over local tracking.
+  //
+  // Allowed cases:
+  //   - Field-only repair (no resolutionMethod in updates)          ✓
+  //   - Same resolutionMethod re-asserted (idempotent retry)        ✓
+  //   - New method = existing method                                ✓
+  //   - Status unchanged but resolved (legacy cost/P&L backfill)    ✓ (no resolutionMethod passed)
+  // Blocked:
+  //   - Already resolved + new resolutionMethod differs             ✗ (logged + audited)
   const trade = trades[idx];
-  if (trade.status === "resolved" && updates.status === "resolved" && trade.resolvedTs) {
-    const secsSinceResolved = (Date.now() - new Date(trade.resolvedTs).getTime()) / 1000;
-    if (secsSinceResolved < 300) { // within 5 minutes — likely a duplicate call
-      console.warn(`[P&L] Skipping duplicate resolution for ${trade.match} (resolved ${secsSinceResolved.toFixed(0)}s ago)`);
-      return;
-    }
+  if (trade.status === "resolved" && updates.resolutionMethod &&
+      trade.resolutionMethod && updates.resolutionMethod !== trade.resolutionMethod) {
+    console.warn(
+      `[P&L] BLOCKED double-resolve of ${trade.match}: existing=${trade.resolutionMethod} ` +
+      `(pnl=$${(trade.realizedPnl ?? 0).toFixed(2)}), attempted=${updates.resolutionMethod} ` +
+      `(pnl=$${((updates.realizedPnl ?? 0) as number).toFixed(2)})`
+    );
+    audit({
+      module: "persist", fn: "resolveArbTrade", action: "double-resolve-blocked",
+      tradeId: trade.id, kalTicker, shares: trade.shares, cost: trade.totalCost,
+      context: {
+        existingMethod: trade.resolutionMethod, attemptedMethod: updates.resolutionMethod,
+        existingPnl: trade.realizedPnl, attemptedPnl: updates.realizedPnl,
+        existingPmCost: trade.pmCost, attemptedPmCost: updates.pmCost,
+        existingPmFillPrice: trade.pmFillPrice, attemptedPmFillPrice: updates.pmFillPrice,
+      },
+    });
+    return;
   }
 
   Object.assign(trades[idx], updates);

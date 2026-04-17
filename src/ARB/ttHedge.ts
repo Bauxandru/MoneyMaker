@@ -98,7 +98,7 @@ import {
   KalOrderEvent,
 } from "./ttWebSocket.js";
 
-import { appendEvent, type OrderPlacedEvent, type FillDetectedEvent, type OrderCancelledEvent } from "./ttEventLog.js";
+import { appendEvent, type OrderPlacedEvent, type FillDetectedEvent, type OrderCancelledEvent, type PositionSnapshotEvent } from "./ttEventLog.js";
 
 import {
   createPmClient,
@@ -1000,6 +1000,11 @@ export async function runHedgeCycle(state: HedgeState, clobBase: string): Promis
           try {
             if (ho.exchange === "pm") await cancelPmOrder(oid, DRY_RUN);
             else await cancelKalshiOrder(oid, DRY_RUN);
+            appendEvent({
+              type: "order-cancelled", tradeId: pos.tradeId, exchange: ho.exchange,
+              orderId: oid, ticker: pos.kalLeg.ticker,
+              filledBeforeCancel: ho.filledSoFar, reason: "scalar-settlement",
+            } as Omit<OrderCancelledEvent, "seq" | "ts">);
           } catch { /* order may already be gone */ }
         }
         activeOrders.clear();
@@ -1034,6 +1039,11 @@ export async function runHedgeCycle(state: HedgeState, clobBase: string): Promis
         try {
           if (ho.exchange === "pm") await cancelPmOrder(oid, DRY_RUN);
           else await cancelKalshiOrder(oid, DRY_RUN);
+          appendEvent({
+            type: "order-cancelled", tradeId: pos.tradeId, exchange: ho.exchange,
+            orderId: oid, ticker: pos.kalLeg.ticker,
+            filledBeforeCancel: ho.filledSoFar, reason: "market-settled",
+          } as Omit<OrderCancelledEvent, "seq" | "ts">);
         } catch { /* market closed -- order may already be gone */ }
       }
       activeOrders.clear();
@@ -1669,10 +1679,17 @@ export async function runHedgeCycle(state: HedgeState, clobBase: string): Promis
                   saveHedgeState(state);
                 if (pos.sharesHeld <= 0) {
                   // Fully hedged — cancel other orders and clean up
-                  for (const [coid] of activeOrders) {
+                  for (const [coid, cho] of activeOrders) {
                     if (coid !== oid) {
                       try { cancelKalshiOrder(coid, false).catch(() => {}); } catch { /* */ }
                       try { cancelPmOrder(coid, false).catch(() => {}); } catch { /* */ }
+                      try {
+                        appendEvent({
+                          type: "order-cancelled", tradeId: pos.tradeId, exchange: cho.exchange,
+                          orderId: coid, ticker: pos.kalLeg.ticker,
+                          filledBeforeCancel: cho.filledSoFar, reason: "fully-hedged-cancel-siblings",
+                        } as Omit<OrderCancelledEvent, "seq" | "ts">);
+                      } catch { /* best effort */ }
                     }
                     unregisterKalListeners(coid);
                   }
@@ -1743,6 +1760,11 @@ export async function runHedgeCycle(state: HedgeState, clobBase: string): Promis
                         if (cho.exchange === "pm") await cancelPmOrder(coid, DRY_RUN);
                         else await cancelKalshiOrder(coid, DRY_RUN);
                         console.log(`[HEDGE] Cancelled ${cho.exchange.toUpperCase()} ${cho.role} ${coid.slice(0, 12)}...`);
+                        appendEvent({
+                          type: "order-cancelled", tradeId: pos.tradeId, exchange: cho.exchange,
+                          orderId: coid, ticker: pos.kalLeg.ticker,
+                          filledBeforeCancel: cho.filledSoFar, reason: "fully-hedged-cancel-remaining",
+                        } as Omit<OrderCancelledEvent, "seq" | "ts">);
                       } catch { /* may already be gone */ }
                     }
                     activeOrders.clear();
@@ -1830,6 +1852,11 @@ export async function runHedgeCycle(state: HedgeState, clobBase: string): Promis
                         if (cho.exchange === "pm") await cancelPmOrder(coid, DRY_RUN);
                         else await cancelKalshiOrder(coid, DRY_RUN);
                         console.log(`[HEDGE] Cancelled ${cho.exchange.toUpperCase()} ${cho.role} ${coid.slice(0, 12)}...`);
+                        appendEvent({
+                          type: "order-cancelled", tradeId: pos.tradeId, exchange: cho.exchange,
+                          orderId: coid, ticker: pos.kalLeg.ticker,
+                          filledBeforeCancel: cho.filledSoFar, reason: "fully-hedged-cancel-remaining",
+                        } as Omit<OrderCancelledEvent, "seq" | "ts">);
                       } catch { /* may already be gone */ }
                     }
                     activeOrders.clear();
@@ -2022,6 +2049,11 @@ export async function runHedgeCycle(state: HedgeState, clobBase: string): Promis
               if (ho.exchange === "pm") await cancelPmOrder(oid, DRY_RUN);
               else await cancelKalshiOrder(oid, DRY_RUN);
               console.log(`[HEDGE] Cancelled ${ho.exchange.toUpperCase()} ${ho.role} ${oid.slice(0, 12)}...`);
+              appendEvent({
+                type: "order-cancelled", tradeId: pos.tradeId, exchange: ho.exchange,
+                orderId: oid, ticker: pos.kalLeg.ticker,
+                filledBeforeCancel: ho.filledSoFar, reason: "hedge-reconciled-onchain",
+              } as Omit<OrderCancelledEvent, "seq" | "ts">);
             } catch { /* order may already be gone */ }
           }
           activeOrders.clear();
@@ -2070,8 +2102,26 @@ export async function runHedgeCycle(state: HedgeState, clobBase: string): Promis
 
           // Within breakeven — legitimate arb completion. Resolve the trade.
           const totalCost = Math.round((pos.initialCost + fillCost) * 100) / 100;
+          // Emit a fill-detected event for the on-chain-verified PM shares. Without this,
+          // ghost-filled / CLOB-recovered fills leave gaps in exchange_events.jsonl, which
+          // prevents shadowCompare() from reconstructing the trade from events alone.
+          try {
+            appendEvent({
+              type: "fill-detected", tradeId: pos.tradeId, exchange: "pm",
+              orderId: "", ticker: pos.kalLeg.ticker, tokenId: pos.pmLeg.tokenId,
+              side: pos.pmLeg.outcome, fillShares: pos.initialShares, fillPrice,
+              fillCost, fees: pmFeePaid(pos.initialShares, fillPrice, pos.pmLeg),
+              cumulativeFilled: pos.initialShares, source: "fills-reconcile",
+            } as Omit<FillDetectedEvent, "seq" | "ts">);
+            appendEvent({
+              type: "position-snapshot", tradeId: pos.tradeId, exchange: "pm",
+              orderId: "", ticker: pos.kalLeg.ticker, tokenId: pos.pmLeg.tokenId,
+              sharesHeld: pos.initialShares, source: "pm-onchain",
+            } as Omit<PositionSnapshotEvent, "seq" | "ts">);
+          } catch { /* best effort */ }
           resolveArbTrade(pos.kalLeg.ticker, {
             status: "resolved",
+            resolvedTs: new Date().toISOString(),
             resolutionMethod: "hedge-reconciled-onchain",
             pmFillPrice: fillPrice,
             pmCost: fillCost,
@@ -2263,6 +2313,11 @@ export async function runHedgeCycle(state: HedgeState, clobBase: string): Promis
                         if (cho.exchange === "pm") await cancelPmOrder(coid, DRY_RUN);
                         else await cancelKalshiOrder(coid, DRY_RUN);
                         console.log(`[HEDGE] Cancelled ${cho.exchange.toUpperCase()} ${cho.role} ${coid.slice(0, 12)}...`);
+                        appendEvent({
+                          type: "order-cancelled", tradeId: pos.tradeId, exchange: cho.exchange,
+                          orderId: coid, ticker: pos.kalLeg.ticker,
+                          filledBeforeCancel: cho.filledSoFar, reason: "fully-hedged-cancel-remaining",
+                        } as Omit<OrderCancelledEvent, "seq" | "ts">);
                       } catch { /* may already be gone */ }
                     }
                     activeOrders.clear();
