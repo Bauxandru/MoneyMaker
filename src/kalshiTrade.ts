@@ -1,6 +1,6 @@
 import crypto from "crypto";
 import fs from "fs";
-import { fetchJson } from "./http.js";
+import { kalFetchHedge } from "./ARB/ttConfig.js";
 import { sleep } from "./utils.js";
 
 type KalshiOrderSide = "yes" | "no";
@@ -72,7 +72,7 @@ export async function placeKalshiOrder(order: KalshiOrderRequest, dryRun: boolea
     };
   }
 
-  return fetchJson(url.toString(), {
+  return kalFetchHedge(url.toString(), {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -122,7 +122,7 @@ async function kalshiSignedFetch(method: "GET" | "DELETE", path: string): Promis
   // Sign with the full URL pathname (e.g. /trade-api/v2/portfolio/orders/...)
   // to match what the server sees -- same as placeKalshiOrder does for POST.
   const signature = signRequest(method, fullUrl.pathname, timestamp, privateKey);
-  return fetchJson(fullUrl.toString(), {
+  return kalFetchHedge(fullUrl.toString(), {
     method,
     headers: {
       "KALSHI-ACCESS-KEY": keyId,
