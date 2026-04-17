@@ -1900,10 +1900,26 @@ export async function runHedgeCycle(state: HedgeState, clobBase: string): Promis
 
       // -- PM GTC bid (the only hedge path for PM-held trades) ---------------
       // If PM fails due to insufficient balance, fall back to KAL GTC.
+      //
+      // DEDUP GUARD: skip placement if we already have an active PM complete
+      // order. Without this, every cycle that meets the placement criteria
+      // stacks a duplicate GTC on the PM book — observed in prod with 5
+      // duplicate Gen.G orders and 4 duplicate JD Gaming orders, each for
+      // the full share count, risking 4-5× over-hedge if the book ticks down.
       let pmBalanceFailed = false;
       const pmGtcCooldownKey = `${pos.tradeId}:opp`;
       const pmGtcCooldownUntil = _pmGtcCrossCooldown.get(pmGtcCooldownKey) ?? 0;
-      if (!placed && pmViable && pos.pmOppLeg && Date.now() >= pmGtcCooldownUntil) {
+      const hasActivePmCompleteOpp = [...activeOrders.values()].some(o => o.role === "complete" && o.exchange === "pm");
+      if (hasActivePmCompleteOpp) {
+        const k = `dedup-opp:${pos.tradeId}`;
+        const prev = _onChainBalLastLogged.get(k);
+        const now = Date.now();
+        if (!prev || now - prev.ts >= ONCHAIN_BAL_LOG_INTERVAL_MS) {
+          console.log(`[HEDGE] PM complete GTC already active for ${pos.pmOppLeg?.outcome ?? "?"} — skipping new placement (dedup guard).`);
+          _onChainBalLastLogged.set(k, { value: 1, ts: now });
+        }
+      }
+      if (!placed && pmViable && pos.pmOppLeg && Date.now() >= pmGtcCooldownUntil && !hasActivePmCompleteOpp) {
         const oppTick = pos.pmOppLeg.tickSize || 0.01;
         const oppBidPrice = Math.round(Math.floor(maxOppPrice / oppTick + 1e-9) * oppTick * 1e6) / 1e6;
         const cappedOppShares = DRY_RUN
@@ -2403,9 +2419,23 @@ export async function runHedgeCycle(state: HedgeState, clobBase: string): Promis
       let placed = false;
       let pmBalanceFailedKH = false;
 
+      // DEDUP GUARD: skip placement if we already have an active PM complete
+      // order. See detailed comment in the PM-held branch above for why this
+      // matters. Without it, every cycle stacks another duplicate order.
+      const hasActivePmCompleteLeg = [...activeOrders.values()].some(o => o.role === "complete" && o.exchange === "pm");
+      if (hasActivePmCompleteLeg) {
+        const k = `dedup-leg:${pos.tradeId}`;
+        const prev = _onChainBalLastLogged.get(k);
+        const now = Date.now();
+        if (!prev || now - prev.ts >= ONCHAIN_BAL_LOG_INTERVAL_MS) {
+          console.log(`[HEDGE] PM complete GTC already active for ${pos.pmLeg.outcome} — skipping new placement (dedup guard).`);
+          _onChainBalLastLogged.set(k, { value: 1, ts: now });
+        }
+      }
+
       const pmGtcKhCooldownKey = `${pos.tradeId}:leg`;
       const pmGtcKhCooldownUntil = _pmGtcCrossCooldown.get(pmGtcKhCooldownKey) ?? 0;
-      if (pmViableKH && Date.now() >= pmGtcKhCooldownUntil) {
+      if (pmViableKH && Date.now() >= pmGtcKhCooldownUntil && !hasActivePmCompleteLeg) {
         // -- Try PM GTC BID for the needed token -----------------------------
         const pmTick = pos.pmLeg.tickSize || 0.01;
         const pmBidPrice = Math.round(Math.floor(maxPmPrice / pmTick + 1e-9) * pmTick * 1e6) / 1e6;
