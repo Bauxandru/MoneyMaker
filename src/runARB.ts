@@ -271,27 +271,39 @@ async function main() {
 
   // -- Startup reconciliation --
   console.log("[STARTUP] Running position reconciliation (non-blocking)...");
-  // Auto-backfill any on-chain positions that lack a journal entry BEFORE reconcile runs.
-  // Disable on a VPS when the wallet is ALSO used by another bot (home, or another VPS) —
-  // the other owner already tracks these positions, and backfill would synthesize ghost
-  // records that double-count P&L. Set DISABLE_AUTO_BACKFILL=true in settings.txt.
-  if (process.env.DISABLE_AUTO_BACKFILL === "true") {
-    console.log("[STARTUP] DISABLE_AUTO_BACKFILL=true — skipping backfill of untracked on-chain positions");
-  } else {
-    import("./ARB/ttReconcile.js")
-      .then(m => m.autoBackfillUntracked?.())
-      .catch(err => console.warn(`[AUTO-BACKFILL] skipped: ${(err as Error).message}`));
-  }
+  // Auto-backfill + wallet-first must run SEQUENTIALLY: wallet-first rebuilds hedge_state
+  // for trades in arb_trades.json marked `hedging`. If it runs in parallel with
+  // autoBackfillUntracked, it misses the brand-new backfill records and leaves them
+  // without hedge_state entries — the bot won't actively hedge them.
+  //
+  // Disable auto-backfill on a VPS when the wallet is ALSO used by another bot (home,
+  // or another VPS) — the other owner already tracks those positions, and backfill
+  // would synthesize ghost records that double-count P&L. Set DISABLE_AUTO_BACKFILL=true.
+  (async () => {
+    if (process.env.DISABLE_AUTO_BACKFILL === "true") {
+      console.log("[STARTUP] DISABLE_AUTO_BACKFILL=true — skipping backfill of untracked on-chain positions");
+    } else {
+      try {
+        const m = await import("./ARB/ttReconcile.js");
+        await m.autoBackfillUntracked?.();
+      } catch (err) {
+        console.warn(`[AUTO-BACKFILL] skipped: ${(err as Error).message}`);
+      }
+    }
 
-  // Wallet-first startup: pair orphan backfills via Discovery, rebuild hedge_state
-  // for hedging trades that lack one, enrich positions with watchlist metadata,
-  // and purge stale entries. Opt-in via WALLET_FIRST_STARTUP=true.
-  if (process.env.WALLET_FIRST_STARTUP === "true") {
-    console.log("[STARTUP] WALLET_FIRST_STARTUP=true — running wallet-first reconstruction");
-    import("./ARB/ttWalletFirst.js")
-      .then(m => m.runWalletFirstStartup({ forceDiscovery: process.env.FORCE_DISCOVER === "true" }))
-      .catch(err => console.error(`[WALLET-FIRST] failed: ${(err as Error).message}`));
-  }
+    // Wallet-first startup: pair orphan backfills via Discovery, rebuild hedge_state
+    // for every `hedging` trade (including ones just created by autoBackfillUntracked),
+    // enrich positions with watchlist metadata, and purge stale entries.
+    if (process.env.WALLET_FIRST_STARTUP === "true") {
+      console.log("[STARTUP] WALLET_FIRST_STARTUP=true — running wallet-first reconstruction");
+      try {
+        const m = await import("./ARB/ttWalletFirst.js");
+        await m.runWalletFirstStartup({ forceDiscovery: process.env.FORCE_DISCOVER === "true" });
+      } catch (err) {
+        console.error(`[WALLET-FIRST] failed: ${(err as Error).message}`);
+      }
+    }
+  })();
 
   reconcilePositions("startup").catch(err =>
     console.error(`[RECONCILE] Startup reconciliation failed: ${(err as Error).message}`)
