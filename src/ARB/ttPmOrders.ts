@@ -9,12 +9,11 @@
 import { ClobClient, OrderType, Side } from "@polymarket/clob-client";
 import { Wallet } from "@ethersproject/wallet";
 import { resolvePolyApiCreds } from "../polyAuth.js";
-import { fetchJsonWithRetry } from "../http.js";
 import { sleep, normCents, normDollarsOrCents, bestAskFromSide, bestBidFromSide, pickString } from "../utils.js";
 import { getOnChainBalance, getUsdcBalance } from "../polyChain.js";
 import { waitForPmFillWs, isPmUserWsReady } from "./ttWebSocket.js";
 import {
-  kalFetch, polyClobFetch, retryOpts,
+  kalFetch, polyClobFetch, polyClobFetchHot, hotRetryOpts,
   PM_ORDER_TYPE, PM_MARKETABLE_MIN_VALUE,
 } from "./ttConfig.js";
 import type {
@@ -460,9 +459,16 @@ export async function fetchPmAsk(tokenId: string, clobBase: string): Promise<num
 }
 
 export async function fetchPmAskDirect(tokenId: string, clobBase: string): Promise<number | null> {
+  // Uses raw fetchJsonWithRetry (no rate-limiter queue) — intentional.
+  // This function is called 20-40× per cycle from the pm-prices REST batch, all in parallel
+  // inside a 3s Promise.race. If routed through polyClobFetchHot, abandoned calls from
+  // timed-out batches accumulate slot reservations, pushing nextAllowedAt minutes into the
+  // future and freezing all subsequent callers (observed as 5-min pm-prices watchdog stall).
+  // The outer Promise.race + hotRetryOpts (2s timeout, 1 retry) bound the per-call blast.
   try {
+    const { fetchJsonWithRetry } = await import("../http.js");
     const book = await fetchJsonWithRetry<{ asks?: unknown }>(
-      `${clobBase}/book?token_id=${encodeURIComponent(tokenId)}`, {}, retryOpts
+      `${clobBase}/book?token_id=${encodeURIComponent(tokenId)}`, {}, hotRetryOpts
     );
     return bestAskFromSide(book.asks);
   } catch { return null; }
@@ -470,8 +476,8 @@ export async function fetchPmAskDirect(tokenId: string, clobBase: string): Promi
 
 export async function fetchPmBidDirect(tokenId: string, clobBase: string): Promise<number | null> {
   try {
-    const book = await fetchJsonWithRetry<{ bids?: unknown }>(
-      `${clobBase}/book?token_id=${encodeURIComponent(tokenId)}`, {}, retryOpts
+    const book = await polyClobFetchHot<{ bids?: unknown }>(
+      `${clobBase}/book?token_id=${encodeURIComponent(tokenId)}`
     );
     return bestBidFromSide(book.bids);
   } catch { return null; }

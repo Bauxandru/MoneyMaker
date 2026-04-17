@@ -86,10 +86,10 @@ export async function fetchJsonWithRetry<T>(
 export function createRateLimitedFetcher(
   intervalMs: number,
   retryOpts: RetryOptions = {}
-): <T>(url: string) => Promise<T> {
+): <T>(url: string, init?: RequestInit) => Promise<T> {
   let nextAllowedAt = 0;
 
-  return async function rateLimitedFetch<T>(url: string): Promise<T> {
+  return async function rateLimitedFetch<T>(url: string, init: RequestInit = {}): Promise<T> {
     // Reserve a slot: each request gets its own time slot, spaced by intervalMs.
     // Does NOT wait for previous requests to complete — only for the time window.
     // This prevents a slow/hanging request from blocking the entire queue.
@@ -98,6 +98,6 @@ export function createRateLimitedFetcher(
     nextAllowedAt = mySlot + intervalMs;
     const wait = mySlot - now;
     if (wait > 0) await sleep(wait);
-    return fetchJsonWithRetry<T>(url, {}, retryOpts);
+    return fetchJsonWithRetry<T>(url, init, retryOpts);
   };
 }

@@ -105,12 +105,20 @@ export const PM_ORDER_TYPE: OrderType =
 // --- Rate-limited fetch helpers -----------------------------------------------
 
 export const retryOpts = { timeoutMs: 12000, maxRetries: 3, baseDelayMs: 600, maxDelayMs: 8000, jitterMs: 200 };
-export const kalFetch = createRateLimitedFetcher(numEnv("KALSHI_REQUEST_INTERVAL_MS", 50), retryOpts);
+// Hot-path retry profile: used by price/book fetches that run inside an outer
+// Promise.race timeout. We don't want the inner retry chain to keep the rate-
+// limiter queue busy long after the outer has given up on the result.
+export const hotRetryOpts = { timeoutMs: 2000, maxRetries: 1, baseDelayMs: 200, maxDelayMs: 400, jitterMs: 50 };
+export const kalFetch = createRateLimitedFetcher(numEnv("KALSHI_REQUEST_INTERVAL_MS", 25), retryOpts);
+// Hot-path Kalshi fetcher: shares interval default but aggressive retry cap.
+export const kalFetchHot = createRateLimitedFetcher(numEnv("KALSHI_REQUEST_INTERVAL_MS", 25), hotRetryOpts);
 // Dedicated hedge queue — independent from main queue so hedge orders never wait behind price refreshes
-export const kalFetchHedge = createRateLimitedFetcher(numEnv("KALSHI_REQUEST_INTERVAL_MS", 50), { ...retryOpts, maxRetries: 1, timeoutMs: 8000 });
+export const kalFetchHedge = createRateLimitedFetcher(numEnv("KALSHI_REQUEST_INTERVAL_MS", 25), { ...retryOpts, maxRetries: 1, timeoutMs: 8000 });
 // Two separate PM queues -- gamma (discovery, 30/s) and CLOB (orderbook, 150/s)
 export const polyFetch = createRateLimitedFetcher(numEnv("POLY_GAMMA_INTERVAL_MS", 35), retryOpts);
 export const polyClobFetch = createRateLimitedFetcher(numEnv("POLY_CLOB_INTERVAL_MS", 7), retryOpts);
+// Hot-path CLOB fetcher — same queue rate, aggressive retry cap for main-loop price reads.
+export const polyClobFetchHot = createRateLimitedFetcher(numEnv("POLY_CLOB_INTERVAL_MS", 7), hotRetryOpts);
 
 // --- Pure helpers -------------------------------------------------------------
 
