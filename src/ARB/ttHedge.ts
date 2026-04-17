@@ -2000,6 +2000,7 @@ export async function runHedgeCycle(state: HedgeState, clobBase: string): Promis
           // Try to recover actual fill price from CLOB getTrades()
           let fillPrice = 0;
           let fillCost = 0;
+          let attributedShares = 0; // ACTUAL shares attributed from CLOB — NEVER substitute pos.initialShares
           try {
             const { client } = await createPmClient();
             type ClobFill = { asset_id: string; size: string; price: string; fee_rate_bps: string; side: string; status: string; match_time: string; id?: string };
@@ -2037,6 +2038,7 @@ export async function runHedgeCycle(state: HedgeState, clobBase: string): Promis
               if (totalSize > 0) {
                 fillPrice = Math.round((totalCost / totalSize) * 10000) / 10000;
                 fillCost = Math.round(totalCost * 100) / 100;
+                attributedShares = totalSize;
                 console.log(`[HEDGE] Recovered PM fill from CLOB: avgPrice=${fmtPct(fillPrice)} totalCost=$${fillCost.toFixed(2)} (${totalSize} shares, skipped ${skipped} from other trades)`);
               }
             }
@@ -2100,23 +2102,65 @@ export async function runHedgeCycle(state: HedgeState, clobBase: string): Promis
             return;
           }
 
+          // DATA-FIRST INVARIANT: if CLOB returned ZERO fills, we have no data to
+          // compute pmCost from. Resolving here would write pmCost=$0 (fabricated) and
+          // overstate P&L by the full PM leg. Park in hedging and retry later.
+          if (attributedShares === 0) {
+            console.warn(
+              `[HEDGE] CLOB returned no attributable fills for trade ${pos.tradeId} — NOT resolving. ` +
+              `On-chain shows shares present but fill-price data is unavailable.`
+            );
+            audit({
+              module: "hedge", fn: "runHedgeCycle", action: "reconcile-onchain-no-clob-data",
+              tradeId: pos.tradeId, kalTicker: pos.kalLeg.ticker, shares: pos.initialShares,
+              price: 0, context: { note: "CLOB getTrades() returned no matches; cannot compute pmCost from real data" },
+            });
+            // Leave sharesHeld unchanged; don't write phantom pmCost.
+            saveHedgeState(state);
+            return;
+          }
+
           // Within breakeven — legitimate arb completion. Resolve the trade.
+          // DATA-FIRST INVARIANT: if CLOB attribution returned fewer shares than we
+          // expected (attributedShares < pos.initialShares), we have INCOMPLETE data.
+          // Resolving anyway would fabricate a P&L from partial evidence. Park the
+          // position in `hedging` and let subsequent reconciliation pass find more fills.
+          if (attributedShares > 0 && attributedShares < pos.initialShares - 0.01) {
+            console.warn(
+              `[HEDGE] CLOB attributed ${attributedShares}/${pos.initialShares} shares for trade ${pos.tradeId} — incomplete data, NOT resolving. ` +
+              `Recording partial hedge cost and parking in hedging until more fills visible.`
+            );
+            audit({
+              module: "hedge", fn: "runHedgeCycle", action: "reconcile-onchain-incomplete",
+              tradeId: pos.tradeId, kalTicker: pos.kalLeg.ticker, shares: attributedShares,
+              price: fillPrice, context: {
+                expected: pos.initialShares, attributed: attributedShares, fillCost,
+                note: "CLOB returned incomplete attribution — refusing to resolve with partial data",
+              },
+            });
+            pos.hedgeFillCost += fillCost;
+            pos.hedgeFillCostPm += fillCost;
+            // Keep sharesHeld reflecting what's still unaccounted for
+            pos.sharesHeld = Math.max(0, pos.initialShares - attributedShares);
+            saveHedgeState(state);
+            return;
+          }
+          // Full attribution achieved. Emit events using the ACTUAL attributed share
+          // count (attributedShares === pos.initialShares at this point — verified by
+          // the guards above).
           const totalCost = Math.round((pos.initialCost + fillCost) * 100) / 100;
-          // Emit a fill-detected event for the on-chain-verified PM shares. Without this,
-          // ghost-filled / CLOB-recovered fills leave gaps in exchange_events.jsonl, which
-          // prevents shadowCompare() from reconstructing the trade from events alone.
           try {
             appendEvent({
               type: "fill-detected", tradeId: pos.tradeId, exchange: "pm",
               orderId: "", ticker: pos.kalLeg.ticker, tokenId: pos.pmLeg.tokenId,
-              side: pos.pmLeg.outcome, fillShares: pos.initialShares, fillPrice,
-              fillCost, fees: pmFeePaid(pos.initialShares, fillPrice, pos.pmLeg),
-              cumulativeFilled: pos.initialShares, source: "fills-reconcile",
+              side: pos.pmLeg.outcome, fillShares: attributedShares, fillPrice,
+              fillCost, fees: pmFeePaid(attributedShares, fillPrice, pos.pmLeg),
+              cumulativeFilled: attributedShares, source: "fills-reconcile",
             } as Omit<FillDetectedEvent, "seq" | "ts">);
             appendEvent({
               type: "position-snapshot", tradeId: pos.tradeId, exchange: "pm",
               orderId: "", ticker: pos.kalLeg.ticker, tokenId: pos.pmLeg.tokenId,
-              sharesHeld: pos.initialShares, source: "pm-onchain",
+              sharesHeld: attributedShares, source: "pm-onchain",
             } as Omit<PositionSnapshotEvent, "seq" | "ts">);
           } catch { /* best effort */ }
           resolveArbTrade(pos.kalLeg.ticker, {
@@ -2125,7 +2169,7 @@ export async function runHedgeCycle(state: HedgeState, clobBase: string): Promis
             resolutionMethod: "hedge-reconciled-onchain",
             pmFillPrice: fillPrice,
             pmCost: fillCost,
-            pmFees: pmFeePaid(pos.initialShares, fillPrice, pos.pmLeg),
+            pmFees: pmFeePaid(attributedShares, fillPrice, pos.pmLeg),
             totalCost,
             hedgeCost: 0,
             realizedPnl: Math.round((pos.initialShares - totalCost) * 100) / 100,

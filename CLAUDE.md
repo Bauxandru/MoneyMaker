@@ -155,6 +155,21 @@ Kalshi is executed first because:
 
 8. **Pending fills must not be deleted while executing.** The `_activePendingFillId` guard prevents ghost-fill detection from acting on a fill that's currently being processed by the execution engine. Removing this guard causes double-counting.
 
+9. **DATA-FIRST INVARIANT — never guess financial fields.** The following fields on `ArbTradeRecord` must be sourced from actual exchange data (exchange fills, on-chain transfers, CLOB `getTrades()`, Kalshi settlement API): `pmFillPrice`, `pmCost`, `pmFees`, `kalFillPrice`, `kalCost`, `kalFees`, `totalCost`, `realizedPnl`, `hedgeCost`. They must NEVER be derived from estimates, defaults, or heuristics — including but not limited to:
+   - `pmCost = shares × (1 - kalFillPrice)` (break-even estimate)
+   - `pmFillPrice = pmCost / initialShares` when actual filled share count is unknown
+   - `hedgeCostPm = unhedgedCount × (oppAskNow ?? (1 - pmAsk))` (market-price fallback)
+   - `pmCost = sharesHeld × pmAsk` (market price at execution, not fill price)
+   - Dividing accumulated cost by the requested (not filled) share count
+   - Silently writing `0` when upstream data is missing
+   
+   If the required actual data is unavailable, the correct action is to:
+   - Leave the field `null` or unchanged,
+   - Keep the trade in `hedging` status until real data arrives,
+   - Log a warning and emit an `audit()` entry describing what data is missing.
+   
+   The dashboard's "Actual P&L" column displays `trade.realizedPnl` verbatim (see `dashboard.ts:2400`). If we fabricate that value here, the dashboard lies. Never fabricate.
+
 ---
 
 ## Ghost Fill Handling
@@ -370,7 +385,19 @@ These are known issues. Do not waste time "discovering" them — they're documen
 
 7. **[cosmetic] No slippage tracking.** Projected edge at discovery time is not compared to actual fill prices. No metric for how much slippage occurs.
 
-8. **[cosmetic] Session skip set is session-wide, not status-aware.** `sessionSkipSet` blocks re-arbing a match for the entire session; at startup it's seeded from `recent (3 days)` OR `active (hedging/filled)` trades, so old-but-active positions are covered. There's no runtime sync — if a hedging trade resolves mid-session the match stays skipped, which is the intended conservative behaviour.
+8. **[important] Several code paths violate the DATA-FIRST invariant (Safety Invariant #9).** An audit on 2026-04-17 identified these sites that derive financial values via estimates rather than actual fills. Fix when touching the surrounding code; do NOT introduce new sites of the same pattern:
+   - **HIGH** `ttHedge.ts:1107-1110` — settlement math divides `kalSettleRaw / pos.initialShares` to derive per-share price (not actual filled)
+   - **HIGH** `ttReconcile.ts:158-160` — ghost-fill resolution uses `hedgingTrade.shares * actualPrice` without verifying `shares` equals actual Kalshi fills
+   - **HIGH** `ttHedge.ts:1426-1432` — hedge breakeven cap built on `pos.pmCostBasis` which may itself be derived from `pmCost / initialShares`
+   - **MEDIUM** `ttPersistence.ts:184-186` — `recoverOrphanedHedgeTrades` falls back to `pmCost / shares` when `pmFillPrice` is missing
+   - **MEDIUM** `ttHedge.ts:1090-1114` — settlement P&L compounds potentially-wrong `initialCost` and `hedgeFillCost`
+   - **MEDIUM** `ttExecution.ts:1007` — `hedgeCostPm = unhedgedCount × (oppAskNow ?? (1 - pmAsk))` fallback to theoretical price
+   - **MEDIUM** `ttReconcile.ts:1107-1110` — consolidation uses `primary.pmCost / primary.shares` division
+   - **MEDIUM** `ttExecution.ts:637-640` — unhedged positions record `pmCost = sharesHeld × pmAsk` (market price, not fill)
+   - **MEDIUM** `ttReconcile.ts:199-200` — ghost trade uses `Math.min(shares, hedgingTrade.shares)` as a heuristic
+   - **LOW-MEDIUM** `ttPersistence.ts:145-150` — chained recovery computes `initialCost = initialShares * costBasis` from two derived values
+
+9. **[cosmetic] Session skip set is session-wide, not status-aware.** `sessionSkipSet` blocks re-arbing a match for the entire session; at startup it's seeded from `recent (3 days)` OR `active (hedging/filled)` trades, so old-but-active positions are covered. There's no runtime sync — if a hedging trade resolves mid-session the match stays skipped, which is the intended conservative behaviour.
 
 ---
 
