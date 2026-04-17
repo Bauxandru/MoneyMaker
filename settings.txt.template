@@ -59,3 +59,11 @@ DRIFT_WARN_USD=5
 # LICENSE_TOKEN=your-shared-secret
 # SERVER_ID=vps-frankfurt
 # DASHBOARD_PUSH_INTERVAL_MS=300000   # periodic sync every 5 min (default)
+
+# ── Wallet sharing (only flip this if TWO bots share the same wallet) ────
+# When multiple bots hold keys to the same PM/Kalshi wallet, the VPS startup
+# reconciler would synthesize "auto-backfill" trade records for positions it
+# finds on-chain — which double-counts the P&L the other bot already tracks.
+# Disable the backfill on the "secondary" bot to keep its journal clean.
+# Best practice: run one wallet per bot and leave this at its default (false).
+# DISABLE_AUTO_BACKFILL=true

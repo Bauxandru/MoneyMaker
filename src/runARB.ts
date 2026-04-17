@@ -271,12 +271,17 @@ async function main() {
 
   // -- Startup reconciliation --
   console.log("[STARTUP] Running position reconciliation (non-blocking)...");
-  // Auto-backfill any on-chain positions that lack a journal entry BEFORE reconcile runs,
-  // so the reconciler sees the full picture. Runs in parallel with the reconcile so neither
-  // blocks startup path; if it errors, we just proceed without backfilling.
-  import("./ARB/ttReconcile.js")
-    .then(m => m.autoBackfillUntracked?.())
-    .catch(err => console.warn(`[AUTO-BACKFILL] skipped: ${(err as Error).message}`));
+  // Auto-backfill any on-chain positions that lack a journal entry BEFORE reconcile runs.
+  // Disable on a VPS when the wallet is ALSO used by another bot (home, or another VPS) —
+  // the other owner already tracks these positions, and backfill would synthesize ghost
+  // records that double-count P&L. Set DISABLE_AUTO_BACKFILL=true in settings.txt.
+  if (process.env.DISABLE_AUTO_BACKFILL === "true") {
+    console.log("[STARTUP] DISABLE_AUTO_BACKFILL=true — skipping backfill of untracked on-chain positions");
+  } else {
+    import("./ARB/ttReconcile.js")
+      .then(m => m.autoBackfillUntracked?.())
+      .catch(err => console.warn(`[AUTO-BACKFILL] skipped: ${(err as Error).message}`));
+  }
 
   reconcilePositions("startup").catch(err =>
     console.error(`[RECONCILE] Startup reconciliation failed: ${(err as Error).message}`)
