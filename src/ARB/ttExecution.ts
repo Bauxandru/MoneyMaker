@@ -2959,6 +2959,15 @@ export async function monitorLoop(watchlist: WatchEntry[]): Promise<void> {
               const pmFillPriceR = isPmInitial
                 ? p.pmCostBasis
                 : (p.hedgeFillCostPm > 0 ? Math.round((p.hedgeFillCostPm / p.initialShares) * 100) / 100 : 0);
+              // pmFees is display-only — matches the pattern used by all other
+              // hedge-complete/settlement resolve sites (ttExecution.ts:891/1017/1043/
+              // 1093/1158/1184 and ttHedge.ts:1092). Without this, the dashboard's
+              // "Fees" column understates by the PM taker fee (~$0.04-0.10 per trade).
+              // totalCost/kalCost/pmCost are already fee-inclusive for hedge-complete,
+              // so setting pmFees here is purely a display aid and does not affect P&L.
+              const pmFeesEst = pmFillPriceR > 0 && p.initialShares > 0
+                ? Math.round(pmFeePaid(p.initialShares, pmFillPriceR, p.pmLeg) * 100) / 100
+                : 0;
               resolveArbTrade(p.kalLeg.ticker, {
                 status: "resolved",
                 resolvedTs: new Date().toISOString(),
@@ -2966,6 +2975,7 @@ export async function monitorLoop(watchlist: WatchEntry[]): Promise<void> {
                 totalCost: totalCostHedge,
                 hedgeCost: p.hedgeFillCost,
                 kalFees: p.kalFees,
+                pmFees: pmFeesEst,
                 realizedPnl,
                 initialExchange: p.heldExchange,
                 kalFillPrice: kalCostR > 0
