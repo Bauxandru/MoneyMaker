@@ -11,7 +11,7 @@
  */
 import fs from "fs";
 import dotenv from "dotenv";
-import { placePmFOKSell } from "./ARB/ttPmOrders.js";
+import { placePmFAKSell } from "./ARB/ttPmOrders.js";
 
 dotenv.config();
 
@@ -142,7 +142,7 @@ async function main() {
     const projectedRevenue = bestBid * excess;
     console.log(`  ★ PLACING FAK SELL ${excess} shares @ ${(bestBid * 100).toFixed(1)}c (projected revenue $${projectedRevenue.toFixed(2)})`);
     try {
-      const res = await placePmFOKSell(tokenId, bestBid, excess, market.tickSize, market.negRisk, false /* NOT dry-run */);
+      const res = await placePmFAKSell(tokenId, bestBid, excess, market.tickSize, market.negRisk, false /* NOT dry-run */);
       console.log(`  RESULT:`, JSON.stringify(res));
       fired++;
       totalRecovered += projectedRevenue;

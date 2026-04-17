@@ -9,6 +9,7 @@
 
 import {
   DRY_RUN, SERVER_ID, PARALLEL_MODE, TRADE_USD, MAX_CONTRACTS, MIN_EDGE,
+  MAX_MARKET_EXPOSURE_USD,
   POLL_INTERVAL_MS, TRADE_COOLDOWN_MS,
   HEDGE_TARGET, STRICT_HEDGE, PM_ONLY_MAX_CYCLES,
   FORCE_DISCOVER, MAX_CONSECUTIVE_ERRORS, MAX_HEDGE_POSITIONS,
@@ -359,6 +360,32 @@ export async function executeArb(
         tPreflight = performance.now() - _tPre0;
         // If we can't verify, proceed cautiously — the order will fail anyway if market is closed
       }
+    }
+  }
+
+  // ── SAFETY: per-market exposure cap ─────────────────────────────────────────
+  // Block new arbs on a market where the bot has already committed >= cap in $.
+  // Sum kalCost + pmCost + hedgeCost across every bot-originated trade on this
+  // kalTicker (regardless of status). Guards against compound stacking like the
+  // Arsenal 2026-04-17 incident (77 PM Over + 16 KAL YES -> $57 naked risk).
+  // Set MAX_MARKET_EXPOSURE_USD=0 to disable the cap.
+  if (MAX_MARKET_EXPOSURE_USD > 0) {
+    const existingTrades = loadArbTrades();
+    let marketExposure = 0;
+    for (const t of existingTrades) {
+      if (t.kalTicker !== kalLeg.ticker) continue;
+      marketExposure += (t.kalCost || 0) + (t.pmCost || 0) + (t.hedgeCost || 0);
+    }
+    const costPerShareEst = kalAsk + pmAsk;
+    const projectedTradeCost = Math.max(1, Math.floor(TRADE_USD / costPerShareEst)) * costPerShareEst;
+    if (marketExposure + projectedTradeCost > MAX_MARKET_EXPOSURE_USD) {
+      console.warn(
+        `  [SKIP] Market exposure cap hit for ${kalLeg.ticker}: ` +
+        `existing=$${marketExposure.toFixed(2)} + projected=$${projectedTradeCost.toFixed(2)} ` +
+        `> cap=$${MAX_MARKET_EXPOSURE_USD.toFixed(2)}`
+      );
+      saveExecMetric("abort-safety", "market-exposure-cap");
+      return { sessionSkip: true, unhedged: null };
     }
   }
 
@@ -1964,6 +1991,29 @@ export async function executeArb3Leg(
   if (realEdge < MIN_EDGE) {
     console.log(`  [3LEG] Edge evaporated: ${fmtPct(realEdge)} < ${fmtPct(MIN_EDGE)}. Skipping.`);
     return { sessionSkip: false, unhedged: null, abortReason: "soft" };
+  }
+
+  // Per-market exposure cap (3-leg) — short-circuit before any order placement.
+  // Keyed on the KAL leg ticker (same as executeArb's cap).
+  if (MAX_MARKET_EXPOSURE_USD > 0) {
+    const kalTicker3 = legs.find(l => l.exchange === "kal")?.kalLeg.ticker;
+    if (kalTicker3) {
+      const allTrades = loadArbTrades();
+      let marketExposure3 = 0;
+      for (const t of allTrades) {
+        if (t.kalTicker !== kalTicker3) continue;
+        marketExposure3 += (t.kalCost || 0) + (t.pmCost || 0) + (t.hedgeCost || 0);
+      }
+      const projectedCost3 = Math.max(1, Math.floor(TRADE_USD / totalCostPerShare)) * totalCostPerShare;
+      if (marketExposure3 + projectedCost3 > MAX_MARKET_EXPOSURE_USD) {
+        console.warn(
+          `  [3LEG SKIP] Market exposure cap hit for ${kalTicker3}: ` +
+          `existing=$${marketExposure3.toFixed(2)} + projected=$${projectedCost3.toFixed(2)} ` +
+          `> cap=$${MAX_MARKET_EXPOSURE_USD.toFixed(2)}`
+        );
+        return { sessionSkip: true, unhedged: null };
+      }
+    }
   }
 
   // Sizing: budget-limited, capped at MAX_CONTRACTS, floored by PM min size

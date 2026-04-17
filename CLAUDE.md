@@ -354,6 +354,7 @@ Test files under `src/ARB/*.test.ts` (run with `npm run test`):
 | `KAL_MAKER_MODE` | `false` | Use GTC maker orders on Kalshi (1.75% fee vs 7%) |
 | `MAX_CONSECUTIVE_ERRORS` | `5` | Circuit breaker threshold |
 | `MAX_HEDGE_POSITIONS` | `8` | Max concurrent hedge positions |
+| `MAX_MARKET_EXPOSURE_USD` | `2 × TRADE_USD` | Hard cap on lifetime $ committed per Kalshi market (`kalCost + pmCost + hedgeCost` summed across every bot trade on the same `kalTicker`). Guards against compound stacking (Arsenal 2026-04-17 incident). Short-circuits `executeArb` / `executeArb3Leg` with `abort-safety:market-exposure-cap`. Set to `0` to disable. |
 | `DISCOVERY_CACHE_TTL_MS` | `21,600,000` (6h) | Discovery cache lifetime (0 = date-based, stale at midnight UTC) |
 | `LIVE_ONLY` | `false` | Skip pre-match trades |
 | `FORCE_DISCOVER` | `false` | Force fresh discovery ignoring cache |

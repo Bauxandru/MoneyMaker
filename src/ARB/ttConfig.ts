@@ -53,6 +53,14 @@ export const TRADE_USD = numEnv("TRADE_USD", 10);
 export const MAX_CONTRACTS = Math.max(1, Math.floor(numEnv("MAX_CONTRACTS", 999)));
 export const MIN_EDGE = numEnv("MIN_EDGE", 0.02);
 
+// MAX_MARKET_EXPOSURE_USD: Hard cap on total $ committed to a single Kalshi market
+// (summed across kalCost + pmCost on every bot-originated trade with that kalTicker,
+// regardless of status). Default = 2 × TRADE_USD. Added 2026-04-17 after an
+// Arsenal EPL totals market accumulated ~77 PM Over + 16 KAL YES across many
+// Dir-A/C fires, creating ~$57 of downside risk. The cap short-circuits executeArb
+// before any order is sent. Set MAX_MARKET_EXPOSURE_USD=0 to disable.
+export const MAX_MARKET_EXPOSURE_USD = numEnv("MAX_MARKET_EXPOSURE_USD", TRADE_USD * 2);
+
 // POLL_INTERVAL_MS: With WS feeds active, the poll cycle does zero API calls
 // (pure Map reads), so this is just a sleep to yield the event loop. 0 = max speed.
 export const POLL_INTERVAL_MS = Math.max(0,
