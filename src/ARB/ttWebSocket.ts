@@ -175,8 +175,11 @@ export function unregisterKalListeners(orderId: string): void {
   _kalPersistentOrderListeners.delete(orderId);
 }
 
-/** Register a one-shot waiter for a Kalshi fill. Returns fill event or null on timeout. */
-export function waitForKalFillWs(orderId: string, timeoutMs = 15_000): Promise<KalFillEvent | null> {
+/** Register a one-shot waiter for a Kalshi fill. Returns fill event or null on timeout.
+ *  Default timeout is 3s: KAL WS fills typically arrive in <100ms, and all real
+ *  callers override this anyway. The old 15s default never fired in practice;
+ *  this is defensive for any future caller that forgets to pass one. */
+export function waitForKalFillWs(orderId: string, timeoutMs = 3_000): Promise<KalFillEvent | null> {
   return new Promise((resolve) => {
     const timer = setTimeout(() => {
       _kalFillWaiters.delete(orderId);
@@ -465,10 +468,10 @@ export function connectKalshiWs(): void {
   });
 
   _kalWs.on("close", () => {
-    console.log("[WS] Kalshi disconnected, reconnecting in 3s...");
+    console.log("[WS] Kalshi disconnected, reconnecting in 1s...");
     _kalWsReady = false;
     wsKalBooks.clear();
-    setTimeout(connectKalshiWs, 3000);
+    setTimeout(connectKalshiWs, 1000);
   });
   _kalWs.on("error", (err) => { console.error("[WS] Kalshi error:", (err as Error).message); });
 }
@@ -538,10 +541,10 @@ export function connectPmWs(): void {
   });
 
   _pmWs.on("close", () => {
-    console.log("[WS] Polymarket disconnected, clearing books, reconnecting in 3s...");
+    console.log("[WS] Polymarket disconnected, clearing books, reconnecting in 1s...");
     _pmWsReady = false;
     wsPmBooks.clear(); // Prevent stale PM prices from being used during reconnect gap
-    setTimeout(connectPmWs, 3000);
+    setTimeout(connectPmWs, 1000);
   });
   _pmWs.on("error", (err) => { console.error("[WS] Polymarket error:", (err as Error).message); });
 }
@@ -795,9 +798,9 @@ export function connectPmUserWs(): void {
   });
 
   _pmUserWs.on("close", () => {
-    console.log("[PM-USER-WS] Disconnected, reconnecting in 3s...");
+    console.log("[PM-USER-WS] Disconnected, reconnecting in 1s...");
     _pmUserWsReady = false;
-    setTimeout(connectPmUserWs, 3000);
+    setTimeout(connectPmUserWs, 1000);
   });
   _pmUserWs.on("error", (err) => { console.error("[PM-USER-WS] Error:", (err as Error).message); });
 }

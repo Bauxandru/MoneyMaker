@@ -69,7 +69,12 @@ export const MAX_CONSECUTIVE_ERRORS = numEnv("MAX_CONSECUTIVE_ERRORS", 5);
 export const MAX_HEDGE_POSITIONS = numEnv("MAX_HEDGE_POSITIONS", 8);
 
 // WS orderbook staleness thresholds (ms)
-export const KAL_WS_STALE_MS = numEnv("KAL_WS_STALE_MS", 600_000);   // 10 min
+// WS staleness: if a book entry is older than this, treat as stale and fall back
+// to REST. Previously 10 min for KAL — too lenient, a disconnected WS meant hedge
+// decisions ran on 10-min-old books. 2 min keeps WS primary while making REST
+// failover prompt. PM stays at 5 min because its illiquid books genuinely don't
+// update for minutes (per original comment).
+export const KAL_WS_STALE_MS = numEnv("KAL_WS_STALE_MS", 120_000);   // 2 min (was 10 min)
 export const PM_WS_STALE_MS  = numEnv("PM_WS_STALE_MS",   300_000);   // 5 min (illiquid books may not update for minutes)
 
 // Discovery cache TTL (ms). 0 = date-based (stale at midnight UTC).
@@ -104,7 +109,11 @@ export const PM_ORDER_TYPE: OrderType =
 
 // --- Rate-limited fetch helpers -----------------------------------------------
 
-export const retryOpts = { timeoutMs: 12000, maxRetries: 3, baseDelayMs: 600, maxDelayMs: 8000, jitterMs: 200 };
+// Default REST retry profile. Kalshi typical p99 < 1.5s, PM CLOB p99 < 2s, so a
+// 5s timeout is still 3× their 99th percentile while cutting worst-case blocking
+// from 36s (12s × 3 retries) to 15s on a truly dead endpoint. First retry at 200ms
+// (was 600ms) matches typical transient-error recovery window.
+export const retryOpts = { timeoutMs: 5000, maxRetries: 3, baseDelayMs: 200, maxDelayMs: 8000, jitterMs: 200 };
 // Hot-path retry profile: used by price/book fetches that run inside an outer
 // Promise.race timeout. We don't want the inner retry chain to keep the rate-
 // limiter queue busy long after the outer has given up on the result.

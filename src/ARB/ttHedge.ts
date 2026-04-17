@@ -400,8 +400,16 @@ export function isScalarSettlement(mkt: KalshiMarket): boolean {
   return false;
 }
 
-/** Fetch PM book and return the best bid price (highest buyer). */
+/** Fetch PM book and return the best bid price (highest buyer).
+ *  Checks the WS book first (instant, no network); only falls through to the
+ *  REST CLOB fetch when the WS entry is missing or stale. Saves one REST call
+ *  per hedge cycle when WS is healthy. */
 export async function fetchPmBestBid(tokenId: string, clobBase: string): Promise<number | null> {
+  // WS-first: the live book typically has a fresh best-bid under 100ms of latency.
+  try {
+    const wsBid = getWsPmBestBid(tokenId);
+    if (wsBid !== null && Number.isFinite(wsBid) && wsBid > 0 && wsBid < 1) return wsBid;
+  } catch { /* fall through to REST */ }
   try {
     const book = await polyClobFetch<{ bids?: unknown }>(`${clobBase}/book?token_id=${encodeURIComponent(tokenId)}`);
     if (!Array.isArray(book.bids)) return null;
