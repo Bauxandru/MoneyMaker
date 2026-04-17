@@ -108,6 +108,7 @@ import {
   placePmFAKSell,
   cancelPmOrder,
   cancelAllPmOrdersForToken,
+  getOpenPmBuyOrdersForToken,
   getPmOrderFills,
   buildKalshiIOCOrder,
   fetchKalshiSingleMarket,
@@ -1909,6 +1910,25 @@ export async function runHedgeCycle(state: HedgeState, clobBase: string): Promis
       let pmBalanceFailed = false;
       const pmGtcCooldownKey = `${pos.tradeId}:opp`;
       const pmGtcCooldownUntil = _pmGtcCrossCooldown.get(pmGtcCooldownKey) ?? 0;
+      // Reconcile activeOrders vs PM open-orders API to catch orphaned live orders
+      // that were removed from in-memory tracking (fetch-failure cancel, stale-order
+      // timeout, counterpart cancel — any path whose cancelOrder silently failed).
+      // Without this, `hasActivePmCompleteOpp` can be false while PM still has a
+      // live BUY → next placement stacks a duplicate (seen in prod with Gen.G 64¢+63¢).
+      if (!DRY_RUN && pos.pmOppLeg) {
+        const liveOpp = await getOpenPmBuyOrdersForToken(pos.pmOppLeg.tokenId);
+        for (const lo of liveOpp) {
+          if (!activeOrders.has(lo.orderId)) {
+            activeOrders.set(lo.orderId, {
+              role: "complete", exchange: "pm", orderId: lo.orderId,
+              price: lo.price, shares: lo.size, filledSoFar: 0,
+              fetchFailures: 0, placedAt: Date.now(),
+            });
+            console.log(`[HEDGE] Re-registered orphan PM order ${lo.orderId.slice(0, 16)}... on ${pos.pmOppLeg.outcome} (${lo.size}@${fmtPct(lo.price)}) — dedup guard would have missed it.`);
+          }
+        }
+        if (liveOpp.length > 0) saveHedgeState(state);
+      }
       const hasActivePmCompleteOpp = [...activeOrders.values()].some(o => o.role === "complete" && o.exchange === "pm");
       if (hasActivePmCompleteOpp) {
         const k = `dedup-opp:${pos.tradeId}`;
@@ -2422,6 +2442,23 @@ export async function runHedgeCycle(state: HedgeState, clobBase: string): Promis
       // DEDUP GUARD: skip placement if we already have an active PM complete
       // order. See detailed comment in the PM-held branch above for why this
       // matters. Without it, every cycle stacks another duplicate order.
+      // Reconcile activeOrders vs PM open-orders API first to catch orphans
+      // (live on exchange but missing from in-memory tracking) — same reason
+      // as the PM-held branch.
+      if (!DRY_RUN) {
+        const liveLeg = await getOpenPmBuyOrdersForToken(pos.pmLeg.tokenId);
+        for (const lo of liveLeg) {
+          if (!activeOrders.has(lo.orderId)) {
+            activeOrders.set(lo.orderId, {
+              role: "complete", exchange: "pm", orderId: lo.orderId,
+              price: lo.price, shares: lo.size, filledSoFar: 0,
+              fetchFailures: 0, placedAt: Date.now(),
+            });
+            console.log(`[HEDGE] Re-registered orphan PM order ${lo.orderId.slice(0, 16)}... on ${pos.pmLeg.outcome} (${lo.size}@${fmtPct(lo.price)}) — dedup guard would have missed it.`);
+          }
+        }
+        if (liveLeg.length > 0) saveHedgeState(state);
+      }
       const hasActivePmCompleteLeg = [...activeOrders.values()].some(o => o.role === "complete" && o.exchange === "pm");
       if (hasActivePmCompleteLeg) {
         const k = `dedup-leg:${pos.tradeId}`;

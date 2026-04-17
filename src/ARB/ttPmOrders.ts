@@ -176,6 +176,38 @@ export async function cancelAllPmOrdersForToken(tokenId: string): Promise<number
   return cancelled;
 }
 
+/** List the currently-live PM BUY orders for a specific tokenId (funder-scoped).
+ *  Used by the hedge cycle to detect orphaned orders that were deleted from
+ *  in-memory `activeOrders` (e.g. the fetch-failure cancel path at ttHedge.ts:1483
+ *  swallows a failing cancelOrder and still removes from tracking) but are still
+ *  live on the exchange. Returning these lets the hedge cycle re-register them
+ *  so the dedup guard reflects exchange reality and does not stack duplicates. */
+export async function getOpenPmBuyOrdersForToken(
+  tokenId: string
+): Promise<Array<{ orderId: string; price: number; size: number }>> {
+  try {
+    const { client } = await createPmClient();
+    type OpenOrder = {
+      id?: string; orderID?: string; asset_id?: string; side?: string;
+      price?: string | number; size?: string | number; original_size?: string | number;
+    };
+    const orders = await (client as unknown as { getOpenOrders(p?: { asset_id?: string }): Promise<OpenOrder[]> })
+      .getOpenOrders({ asset_id: tokenId });
+    const arr = Array.isArray(orders) ? orders : [];
+    return arr
+      .filter(o => {
+        const side = String(o.side ?? "").toUpperCase();
+        return side === "BUY" || side === "BID";
+      })
+      .map(o => ({
+        orderId: String(o.id ?? o.orderID ?? ""),
+        price: Number(o.price ?? 0),
+        size: Number(o.size ?? o.original_size ?? 0),
+      }))
+      .filter(o => !!o.orderId);
+  } catch { return []; }
+}
+
 /**
  * Get actual PM fill cost from CLOB getTrades() API.
  * Returns exact per-fill prices from the exchange — no WS inversion issues.
