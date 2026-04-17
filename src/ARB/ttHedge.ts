@@ -876,6 +876,41 @@ const MISSING_LEG_LOG_INTERVAL_MS = 60 * 60 * 1000; // 1h
 const _pmGtcCrossCooldown = new Map<string, number>();
 const PM_GTC_CROSS_COOLDOWN_MS = 30_000;
 
+// Short-TTL on-chain balance cache. Without this, every hedge cycle (~180ms)
+// makes an RPC call for each held position even when the wallet is idle —
+// observed ~10 wasted eth_call/sec on two stuck hedge positions.
+// 2s TTL: short enough to catch new fills promptly, long enough to cut RPC
+// spend ~10×. Transparent to callers via `getCachedOnChainBalance`.
+const _onChainBalCache = new Map<string, { value: number; ts: number }>();
+const ONCHAIN_BAL_CACHE_MS = 2_000;
+// Per-token log throttling: only emit a "[HEDGE] On-chain balance: …" line
+// when the value CHANGES or 60s have passed since the last log for this token.
+// Killed the cycle-by-cycle repetition of "0x Gen.G" / "5x Team Liquid" lines.
+const _onChainBalLastLogged = new Map<string, { value: number; ts: number }>();
+const ONCHAIN_BAL_LOG_INTERVAL_MS = 60_000;
+
+async function getCachedOnChainBalance(tokenId: string, timeoutMs = 10_000): Promise<number> {
+  const cached = _onChainBalCache.get(tokenId);
+  const now = Date.now();
+  if (cached && now - cached.ts < ONCHAIN_BAL_CACHE_MS) return cached.value;
+  const val = await Promise.race([
+    getOnChainBalanceWithFallback(tokenId),
+    new Promise<number>((_, rej) => setTimeout(() => rej(new Error("balance-timeout")), timeoutMs)),
+  ]);
+  _onChainBalCache.set(tokenId, { value: val, ts: now });
+  return val;
+}
+
+/** Log on-chain balance with per-token throttling: only prints when value
+ *  differs from the last-logged value, or when more than 60s have elapsed. */
+function logOnChainBalanceThrottled(tokenId: string, value: number, label: string): void {
+  const prev = _onChainBalLastLogged.get(tokenId);
+  const now = Date.now();
+  if (prev && prev.value === value && now - prev.ts < ONCHAIN_BAL_LOG_INTERVAL_MS) return;
+  _onChainBalLastLogged.set(tokenId, { value, ts: now });
+  console.log(`  [HEDGE] On-chain balance: ${value}x ${label} (token ${tokenId.slice(0, 16)}...)`);
+}
+
 /** Before placing a PM hedge order, re-check current on-chain balance of the target token
  *  and cap the order size so we never exceed the intended coverage. Prevents cross-session
  *  and cross-server over-hedging (observed: 113 DKC held vs 40 KAL T1 needed).
@@ -894,16 +929,32 @@ async function capPmOrderByOnChain(
 ): Promise<number> {
   if (requestedShares <= 0 || targetCoverage <= 0) return requestedShares;
   try {
-    const bal = await getOnChainBalance(tokenId);
+    // Route through the 2s-TTL cache so the cap-check doesn't fire an RPC
+    // every cycle when the wallet is idle. Log guards below ensure the
+    // "Capping order" / "over-hedge" warnings only print when the decision
+    // CHANGES (different cap target), not on every steady-state cycle.
+    const bal = await getCachedOnChainBalance(tokenId);
     if (bal < 0 || !Number.isFinite(bal)) return requestedShares;
     const alreadyCovered = Math.floor(bal);
     if (alreadyCovered >= targetCoverage) {
-      console.warn(`[HEDGE ${label}] On-chain already holds ${alreadyCovered} shares vs target ${targetCoverage} — skipping order (over-hedge guard).`);
+      const k = `cap:${tokenId}:full`;
+      const prev = _onChainBalLastLogged.get(k);
+      const now = Date.now();
+      if (!prev || prev.value !== alreadyCovered || now - prev.ts >= ONCHAIN_BAL_LOG_INTERVAL_MS) {
+        console.warn(`[HEDGE ${label}] On-chain already holds ${alreadyCovered} shares vs target ${targetCoverage} — skipping order (over-hedge guard).`);
+        _onChainBalLastLogged.set(k, { value: alreadyCovered, ts: now });
+      }
       return 0;
     }
     const stillNeeded = Math.max(0, targetCoverage - alreadyCovered);
     if (stillNeeded < requestedShares) {
-      console.warn(`[HEDGE ${label}] Capping order ${requestedShares} -> ${stillNeeded} shares (on-chain has ${alreadyCovered}/${targetCoverage}, avoiding over-hedge).`);
+      const k = `cap:${tokenId}:partial`;
+      const prev = _onChainBalLastLogged.get(k);
+      const now = Date.now();
+      if (!prev || prev.value !== stillNeeded || now - prev.ts >= ONCHAIN_BAL_LOG_INTERVAL_MS) {
+        console.warn(`[HEDGE ${label}] Capping order ${requestedShares} -> ${stillNeeded} shares (on-chain has ${alreadyCovered}/${targetCoverage}, avoiding over-hedge).`);
+        _onChainBalLastLogged.set(k, { value: stillNeeded, ts: now });
+      }
       return stillNeeded;
     }
     return requestedShares;
@@ -2027,16 +2078,13 @@ export async function runHedgeCycle(state: HedgeState, clobBase: string): Promis
     // FOK failed -> wallet shows 9 but only trade 1 owns them).
     if (sharesNeeded > 0 && !DRY_RUN) {
       try {
-        let pmHeld = await Promise.race([
-          getOnChainBalanceWithFallback(pos.pmLeg.tokenId),
-          new Promise<number>((_, rej) => setTimeout(() => rej(new Error("balance-timeout")), 10_000)),
-        ]);
+        let pmHeld = await getCachedOnChainBalance(pos.pmLeg.tokenId);
         if (pmHeld < 0) {
           const positions = await fetchPmPositionsCached(0);
           pmHeld = sumPmHeld(positions, pos.pmLeg.tokenId);
           console.log(`  [HEDGE] On-chain RPC failed, data-api fallback: ${pmHeld}x ${pos.pmLeg.outcome}`);
         } else {
-          console.log(`  [HEDGE] On-chain balance: ${pmHeld}x ${pos.pmLeg.outcome} (token ${pos.pmLeg.tokenId.slice(0,16)}...)`);
+          logOnChainBalanceThrottled(pos.pmLeg.tokenId, pmHeld, pos.pmLeg.outcome);
         }
         // Subtract shares already attributed to other trades on this same PM token
         const otherTradesShares = loadArbTrades()
