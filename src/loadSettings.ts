@@ -78,9 +78,18 @@ function locateSettingsFile(): string | null {
       if (eq < 1) continue;
       const key = line.slice(0, eq).trim();
       let value = line.slice(eq + 1).trim();
-      if ((value.startsWith('"') && value.endsWith('"')) ||
-          (value.startsWith("'") && value.endsWith("'"))) {
+      const wasQuoted =
+        (value.startsWith('"') && value.endsWith('"')) ||
+        (value.startsWith("'") && value.endsWith("'"));
+      if (wasQuoted) {
         value = value.slice(1, -1);
+      } else {
+        // Strip trailing inline comments: `FORCE_DISCOVER=true   # note`.
+        // The `#` must be preceded by whitespace to avoid truncating values
+        // that legitimately contain `#` (URLs, hashes, passwords). Quoted
+        // values are left untouched above.
+        const commentIdx = value.search(/\s#/);
+        if (commentIdx >= 0) value = value.slice(0, commentIdx).trim();
       }
       if (isShellSet(key)) { skipped++; continue; } // real shell var wins
       // Either unset OR banner-set — settings.txt overrides both
