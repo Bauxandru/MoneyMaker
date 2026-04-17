@@ -855,6 +855,13 @@ async function verifyPmFillPrice(
 // Per-position lock to prevent concurrent hedge cycles placing duplicate orders
 const _hedgeCycleLocks = new Set<string>();
 
+// Throttled logging for orphan positions (empty kalTicker or pmTokenId).
+// Orphan `arb-backfill-*` trades for markets without a cross-exchange counterpart
+// (e.g. PM-only political markets, Kalshi-only Fed-decision tickers) can't be
+// hedged. Without throttling, each skip spams the log once per cycle.
+const _missingLegLogAt = new Map<string, number>();
+const MISSING_LEG_LOG_INTERVAL_MS = 60 * 60 * 1000; // 1h
+
 // Per-position cooldown after PM GTC "crosses the book" — the book has moved such that
 // our maker breakeven-capped bid is marketable, but a taker FAK would bust breakeven.
 // Back off so we stop spamming the CLOB each cycle until the book drifts back.
@@ -909,6 +916,27 @@ export async function runHedgeCycle(state: HedgeState, clobBase: string): Promis
   _hedgeLogCounter++;
 
   if (pos.sharesHeld <= 0) return;
+
+  // DATA-FIRST INVARIANT: orphan positions with missing leg identifiers can't be
+  // hedged. Running the cycle for them burns CLOB/on-chain API calls that always
+  // fail ("Invalid token id", "PM ask fetch returned null for unknown"), spams
+  // the logs, and contributes to slow cycles. Skip silently; log once per hour
+  // so the user still knows these positions exist and need Discovery pairing.
+  const missingKal = !pos.kalLeg?.ticker || pos.kalLeg.ticker.trim() === "";
+  const missingPm = !pos.pmLeg?.tokenId || pos.pmLeg.tokenId.trim() === "";
+  if (missingKal || missingPm) {
+    const now = Date.now();
+    const lastLog = _missingLegLogAt.get(pos.tradeId) ?? 0;
+    if (now - lastLog > MISSING_LEG_LOG_INTERVAL_MS) {
+      const missing = missingKal && missingPm ? "kalTicker+pmTokenId" : missingKal ? "kalTicker" : "pmTokenId";
+      console.warn(
+        `[HEDGE] Skipping ${pos.tradeId} (${missing} empty) — orphan backfill without cross-exchange pair. ` +
+        `Needs Discovery pairing via ttWalletFirst.pairOrphanBackfills or manual sell.`
+      );
+      _missingLegLogAt.set(pos.tradeId, now);
+    }
+    return;
+  }
 
   // Prevent concurrent hedge cycles for the same position
   if (_hedgeCycleLocks.has(pos.tradeId)) return;
@@ -1160,6 +1188,26 @@ export async function runHedgeCycle(state: HedgeState, clobBase: string): Promis
   // Collect counterpart cancellations here to avoid mutating the map mid-iteration
   const toCancel: Array<{ oid: string; ho: HedgeOrder }> = [];
 
+  // Pre-fetch all PM order statuses in PARALLEL. Previously the loop below awaited
+  // each getPmOrderFills sequentially. When PM's CLOB API is slow, a single 30s
+  // timeout × N orders = 30N seconds of main-loop stall (observed: 70s cycles with
+  // 3 stuck orders). Pre-fetching in parallel bounds the wait to one timeout.
+  // The loop below reads from this cache first; falls back to per-order await only
+  // if the pre-fetch failed (e.g. during a transient PM outage).
+  const pmStatusCache = new Map<string, { filledShares: number; status: string }>();
+  const pmOrders: Array<[string, HedgeOrder]> = [];
+  for (const [oid, ho] of activeOrders) {
+    if (ho.exchange === "pm" && !oid.startsWith("dry-")) pmOrders.push([oid, ho]);
+  }
+  if (pmOrders.length > 0) {
+    await Promise.all(pmOrders.map(async ([oid]) => {
+      try {
+        const result = await getPmOrderFills(oid);
+        pmStatusCache.set(oid, result);
+      } catch { /* handled inside the sequential loop below */ }
+    }));
+  }
+
   for (const [oid, ho] of activeOrders) {
     // Skip dry-run order IDs -- they're fake and will fail API calls
     if (oid.startsWith("dry-")) { activeOrders.delete(oid); continue; }
@@ -1184,7 +1232,12 @@ export async function runHedgeCycle(state: HedgeState, clobBase: string): Promis
       let orderDone = false;
 
       if (ho.exchange === "pm") {
-        const { filledShares: f, status } = await getPmOrderFills(oid);
+        // Use pre-fetched status from the parallel batch above when available.
+        // Falls back to a per-order await only when the pre-fetch failed for this
+        // specific orderId (e.g. transient CLOB error). This preserves the existing
+        // error-handling path (fetchFailures counter, status-check warnings).
+        const cached = pmStatusCache.get(oid);
+        const { filledShares: f, status } = cached ?? await getPmOrderFills(oid);
         const clobDelta = Math.max(0, f - ho.filledSoFar);
         if (clobDelta > 0 && ho.role === "complete") {
           // CLOB says matched — verify on-chain before crediting.
