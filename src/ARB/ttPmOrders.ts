@@ -14,7 +14,7 @@ import { getOnChainBalance, getUsdcBalance } from "../polyChain.js";
 import { waitForPmFillWs, isPmUserWsReady } from "./ttWebSocket.js";
 import {
   kalFetch, polyClobFetch, polyClobFetchHot, hotRetryOpts,
-  PM_ORDER_TYPE, PM_MARKETABLE_MIN_VALUE,
+  PM_MARKETABLE_MIN_VALUE,
 } from "./ttConfig.js";
 import type {
   KalshiMarket, PmOrderResponse, ClobBookEntry, WatchEntry,
@@ -115,24 +115,28 @@ export async function placePmGTCBid(
   ), PM_ORDER_TIMEOUT_MS, "placePmGTCBid");
 }
 
-export async function placePmFOK(
+/** Place a PM taker BUY as FAK (Fill-And-Kill).
+ *  FAK fills as much as the book has at our price, cancels the rest. We use FAK
+ *  (not FOK) because FOK rejects the entire order when the book is 1 share short
+ *  — a common occurrence on fractional PM books (e.g. 10.75 of 11 available).
+ *  Over-fills from FAK are a known acceptable behavior (see memory note
+ *  `feedback_pm_fak_overfills`). DO NOT CHANGE TO FOK. */
+export async function placePmFAK(
   tokenId: string, price: number, shares: number,
   tickSize: number, negRisk: boolean, dryRun: boolean
 ): Promise<unknown> {
-  // FAK (Fill And Kill): fills as much as possible, cancels remainder.
-  // Better than FOK which kills the ENTIRE order if not 100% fillable.
-  // Avoids pm-delayed-zero failures when book has 10.75 of 11 shares.
   if (dryRun) return { dryRun: true, tokenId: tokenId.slice(0, 12) + "...", price, shares, type: "FAK" };
   const { client } = await createPmClient();
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   return withTimeout((client.createAndPostOrder as any)(
     { tokenID: tokenId, price: pmSafePrice(price, shares), size: shares, side: Side.BUY },
     { tickSize: tickSize.toString(), negRisk },
-    OrderType.FAK
-  ), PM_ORDER_TIMEOUT_MS, "placePmFOK");
+    OrderType.FAK  // HARDCODED — PM_ORDER_TYPE config is ignored on purpose
+  ), PM_ORDER_TIMEOUT_MS, "placePmFAK");
 }
 
-export async function placePmFOKSell(
+/** Place a PM taker SELL as FAK (Fill-And-Kill). See `placePmFAK` for rationale. */
+export async function placePmFAKSell(
   tokenId: string, price: number, shares: number,
   tickSize: number, negRisk: boolean, dryRun: boolean
 ): Promise<unknown> {
@@ -142,8 +146,8 @@ export async function placePmFOKSell(
   return withTimeout((client.createAndPostOrder as any)(
     { tokenID: tokenId, price: pmSafePrice(price, shares), size: shares, side: Side.SELL },
     { tickSize: tickSize.toString(), negRisk },
-    OrderType.FAK
-  ), PM_ORDER_TIMEOUT_MS, "placePmFOKSell");
+    OrderType.FAK  // HARDCODED — see placePmFAK
+  ), PM_ORDER_TIMEOUT_MS, "placePmFAKSell");
 }
 
 export async function cancelPmOrder(orderId: string, dryRun: boolean): Promise<void> {
@@ -312,11 +316,15 @@ export async function preSignPmOrder(
   );
 }
 
-/** Post a pre-signed PM order (Step 2). Submits to CLOB for matching. */
+/** Post a pre-signed PM order (Step 2). Submits to CLOB for matching.
+ *  HARDCODED to FAK — see placePmFAK for rationale. The PM_ORDER_TYPE config
+ *  constant is deliberately NOT referenced here so no env var can accidentally
+ *  flip this back to FOK (which would cause pm-delayed-zero failures on
+ *  fractional-shortfall books and break PARALLEL_MODE's speed assumption). */
 export async function postPreSignedPmOrder(signedOrder: unknown): Promise<unknown> {
   const { client } = await createPmClient();
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  return (client as any).postOrder(signedOrder, PM_ORDER_TYPE);
+  return (client as any).postOrder(signedOrder, OrderType.FAK);
 }
 
 // --- PM order status polling --------------------------------------------------

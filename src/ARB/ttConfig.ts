@@ -100,12 +100,15 @@ export const KAL_MAKER_MODE = boolEnv("KAL_MAKER_MODE", false);
 export const KAL_MAKER_WAIT_MS = numEnv("KAL_MAKER_WAIT_MS", 5000);
 export const KAL_MAKER_POLL_MS = 500;
 
-// PM order type
-const PM_ORDER_TYPE_RAW = (process.env.POLY_ORDER_TYPE ?? "FOK").toUpperCase();
-export const PM_ORDER_TYPE: OrderType =
-  PM_ORDER_TYPE_RAW in OrderType
-    ? (OrderType as Record<string, OrderType>)[PM_ORDER_TYPE_RAW]
-    : OrderType.FOK;
+// PM taker order type is HARDCODED to FAK (Fill-And-Kill) across the bot.
+// FAK is strictly better than FOK for our workload: it fills whatever the book
+// can offer and cancels the remainder, instead of rejecting the whole order
+// when the book is 1 share short (a common fractional-PM book situation).
+// Over-fills from FAK are documented/accepted behavior (see memory note
+// `feedback_pm_fak_overfills` and Safety Invariant #4).
+// The `PM_ORDER_TYPE` constant is kept exported for backwards-compat (tests
+// mock it) but no runtime code path reads it — see ttPmOrders.ts.
+export const PM_ORDER_TYPE: OrderType = OrderType.FAK;
 
 // --- Rate-limited fetch helpers -----------------------------------------------
 

@@ -51,7 +51,7 @@ import {
 
 import {
   createPmClient, placePmOrder, placePmGTCAsk, placePmGTCBid,
-  placePmFOK, placePmFOKSell,
+  placePmFAK, placePmFAKSell,
   cancelPmOrder, cancelAllPmOrdersForToken,
   getPmOrderFills, preSignPmOrder, postPreSignedPmOrder,
   waitForPmOrderFill,
@@ -838,7 +838,7 @@ export async function executeArb(
         const oppAsk = await fetchPmAsk(pmOppLeg.tokenId, clobBase);
         if (oppAsk === null || oppAsk > maxOppPrice || unhedgedShares * oppAsk < PM_MARKETABLE_MIN_VALUE) return 0;
         console.log(`  [IMMEDIATE PM HEDGE] Buying ${unhedgedShares}×${pmOppLeg.outcome} @${fmtPct(oppAsk)} (breakeven=${fmtPct(maxOppPrice)})`);
-        const res = await placePmFOK(pmOppLeg.tokenId, oppAsk, unhedgedShares, pmOppLeg.tickSize, pmOppLeg.negRisk, DRY_RUN);
+        const res = await placePmFAK(pmOppLeg.tokenId, oppAsk, unhedgedShares, pmOppLeg.tickSize, pmOppLeg.negRisk, DRY_RUN);
         const meta = extractPmMeta(res);
         if (meta.status === "matched") {
           console.log(`  [IMMEDIATE PM HEDGE] Filled ${unhedgedShares}×${pmOppLeg.outcome} @${fmtPct(oppAsk)} — hedge complete on PM.`);
@@ -1389,7 +1389,7 @@ export async function executeArb(
             const _tParallel = performance.now();
             const [kalRes, pmRes] = await Promise.allSettled([
               placeKalshiOrder(kalIOCOrder, false),
-              placePmFOK(pmLeg.tokenId, parallelPmPrice, shares, pmLeg.tickSize, pmLeg.negRisk, false),
+              placePmFAK(pmLeg.tokenId, parallelPmPrice, shares, pmLeg.tickSize, pmLeg.negRisk, false),
             ]);
             const parallelMs = performance.now() - _tParallel;
             console.log(`  [PARALLEL] Both legs returned in ${parallelMs.toFixed(0)}ms`);
@@ -1595,7 +1595,7 @@ export async function executeArb(
       let fokResult: unknown;
       let fokFailed = false;
       try {
-        fokResult = await placePmFOK(pmLeg.tokenId, pmOrderPrice, pmShares, pmLeg.tickSize, pmLeg.negRisk, false);
+        fokResult = await placePmFAK(pmLeg.tokenId, pmOrderPrice, pmShares, pmLeg.tickSize, pmLeg.negRisk, false);
       } catch (e) { fokResult = e; fokFailed = true; }
 
       if (fokFailed) {
@@ -2017,7 +2017,7 @@ export async function executeArb3Leg(
       // PM: FOK order
       console.log(`  [${legLabel}] PM FOK ${shares}×${leg.pmLeg.outcome} @${fmtPct(leg.price)}`);
       try {
-        const res = await placePmFOK(leg.pmLeg.tokenId, leg.price, shares, leg.pmLeg.tickSize, leg.pmLeg.negRisk, DRY_RUN);
+        const res = await placePmFAK(leg.pmLeg.tokenId, leg.price, shares, leg.pmLeg.tickSize, leg.pmLeg.negRisk, DRY_RUN);
         const meta = extractPmMeta(res);
         if (DRY_RUN) {
           console.log(`  [${legLabel}] PM DRY OK`);

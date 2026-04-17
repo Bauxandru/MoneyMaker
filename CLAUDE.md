@@ -145,7 +145,7 @@ Kalshi is executed first because:
 
 3. **On-chain verification is mandatory for PM fills.** After PM order, the bot checks on-chain balance (RPC), then falls back to CLOB API, then data-api positions. Do not skip or remove these checks — PM orders can silently fail or silently succeed (ghost fills).
 
-4. **FOK order type on PM.** PM uses Fill-Or-Kill (`OrderType.FOK`). This prevents partial fills that would leave mismatched position sizes. The CLOB also supports FAK (Fill-And-Kill) which allows partials — do not switch to FAK without understanding the hedge implications.
+4. **FAK order type on PM (HARDCODED).** All PM taker order placements — `placePmFAK`, `placePmFAKSell`, `placePmOrder`, `postPreSignedPmOrder` — send `OrderType.FAK` (Fill-And-Kill). FAK fills as much as the book can match at our price and cancels the rest. **We do not use FOK** because FOK rejects the entire order when the book is even 1 share short — a common situation on fractional PM books (e.g. 10.75 of 11 available), causing `pm-delayed-zero` failures and missed arbs. The `OrderType.FAK` argument is hardcoded in the function bodies; the `PM_ORDER_TYPE` config constant is ignored on the hot path so no env var can accidentally flip it back to FOK. Partial-fill over-fills from FAK are documented/accepted behavior (see memory note `feedback_pm_fak_overfills`) — the hedge cycle handles remainders. When debugging a "wallet has more shares than journal" situation, check FAK over-fill FIRST before assuming a ghost fill.
 
 5. **Rate limiters must wrap every API call.** Every exchange API call must go through the rate-limited fetchers (`kalFetch`, `kalFetchHedge`, `polyFetch`, `polyClobFetch`). Raw `fetch()` calls will trigger 429 rate limit bans.
 

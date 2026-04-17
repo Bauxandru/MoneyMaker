@@ -233,7 +233,7 @@ const PM_ORDER_TYPE_RAW = (process.env.POLY_ORDER_TYPE ?? "FOK").toUpperCase();
 const PM_ORDER_TYPE: OrderType =
   PM_ORDER_TYPE_RAW in OrderType
     ? (OrderType as Record<string, OrderType>)[PM_ORDER_TYPE_RAW]
-    : OrderType.FOK;
+    : OrderType.FAK;
 
 // Disable system proxy
 for (const k of ["HTTP_PROXY","HTTPS_PROXY","ALL_PROXY","http_proxy","https_proxy","all_proxy"])
@@ -3284,7 +3284,7 @@ async function placePmFOK(
   return (client.createAndPostOrder as any)(
     { tokenID: tokenId, price: pmSafePrice(price, shares), size: shares, side: Side.BUY },
     { tickSize: tickSize.toString(), negRisk },
-    OrderType.FOK
+    OrderType.FAK
   );
 }
 
@@ -3305,7 +3305,7 @@ async function placePmFOKSell(
   return (client.createAndPostOrder as any)(
     { tokenID: tokenId, price: pmSafePrice(price, shares), size: shares, side: Side.SELL },
     { tickSize: tickSize.toString(), negRisk },
-    OrderType.FOK
+    OrderType.FAK
   );
 }
 

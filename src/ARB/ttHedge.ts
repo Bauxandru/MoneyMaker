@@ -104,8 +104,8 @@ import {
   createPmClient,
   placePmGTCBid,
   placePmGTCAsk,
-  placePmFOK,
-  placePmFOKSell,
+  placePmFAK,
+  placePmFAKSell,
   cancelPmOrder,
   cancelAllPmOrdersForToken,
   getPmOrderFills,
@@ -633,7 +633,7 @@ export async function handleCancelledPosition(
         console.log(`[CANC-MON] EMERGENCY SELL PM: ${pmHeld}x ${pos.pmOutcome} @ ${fmtPct(sellPrice)} (FOK into bids)`);
         if (!DRY_RUN) {
           try {
-            await placePmFOKSell(pos.pmTokenId, sellPrice, pmHeld, pos.tickSize, pos.negRisk, false);
+            await placePmFAKSell(pos.pmTokenId, sellPrice, pmHeld, pos.tickSize, pos.negRisk, false);
             pmRevenue = pmHeld * sellPrice;
           } catch (err) {
             console.error(`[CANC-MON] PM sell failed: ${(err as Error).message}`);
@@ -743,7 +743,7 @@ export async function handleCancelledPosition(
       let result: unknown;
       if (useAggressive) {
         // Aggressive: FOK sell into existing bids -- fills instantly or fails
-        result = await placePmFOKSell(pos.pmTokenId, sellPrice, actualShares, pos.tickSize, pos.negRisk, false);
+        result = await placePmFAKSell(pos.pmTokenId, sellPrice, actualShares, pos.tickSize, pos.negRisk, false);
       } else {
         // Passive: GTC ask resting at 50c -- waits for buyers
         result = await placePmGTCAsk(pos.pmTokenId, sellPrice, actualShares, pos.tickSize, pos.negRisk, false);
@@ -1605,7 +1605,7 @@ export async function runHedgeCycle(state: HedgeState, clobBase: string): Promis
       const maxOppPriceTaker = maxOppPrice - pmTakerFeeAtAsk; // tighter limit for taker IOC
       if (oppCurrentAsk !== null && oppCurrentAsk <= maxOppPriceTaker && sharesNeeded * oppCurrentAsk >= PM_MARKETABLE_MIN_VALUE) {
         try {
-          const res = await placePmFOK(pos.pmOppLeg.tokenId, oppCurrentAsk, sharesNeeded, pos.pmOppLeg.tickSize, pos.pmOppLeg.negRisk, DRY_RUN);
+          const res = await placePmFAK(pos.pmOppLeg.tokenId, oppCurrentAsk, sharesNeeded, pos.pmOppLeg.tickSize, pos.pmOppLeg.negRisk, DRY_RUN);
           const meta = extractPmMeta(res);
           let filled = 0;
           if (DRY_RUN) {
@@ -2277,7 +2277,7 @@ export async function runHedgeCycle(state: HedgeState, clobBase: string): Promis
       }
       if (pmCurrentAsk !== null && pmCurrentAsk <= maxPmPriceTaker && sharesNeeded * pmCurrentAsk >= PM_MARKETABLE_MIN_VALUE) {
         try {
-          const res = await placePmFOK(pos.pmLeg.tokenId, pmCurrentAsk, sharesNeeded, pos.pmLeg.tickSize, pos.pmLeg.negRisk, DRY_RUN);
+          const res = await placePmFAK(pos.pmLeg.tokenId, pmCurrentAsk, sharesNeeded, pos.pmLeg.tickSize, pos.pmLeg.negRisk, DRY_RUN);
           if (isPm425(res)) { markPmDown(); }
           else {
             markPmUp();

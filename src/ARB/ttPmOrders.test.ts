@@ -5,7 +5,7 @@ vi.mock("./ttConfig.js", () => ({
   kalFetch: vi.fn(),
   polyClobFetch: vi.fn(),
   retryOpts: {},
-  PM_ORDER_TYPE: "FOK",
+  PM_ORDER_TYPE: "FAK",
   PM_MARKETABLE_MIN_VALUE: 1.0,
 }));
 
