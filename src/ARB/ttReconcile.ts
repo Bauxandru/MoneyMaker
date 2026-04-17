@@ -414,7 +414,15 @@ export async function postResolutionFillAudit(kalTicker: string, tradeId: string
     trade.kalFees = correctedKalFees;
 
     // Recalculate totalCost from corrected values.
-    const correctedTotalCost = Math.round((correctedKalCost + correctedKalFees + (trade.pmCost ?? 0)) * 100) / 100;
+    // CRITICAL: include hedgeCost when one leg's cost is 0 — this is the
+    // PM-hedge-via-PM-opposite (and KAL-hedge-via-KAL-opposite) case where the
+    // "missing" leg's payout was actually achieved via an opposite-outcome buy
+    // recorded under hedgeCost. Dropping it understates total cost and inflates
+    // P&L by the entire hedge cost (e.g. trade looks like +$7.92 instead of +$0.09).
+    const _hcAuditAdd = (((trade.pmCost ?? 0) === 0 || correctedKalCost === 0) && (trade.hedgeCost ?? 0) > 0)
+      ? (trade.hedgeCost ?? 0)
+      : 0;
+    const correctedTotalCost = Math.round((correctedKalCost + correctedKalFees + (trade.pmCost ?? 0) + _hcAuditAdd) * 100) / 100;
     trade.totalCost = correctedTotalCost;
     // Only recalculate P&L for both-legs and hedge-complete (payout = shares).
     // Settlement P&L depends on who won — the resolve code already computed it correctly.
@@ -554,6 +562,33 @@ export async function repairPmCostsFromClob(trades: ArbTradeRecord[]): Promise<{
   return { repaired, changed };
 }
 
+/** Compute the over-hedge layer's net P&L contribution: payout − cost.
+ *  Over-hedge arises when the consolidation reconciler caps arbShares at primary.shares
+ *  but the exchange holds more shares than were hedged. Those naked shares pay $1 if
+ *  their side wins at settlement, $0 otherwise. Returns 0 when the layer is absent or
+ *  when we can't determine settlement yet. */
+async function computeOverHedgeDelta(
+  trade: ArbTradeRecord,
+  settlementByTicker: Map<string, KalSettlement>
+): Promise<number> {
+  const ohShares = Number(trade.overHedgeShares ?? 0);
+  const ohCost = Number(trade.overHedgeCost ?? 0);
+  const ohSide = trade.overHedgeSide;
+  if (ohShares <= 0 || ohCost <= 0 || (ohSide !== "yes" && ohSide !== "no")) return 0;
+  if (!trade.kalTicker) return 0;
+  let result = settlementByTicker.get(trade.kalTicker)?.marketResult ?? "";
+  if (!result) {
+    try {
+      const mkt = await fetchKalshiMarket(trade.kalTicker);
+      result = String(mkt.result ?? "").toLowerCase();
+    } catch { return 0; }
+  }
+  if (!result) return 0;
+  const ohSideWon = (ohSide === "yes" && result === "yes") || (ohSide === "no" && result === "no");
+  const ohPayout = ohSideWon ? ohShares : 0;
+  return Math.round((ohPayout - ohCost) * 100) / 100;
+}
+
 /** (d) Verify and fix P&L for all resolved trades. Mutates trades in place. */
 export async function verifyAndFixPnl(
   trades: ArbTradeRecord[],
@@ -580,8 +615,11 @@ export async function verifyAndFixPnl(
       // include hedge fills) varies by initialExchange and hedge path. Recomputing here
       // with heuristics causes double-counting that turns profits into losses.
       // Only verify the basic invariant: pnl should equal shares - totalCost.
+      // Over-hedge contribution: naked shares beyond the arb layer cost real money on the
+      // exchange but sit outside totalCost. Fold them into P&L when we know the settlement.
+      const oh = await computeOverHedgeDelta(trade, settlementByTicker);
       const payout = trade.shares;
-      const expectedPnl = Math.round((payout - trade.totalCost) * 100) / 100;
+      const expectedPnl = Math.round((payout - trade.totalCost + oh) * 100) / 100;
       if (trade.realizedPnl != null && Math.abs(trade.realizedPnl - expectedPnl) > 0.03) {
         correctPnl = expectedPnl;
       } else {
@@ -617,7 +655,8 @@ export async function verifyAndFixPnl(
         const pmPayout = unhedgedPmPayout;
         // kalCost may or may not include kalFees (post-audit separates them).
         // Always subtract kalFees explicitly to handle both cases safely.
-        correctPnl = kalPayout + pmPayout - trade.kalCost - (trade.kalFees ?? 0) - hcS - trade.pmCost;
+        const oh = await computeOverHedgeDelta(trade, settlementByTicker);
+        correctPnl = kalPayout + pmPayout - trade.kalCost - (trade.kalFees ?? 0) - hcS - trade.pmCost + oh;
       }
       const hcS2 = ((trade.pmCost === 0 || trade.kalCost === 0) && (trade.hedgeCost ?? 0) > 0) ? (trade.hedgeCost ?? 0) : 0;
       trade.totalCost = Math.round((trade.kalCost + (trade.kalFees ?? 0) + hcS2 + trade.pmCost) * 100) / 100;
@@ -663,6 +702,235 @@ export function writeReconcileAudit(trades: ArbTradeRecord[]): void {
     if (entries.length > 200) entries = entries.slice(entries.length - 200);
     atomicWriteFileSync(auditPath, JSON.stringify(entries, null, 2));
     console.log(`[RECONCILE] Audit: ${auditChanges.length} field changes logged.`);
+  }
+}
+
+/** Auto-backfill: create synthetic arb-backfill-* records for any on-chain position
+ *  (Kalshi + Polymarket) that has no matching journal entry. Runs at bot startup so
+ *  the reconciler, sessionSkipSet seed, and hedge cycles immediately see every
+ *  orphan position. Creates data/arb_trades.json backup before writing. */
+export async function autoBackfillUntracked(): Promise<{ pmAdded: number; kalAdded: number }> {
+  try {
+    const { loadArbTrades } = await import("./ttPersistence.js");
+    const trades = loadArbTrades();
+    const knownPmTokens = new Set<string>();
+    const knownKalTickers = new Set<string>();
+    const cutoff = Date.now() - 7 * 86_400_000;
+    for (const t of trades) {
+      if (t.pmTokenId) knownPmTokens.add(t.pmTokenId);
+      const ts = new Date(t.ts ?? 0).getTime();
+      if (t.kalTicker && (t.status === "hedging" || t.status === "filled" || (t.status === "resolved" && ts >= cutoff))) {
+        knownKalTickers.add(t.kalTicker);
+      }
+    }
+    const nowIso = () => new Date().toISOString();
+    const isSettled = (endDate: string) => {
+      if (!endDate) return false;
+      const t = Date.parse(endDate);
+      return Number.isFinite(t) && t < Date.now() - 3 * 3600_000;
+    };
+
+    const added: ArbTradeRecord[] = [];
+    // PM positions
+    try {
+      const pmPositions = await fetchPmPositionsCached(0) as Array<Record<string, unknown>>;
+      for (const p of pmPositions) {
+        const tid = pickString(p.asset ?? p.tokenId ?? p.conditionId ?? "");
+        const sz = Math.round(Number(p.size ?? p.amount ?? 0));
+        if (!tid || sz < 1 || knownPmTokens.has(tid)) continue;
+        const slug = pickString(p.slug ?? "");
+        const outcome = pickString(p.outcome ?? "");
+        const title = pickString(p.title ?? p.eventSlug ?? "");
+        const avgPx = Number(p.avgPrice ?? 0) || 0.5;
+        const currentValue = Number(p.currentValue ?? 0) || 0;
+        const endDate = pickString(p.endDate ?? p.end_date_iso ?? "");
+        const pmCost = Math.round(sz * avgPx * 100) / 100;
+        const settled = isSettled(endDate);
+        const realizedPnl = settled ? Math.round((currentValue - pmCost) * 100) / 100 : 0;
+        added.push({
+          id: `arb-backfill-pm-${tid.slice(0, 12)}-${Date.now()}-${added.length}`,
+          ts: nowIso(),
+          match: title || slug || "unknown",
+          dir: "A",
+          status: settled ? "resolved" : "hedging",
+          shares: sz,
+          kalTicker: "",
+          kalFillPrice: 0,
+          kalCost: 0,
+          pmOutcome: outcome || "unknown",
+          pmSlug: slug,
+          pmTokenId: tid,
+          pmFillPrice: Math.round(avgPx * 10000) / 10000,
+          pmCost,
+          totalCost: pmCost,
+          projectedEdge: 0,
+          projectedProfit: 0,
+          initialExchange: "pm",
+          pmFees: 0,
+          kalFees: 0,
+          resolutionMethod: settled ? "settlement" : undefined,
+          resolvedTs: settled ? nowIso() : undefined,
+          realizedPnl: settled ? realizedPnl : undefined,
+          resolutionNote: `auto-backfill-pm: avg=${avgPx.toFixed(3)} nowVal=$${currentValue.toFixed(2)} endDate=${endDate.slice(0, 10)}`,
+          serverId: "auto-backfill",
+        });
+      }
+    } catch (e) { console.warn(`[AUTO-BACKFILL] PM positions fetch failed: ${(e as Error).message}`); }
+    const pmAdded = added.length;
+
+    // KAL positions
+    try {
+      const kalMap = await getKalshiPositionMap();
+      for (const [ticker, p] of kalMap) {
+        const total = (p.yesCount || 0) + (p.noCount || 0);
+        if (total < 1 || knownKalTickers.has(ticker)) continue;
+        const kalPxCents = p.avgPriceCents || 50;
+        const kalPx = kalPxCents / 100;
+        const kalCost = Math.round(total * kalPx * 100) / 100;
+        added.push({
+          id: `arb-backfill-kal-${ticker.slice(0, 36)}-${Date.now()}-${added.length}`,
+          ts: nowIso(),
+          match: `(untracked) ${ticker}`,
+          dir: "A",
+          status: "hedging",
+          shares: total,
+          kalTicker: ticker,
+          kalFillPrice: Math.round(kalPx * 10000) / 10000,
+          kalCost,
+          pmOutcome: "unknown",
+          pmSlug: "",
+          pmTokenId: undefined,
+          pmFillPrice: 0,
+          pmCost: 0,
+          totalCost: kalCost,
+          projectedEdge: 0,
+          projectedProfit: 0,
+          initialExchange: "kal",
+          kalFees: 0,
+          pmFees: 0,
+          resolutionNote: `auto-backfill-kal: yes=${p.yesCount} no=${p.noCount} avgCents=${kalPxCents}`,
+          serverId: "auto-backfill",
+        });
+      }
+    } catch (e) { console.warn(`[AUTO-BACKFILL] Kalshi positions fetch failed: ${(e as Error).message}`); }
+    const kalAdded = added.length - pmAdded;
+
+    if (added.length === 0) {
+      console.log(`[AUTO-BACKFILL] No untracked positions — journal already in sync with wallets.`);
+      return { pmAdded: 0, kalAdded: 0 };
+    }
+
+    const { saveArbTrades } = await import("./ttPersistence.js");
+    const out = [...trades, ...added];
+    const backupPath = path.join(process.env.DASHBOARD_DATA_ROOT ?? ".", "data", `arb_trades.json.bak-autobackfill-${Date.now()}`);
+    try { fs.copyFileSync(path.join(process.env.DASHBOARD_DATA_ROOT ?? ".", "data", "arb_trades.json"), backupPath); } catch { /* missing backup non-fatal */ }
+    saveArbTrades(out);
+    console.log(`[AUTO-BACKFILL] Added ${added.length} synthetic records (${pmAdded} PM + ${kalAdded} KAL). Backup: ${backupPath}`);
+    return { pmAdded, kalAdded };
+  } catch (e) {
+    console.error(`[AUTO-BACKFILL] error: ${(e as Error).message}`);
+    return { pmAdded: 0, kalAdded: 0 };
+  }
+}
+
+/** Wallet-vs-journal diff — catches positions that exist on-chain but are either
+ *  over-hedged (live shares > journal) or untracked (no journal entry). Writes
+ *  findings to data/wallet_journal_diff.json and logs [RECONCILE-DIFF] warnings.
+ *  Safe to call periodically — read-only on exchanges, append-only on the diff file. */
+export async function runWalletJournalDiff(): Promise<void> {
+  try {
+    const { loadArbTrades } = await import("./ttPersistence.js");
+    const trades = loadArbTrades();
+    const cutoff = Date.now() - 7 * 86_400_000;
+    const relevant = trades.filter(t => {
+      const ts = new Date(t.ts ?? 0).getTime();
+      return t.status === "hedging" || t.status === "filled" ||
+             (t.status === "resolved" && ts >= cutoff);
+    });
+    const byKalTicker = new Map<string, { journalShares: number; ohShares: number; ids: string[] }>();
+    for (const t of relevant) {
+      if (!t.kalTicker) continue;
+      const a = byKalTicker.get(t.kalTicker) ?? { journalShares: 0, ohShares: 0, ids: [] };
+      a.journalShares += t.shares || 0;
+      a.ohShares += Number(t.overHedgeShares ?? 0);
+      a.ids.push(t.id);
+      byKalTicker.set(t.kalTicker, a);
+    }
+    const byPmToken = new Map<string, { journalShares: number; ids: string[]; outcome?: string; slug?: string }>();
+    for (const t of relevant) {
+      if (!t.pmTokenId) continue;
+      const a = byPmToken.get(t.pmTokenId) ?? { journalShares: 0, ids: [], outcome: t.pmOutcome, slug: t.pmSlug };
+      a.journalShares += t.shares || 0;
+      a.ids.push(t.id);
+      byPmToken.set(t.pmTokenId, a);
+    }
+
+    const kalMap = await getKalshiPositionMap();
+    const pmPositions = await fetchPmPositionsCached(0);
+    const pmLive = new Map<string, number>();
+    for (const p of pmPositions as Array<Record<string, unknown>>) {
+      const tid = pickString(p.asset ?? p.tokenId ?? "");
+      const sz = Number(p.size ?? p.amount ?? 0);
+      if (tid && sz > 0) pmLive.set(tid, (pmLive.get(tid) ?? 0) + sz);
+    }
+
+    type Diff = { scope: "kal" | "pm"; key: string; kind: "over-live" | "under-live" | "untracked-live"; journal: number; live: number; delta: number; ids: string[]; outcome?: string; slug?: string };
+    const diffs: Diff[] = [];
+    const seenKal = new Set<string>();
+    for (const [ticker, a] of byKalTicker) {
+      seenKal.add(ticker);
+      const live = kalMap.get(ticker);
+      const liveTotal = (live?.yesCount ?? 0) + (live?.noCount ?? 0);
+      const expected = a.journalShares + a.ohShares;
+      const delta = liveTotal - expected;
+      if (Math.abs(delta) < 1) continue;
+      diffs.push({ scope: "kal", key: ticker, kind: delta > 0 ? "over-live" : "under-live", journal: a.journalShares, live: liveTotal, delta, ids: a.ids });
+    }
+    for (const [ticker, p] of kalMap) {
+      if (seenKal.has(ticker)) continue;
+      const live = (p.yesCount ?? 0) + (p.noCount ?? 0);
+      if (live > 0) diffs.push({ scope: "kal", key: ticker, kind: "untracked-live", journal: 0, live, delta: live, ids: [] });
+    }
+    const seenPm = new Set<string>();
+    for (const [tid, a] of byPmToken) {
+      seenPm.add(tid);
+      const live = pmLive.get(tid) ?? 0;
+      const delta = live - a.journalShares;
+      if (Math.abs(delta) < 1) continue;
+      diffs.push({ scope: "pm", key: tid, kind: delta > 0 ? "over-live" : "under-live", journal: a.journalShares, live, delta, ids: a.ids, outcome: a.outcome, slug: a.slug });
+    }
+    for (const [tid, live] of pmLive) {
+      if (seenPm.has(tid)) continue;
+      if (live < 1) continue;
+      diffs.push({ scope: "pm", key: tid, kind: "untracked-live", journal: 0, live, delta: live, ids: [] });
+    }
+
+    const critical = diffs.filter(d => d.kind === "over-live" || d.kind === "untracked-live");
+    if (critical.length > 0) {
+      console.warn(`[RECONCILE-DIFF] ${critical.length} critical discrepancies (over-live or untracked) — see data/wallet_journal_diff.json`);
+      for (const d of critical.slice(0, 10)) {
+        const id = d.slug ? `${d.slug}/${d.outcome ?? "?"}` : d.key;
+        console.warn(`  ${d.scope.toUpperCase()} ${d.kind} +${d.delta} | ${id.slice(0, 70)}`);
+      }
+    } else {
+      console.log(`[RECONCILE-DIFF] No critical discrepancies (${diffs.length} under-live entries from settled payouts).`);
+    }
+
+    const outPath = path.join(process.env.DASHBOARD_DATA_ROOT ?? ".", "data", "wallet_journal_diff.json");
+    atomicWriteFileSync(outPath, JSON.stringify({
+      ts: new Date().toISOString(),
+      summary: {
+        totalDiffs: diffs.length,
+        critical: critical.length,
+        kalOverLive: diffs.filter(d => d.scope === "kal" && d.kind === "over-live").length,
+        kalUntracked: diffs.filter(d => d.scope === "kal" && d.kind === "untracked-live").length,
+        pmOverLive: diffs.filter(d => d.scope === "pm" && d.kind === "over-live").length,
+        pmUntracked: diffs.filter(d => d.scope === "pm" && d.kind === "untracked-live").length,
+      },
+      diffs,
+    }, null, 2));
+  } catch (e) {
+    console.error(`[RECONCILE-DIFF] error: ${(e as Error).message}`);
   }
 }
 
@@ -873,6 +1141,22 @@ export async function reconcilePositions(trigger: string = "startup"): Promise<v
       primary.pmFillPrice = actualPmFillPrice;
       primary.totalCost = Math.round((cappedKalCost + cappedPmCost) * 100) / 100;
       primary.hedgeCost = undefined;
+      // Preserve the child metadata before deletion. Any child with a DIFFERENT
+      // pmTokenId than the primary represents a hedge-complete opposite-outcome buy
+      // — those on-chain shares must remain visible to reconcilers. Without this
+      // trail, the hedge-complete children get deleted and their PM tokens become
+      // untracked on-chain (see "113 DKC" incident 2026-04-15).
+      const childTrail: Array<{ id: string; pmTokenId?: string; pmCost: number; pmShares: number }> = [];
+      for (const g of group) {
+        if (g === primary) continue;
+        const gShares = g.shares || 0;
+        const gCost = g.pmCost || 0;
+        childTrail.push({ id: g.id, pmTokenId: g.pmTokenId, pmCost: gCost, pmShares: gShares });
+      }
+      if (childTrail.length > 0) {
+        const existing = primary.consolidatedChildren ?? [];
+        primary.consolidatedChildren = [...existing, ...childTrail];
+      }
       primary.kalYesFills = kalFillList.filter(f => f.side === "yes").reduce((s, f) => s + f.count, 0);
       primary.kalNoFills = kalFillList.filter(f => f.side === "no").reduce((s, f) => s + f.count, 0);
       // Track over-hedge excess cost

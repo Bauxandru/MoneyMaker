@@ -97,6 +97,12 @@ export type ArbTradeRecord = {
   // they will re-overwrite the verified values with heuristic matches.
   pnlVerified?: string;                 // ISO timestamp when record was verified against exchanges
   pnlVerifiedBy?: string;               // e.g. "rebuildPnLFromExchange"
+  // Consolidated-children trail -- when the reconciler merges duplicate trade records on the
+  // same kalTicker, it records the merged child IDs + their (pmTokenId, pmCost, shares) so
+  // the resulting primary can still be reconciled against every PM token that was bought.
+  // Without this, hedge-complete children (with pmOppLeg tokens) get deleted and those
+  // tokens become untracked on-chain — exactly the "113 DKC" class of bug.
+  consolidatedChildren?: Array<{ id: string; pmTokenId?: string; pmCost: number; pmShares: number }>;
 };
 
 // Shared CLOB trade type -- used by dashboard.ts and repairTrades.ts
