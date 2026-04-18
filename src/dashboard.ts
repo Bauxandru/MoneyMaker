@@ -15,7 +15,7 @@ import {
   type ExchangeEvent, type ComputedTradeRecord,
 } from "./ARB/ttEventLog.js";
 import WebSocket from "ws";
-import { fetchAllKalshiFills, fetchAllKalshiSettlements, fetchKalshiMarket, getKalshiPositionMap, type KalFill } from "./kalshiTrade.js";
+import { fetchAllKalshiFills, fetchAllKalshiSettlements, fetchKalshiMarket, fetchOpenKalshiOrders, getKalshiPositionMap, type KalFill } from "./kalshiTrade.js";
 import { ClobClient } from "@polymarket/clob-client";
 import { Wallet } from "@ethersproject/wallet";
 import { resolvePolyApiCreds } from "./polyAuth.js";
@@ -1743,6 +1743,96 @@ app.get("/api/wallet-arbs", async (_req, res) => {
 // POST /api/pm-redeem { conditionId, outcomeIndex, negRisk } → on-chain redeem
 // Both respect DRY_RUN=true by default (returns what-would-happen without sending).
 
+// Live open orders from both exchanges. Used by the Wallet Arbs tab to show
+// resting GTC bids from the hedge cycle alongside the paired-arbs view.
+app.get("/api/open-orders", async (_req, res) => {
+  try {
+    const [kalRaw, pmRaw] = await Promise.all([
+      fetchOpenKalshiOrders().catch(() => []),
+      (async () => {
+        try {
+          const { createPmClient } = await import("./ARB/ttPmOrders.js");
+          const { client } = await createPmClient();
+          const all = await (client as unknown as { getOpenOrders(p?: unknown): Promise<unknown[]> }).getOpenOrders({});
+          return Array.isArray(all) ? all : [];
+        } catch { return []; }
+      })(),
+    ]);
+    // Build kalTicker → match-name and pmTokenId → (matchName, outcome) lookups.
+    // Walk the watchlist FIRST — it indexes both pm1 and pm2 per entry, which matters for
+    // total markets where kal1.ticker === kal2.ticker (pair_history would lose one of the
+    // outcomes to overwrite). Then fall back to pair_history for older entries.
+    const matchNameByKalTicker = new Map<string, string>();
+    const pmTokenMeta = new Map<string, { matchName: string; outcome: string }>();
+    try {
+      const cachePath = join(ROOT, "discovery_cache.json");
+      if (existsSync(cachePath)) {
+        const wl = JSON.parse(readFileSync(cachePath, "utf8")).watchlist ?? [];
+        for (const w of wl) {
+          const name = `${w.kal1?.surname ?? ""} vs ${w.kal2?.surname ?? ""}`;
+          if (w.kal1?.ticker) matchNameByKalTicker.set(w.kal1.ticker, name);
+          if (w.kal2?.ticker) matchNameByKalTicker.set(w.kal2.ticker, name);
+          if (w.pm1?.tokenId) pmTokenMeta.set(w.pm1.tokenId, { matchName: name, outcome: String(w.pm1.outcome ?? "") });
+          if (w.pm2?.tokenId) pmTokenMeta.set(w.pm2.tokenId, { matchName: name, outcome: String(w.pm2.outcome ?? "") });
+        }
+      }
+    } catch { /* ignore */ }
+    try {
+      const { loadPairHistory } = await import("./ARB/ttPairHistory.js");
+      const hist = loadPairHistory();
+      for (const [kt, h] of hist) {
+        if (!matchNameByKalTicker.has(kt)) matchNameByKalTicker.set(kt, h.matchName);
+        if (h.pmTokenId && !pmTokenMeta.has(h.pmTokenId)) {
+          pmTokenMeta.set(h.pmTokenId, { matchName: h.matchName, outcome: h.pmOutcome });
+        }
+      }
+    } catch { /* ignore */ }
+
+    const kal = (kalRaw as Array<{ orderId: string; ticker: string; side: string; action: string; priceCents: number; remainingCount: number; status: string }>).map(o => ({
+      exchange: "kalshi",
+      orderId: o.orderId,
+      ticker: o.ticker,
+      matchName: matchNameByKalTicker.get(o.ticker) ?? "",
+      side: String(o.side ?? "").toUpperCase(),
+      action: String(o.action ?? "").toUpperCase(),
+      priceDollars: Math.round(((o.priceCents ?? 0) / 100) * 10000) / 10000,
+      remaining: o.remainingCount ?? 0,
+      status: o.status ?? "",
+    }));
+    const pm = (pmRaw as Array<Record<string, unknown>>).map(o => {
+      const assetId = String((o as any).asset_id ?? "");
+      const meta = pmTokenMeta.get(assetId);
+      const price = Number((o as any).price ?? 0);
+      // PM response shape: original_size + size_matched (no explicit remaining/size field).
+      const origSize = Number((o as any).original_size ?? 0);
+      const sizeMatched = Number((o as any).size_matched ?? 0);
+      const remaining = Math.max(0, origSize - sizeMatched);
+      return {
+        exchange: "polymarket",
+        orderId: String((o as any).id ?? (o as any).orderID ?? ""),
+        tokenId: assetId,
+        matchName: meta?.matchName ?? "",
+        outcome: meta?.outcome ?? String((o as any).outcome ?? ""),
+        side: String((o as any).side ?? "").toUpperCase(),
+        priceDollars: Math.round(price * 10000) / 10000,
+        remaining: Math.round(remaining * 100) / 100,
+        originalSize: Math.round(origSize * 100) / 100,
+        filled: Math.round(sizeMatched * 100) / 100,
+        totalDollars: Math.round(origSize * price * 100) / 100,
+        status: String((o as any).status ?? ""),
+      };
+    });
+    res.json({
+      ts: new Date().toISOString(),
+      totals: { kalshi: kal.length, polymarket: pm.length },
+      kal,
+      pm,
+    });
+  } catch (e) {
+    res.status(500).json({ error: (e as Error).message });
+  }
+});
+
 app.post("/api/pm-sell", async (req, res) => {
   try {
     const { sellPmAtMarket } = await import("./ARB/ttSettleClose.js");
@@ -2562,7 +2652,24 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
     <button class="audit-btn" id="walletArbsRefreshBtn" onclick="loadWalletArbs()" style="margin-left:12px">Refresh</button>
   </div>
   <div id="walletArbsTotals" style="margin:0 20px 10px;font-size:13px;color:#c9d1d9"></div>
-  <div class="section-title" style="font-size:13px">Paired arbs</div>
+  <!-- Live open/resting orders from both exchanges — hedge-cycle GTC bids typically appear here -->
+  <div class="section-title" style="font-size:13px">Open orders <span id="walletArbsOpenOrdersCount" style="font-size:11px;color:#8b949e;font-weight:normal"></span></div>
+  <table id="walletArbsOpenOrdersTable">
+    <thead>
+      <tr>
+        <th>Exch</th>
+        <th>Match / Outcome</th>
+        <th>Ticker / TokenId</th>
+        <th>Side</th>
+        <th>Price</th>
+        <th>Filled / Size</th>
+        <th>Total $</th>
+        <th>Order ID</th>
+      </tr>
+    </thead>
+    <tbody id="walletArbsOpenOrdersBody"><tr><td colspan="8" class="empty">--</td></tr></tbody>
+  </table>
+  <div class="section-title" style="font-size:13px;margin-top:24px">Paired arbs</div>
   <table id="walletArbsPairedTable">
     <thead>
       <tr>
@@ -3587,9 +3694,53 @@ async function pmRedeem(conditionId, outcomeIndex, negRisk) {
   } catch (e) { alert("REDEEM request failed: " + e.message); }
 }
 
+async function loadOpenOrders() {
+  try {
+    var r = await fetch("/api/open-orders");
+    var d = await r.json();
+    var count = (d.kal?.length || 0) + (d.pm?.length || 0);
+    $("walletArbsOpenOrdersCount").textContent = "(" + count + ")";
+    var body = $("walletArbsOpenOrdersBody");
+    if (count === 0) {
+      body.innerHTML = '<tr><td colspan="8" class="empty">No open orders</td></tr>';
+      return;
+    }
+    var rows = [];
+    (d.kal || []).forEach(function(o) {
+      rows.push('<tr>' +
+        '<td>KAL</td>' +
+        '<td>' + esc(o.matchName || "-") + (o.side ? ' <span style="color:#8b949e">(' + esc(o.side) + ')</span>' : '') + '</td>' +
+        '<td style="font-size:11px">' + esc(o.ticker) + '</td>' +
+        '<td>' + esc(o.action || "BUY") + '</td>' +
+        '<td>$' + (o.priceDollars || 0).toFixed(2) + '</td>' +
+        '<td>' + o.remaining + '</td>' +
+        '<td>$' + ((o.remaining || 0) * (o.priceDollars || 0)).toFixed(2) + '</td>' +
+        '<td style="font-size:10px;color:#8b949e">' + esc((o.orderId || "").slice(0, 12)) + '...</td>' +
+        '</tr>');
+    });
+    (d.pm || []).forEach(function(o) {
+      rows.push('<tr>' +
+        '<td>PM</td>' +
+        '<td>' + esc(o.matchName || "-") + ' / ' + esc(o.outcome || "-") + '</td>' +
+        '<td style="font-size:11px">' + esc((o.tokenId || "").slice(0, 18)) + '...</td>' +
+        '<td>' + esc(o.side || "BUY") + '</td>' +
+        '<td>$' + (o.priceDollars || 0).toFixed(2) + '</td>' +
+        '<td>' + (o.filled || 0).toFixed(2) + ' / ' + (o.originalSize || 0).toFixed(2) + '</td>' +
+        '<td>$' + (o.totalDollars || 0).toFixed(2) + '</td>' +
+        '<td style="font-size:10px;color:#8b949e">' + esc((o.orderId || "").slice(0, 12)) + '...</td>' +
+        '</tr>');
+    });
+    body.innerHTML = rows.join("");
+  } catch (e) {
+    $("walletArbsOpenOrdersBody").innerHTML = '<tr><td colspan="8" class="empty">Failed: ' + esc(e.message) + '</td></tr>';
+  }
+}
+
 async function loadWalletArbs() {
   var btn = $("walletArbsRefreshBtn");
   if (btn) btn.textContent = "Loading...";
+  // Kick the open-orders fetch in parallel — separate endpoint, don't block the main view.
+  loadOpenOrders();
   try {
     var res = await fetch("/api/wallet-arbs");
     var d = await res.json();
