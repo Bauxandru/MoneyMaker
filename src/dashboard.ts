@@ -15,7 +15,7 @@ import {
   type ExchangeEvent, type ComputedTradeRecord,
 } from "./ARB/ttEventLog.js";
 import WebSocket from "ws";
-import { fetchAllKalshiFills, fetchAllKalshiSettlements, fetchKalshiMarket, fetchOpenKalshiOrders, getKalshiPositionMap, type KalFill } from "./kalshiTrade.js";
+import { fetchAllKalshiFills, fetchAllKalshiSettlements, fetchKalshiMarket, fetchKalshiOrderbook, fetchOpenKalshiOrders, getKalshiPositionMap, type KalFill } from "./kalshiTrade.js";
 import { ClobClient } from "@polymarket/clob-client";
 import { Wallet } from "@ethersproject/wallet";
 import { resolvePolyApiCreds } from "./polyAuth.js";
@@ -1749,6 +1749,38 @@ app.get("/api/wallet-arbs", async (_req, res) => {
       row.kalStatus = mkt?.status ?? "";
     }
 
+    // For active unpaired-KAL rows, fetch the orderbook to compute the current market-sell
+    // price — what you'd realize per share if you hit "Sell at mkt" right now. For YES:
+    // best YES bid = 100 − best NO ask (Kalshi's two-sided convention). Same for NO side.
+    // Skipped for inactive markets (untradable anyway).
+    const kalSellLookups = unpairedKal
+      .filter(r => String(r.kalStatus || "").toLowerCase() === "active")
+      .map(r => r.ticker);
+    const kalSellPrices = new Map<string, { priceCents: number; available: number }>();
+    await Promise.all(kalSellLookups.map(async (ticker) => {
+      try {
+        const book = await fetchKalshiOrderbook(ticker);
+        // Book is sorted by price ascending; best ask = levels[0].
+        const row = unpairedKal.find(r => r.ticker === ticker);
+        if (!row) return;
+        const oppAsks = row.side === "yes" ? book.no : book.yes;
+        const bestOppAsk = oppAsks?.[0]?.[0];
+        const bestOppSize = oppAsks?.[0]?.[1];
+        if (bestOppAsk != null) {
+          kalSellPrices.set(ticker, {
+            priceCents: Math.max(1, 100 - Math.floor(bestOppAsk)),
+            available: Number(bestOppSize ?? 0),
+          });
+        }
+      } catch { /* network error — leave unset */ }
+    }));
+    for (const row of unpairedKal) {
+      const sp = kalSellPrices.get(row.ticker);
+      row.curSellPriceCents = sp?.priceCents ?? 0;
+      row.curSellAvailable = sp?.available ?? 0;
+      row.curSellValue = sp ? Math.round((sp.priceCents / 100) * row.shares * 100) / 100 : 0;
+    }
+
     // 4b. Build unpaired-PM rows with settlement classification.
     // pmStatus values:
     //   naked                   — PM shares, KAL market still active → genuinely unhedged
@@ -2940,8 +2972,8 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
   </table>
   <div class="section-title" style="font-size:13px;margin-top:24px">Unpaired Kalshi positions</div>
   <table id="walletArbsKalTable">
-    <thead><tr><th>Age</th><th>Match</th><th>Ticker</th><th>Side</th><th>Shares</th><th>Avg</th><th>Cost</th><th>KAL Status</th><th>Hedge</th><th>Actions</th></tr></thead>
-    <tbody id="walletArbsKalBody"><tr><td colspan="10" class="empty">--</td></tr></tbody>
+    <thead><tr><th>Age</th><th>Match</th><th>Ticker</th><th>Side</th><th>Shares</th><th>Avg</th><th>Cost</th><th title="Live best bid — what you'd realize per share at current market">Sell Px</th><th title="Cost vs current sell value — negative = loss if closed now">If sold now</th><th>KAL Status</th><th>Hedge</th><th>Actions</th></tr></thead>
+    <tbody id="walletArbsKalBody"><tr><td colspan="12" class="empty">--</td></tr></tbody>
   </table>
   <!-- PM positions split by settlement status. Each bucket renders into its own table. -->
   <div class="section-title" style="font-size:13px;margin-top:24px;color:#f85149">
@@ -4127,16 +4159,27 @@ async function loadWalletArbs() {
           '</tr>';
       }).join("");
     }
-    // Unpaired KAL (Sell button only shown when KAL market is still active/tradable)
+    // Unpaired KAL (Sell Px column shows live best-bid; Sell button only when active)
     var kb = $("walletArbsKalBody");
     if (!d.unpairedKal || d.unpairedKal.length === 0) {
-      kb.innerHTML = '<tr><td colspan="10" class="empty">No unpaired Kalshi positions</td></tr>';
+      kb.innerHTML = '<tr><td colspan="12" class="empty">No unpaired Kalshi positions</td></tr>';
     } else {
       kb.innerHTML = d.unpairedKal.map(function(r) {
         var sellable = String(r.kalStatus || "").toLowerCase() === "active";
         var sellBtnHtml = sellable
           ? '<button class="audit-btn" style="padding:2px 8px;font-size:11px" onclick="kalSellExit(\\'' + r.ticker + '\\', \\'' + r.side + '\\', ' + r.shares + ')">Sell at mkt</button>'
           : '<span style="font-size:11px;color:#6e7681" title="KAL market not tradable (status: ' + esc(r.kalStatus || "?") + ')">—</span>';
+        var sellPxHtml = '<span style="color:#6e7681">—</span>';
+        var sellPnlHtml = '<span style="color:#6e7681">—</span>';
+        if (sellable && r.curSellPriceCents) {
+          var availNote = r.curSellAvailable > 0 && r.curSellAvailable < r.shares
+            ? ' <span style="font-size:10px;color:#d29922" title="Only ' + r.curSellAvailable + ' shares available at this price">⚠ ' + r.curSellAvailable + '</span>'
+            : '';
+          sellPxHtml = (r.curSellPriceCents / 100).toFixed(2) + availNote;
+          var pnlIfSold = (r.curSellValue || 0) - r.cost;
+          var pnlColor = pnlIfSold >= 0 ? '#3fb950' : '#f85149';
+          sellPnlHtml = '<span style="color:' + pnlColor + '" title="$' + (r.curSellValue || 0).toFixed(2) + ' realized − $' + r.cost.toFixed(2) + ' cost">$' + pnlIfSold.toFixed(2) + '</span>';
+        }
         return '<tr>' +
           '<td>' + ageLabel(r.firstSeenAt) + '</td>' +
           '<td>' + esc(r.matchName || "—") + hedgeBadge(r.hedgeInfo) + '</td>' +
@@ -4145,6 +4188,8 @@ async function loadWalletArbs() {
           '<td>' + r.shares + '</td>' +
           '<td>' + r.avgPrice + '</td>' +
           '<td>$' + r.cost.toFixed(2) + '</td>' +
+          '<td>' + sellPxHtml + '</td>' +
+          '<td>' + sellPnlHtml + '</td>' +
           '<td style="font-size:11px">' + esc(r.kalStatus || "—") + '</td>' +
           '<td>' + (r.hedgeInfo ? '<span style="color:#3fb950;font-size:11px">hedging</span>' : '<span style="color:#8b949e;font-size:11px">—</span>') + '</td>' +
           '<td>' + sellBtnHtml + ' ' + ignoreBtn(r.ticker, null) + '</td>' +

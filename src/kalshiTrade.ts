@@ -346,32 +346,47 @@ export async function fetchKalshiMarket(ticker: string): Promise<Record<string, 
 
 // Fetches the full orderbook for a Kalshi market.
 // Returns ask levels as [priceCents, size][] sorted ascending (best ask first).
+//
+// Kalshi migrated to fractional-precision `orderbook_fp` with dollar-string prices —
+// falls back to the legacy `orderbook` integer-cents shape if the new field is absent.
 export async function fetchKalshiOrderbook(ticker: string): Promise<{ yes: [number, number][]; no: [number, number][] }> {
   const path = `/markets/${ticker}/orderbook`;
   const res = await kalshiSignedFetch("GET", path) as Record<string, unknown>;
-  const book = (res.orderbook as Record<string, unknown>) ?? res;
 
-  function parseBookLevels(side: unknown): [number, number][] {
+  function parseBookLevels(side: unknown, priceIsDollars: boolean): [number, number][] {
     if (!Array.isArray(side)) return [];
     const levels: [number, number][] = [];
     for (const entry of side) {
-      let price = 0, size = 0;
+      let priceRaw = 0, size = 0;
       if (Array.isArray(entry)) {
-        price = Number(entry[0] ?? 0);
+        priceRaw = Number(entry[0] ?? 0);
         size = Number(entry[1] ?? 0);
       } else if (entry && typeof entry === "object") {
         const o = entry as Record<string, unknown>;
-        price = Number(o.price ?? 0);
+        priceRaw = Number(o.price ?? 0);
         size = Number(o.quantity ?? o.size ?? 0);
       }
-      if (price > 0 && size > 0) levels.push([price, size]);
+      // Normalize to cents so callers always see integer-cents prices.
+      const priceCents = priceIsDollars ? Math.round(priceRaw * 100) : priceRaw;
+      if (priceCents > 0 && size > 0) levels.push([priceCents, size]);
     }
-    // Sort ascending by price (best ask = lowest)
     levels.sort((a, b) => a[0] - b[0]);
     return levels;
   }
 
-  return { yes: parseBookLevels(book.yes), no: parseBookLevels(book.no) };
+  // Prefer the newer orderbook_fp format (priceIsDollars=true). Fall back to legacy orderbook.
+  const fp = res.orderbook_fp as Record<string, unknown> | undefined;
+  if (fp && (Array.isArray(fp.yes_dollars) || Array.isArray(fp.no_dollars))) {
+    return {
+      yes: parseBookLevels(fp.yes_dollars, true),
+      no: parseBookLevels(fp.no_dollars, true),
+    };
+  }
+  const legacy = (res.orderbook as Record<string, unknown>) ?? res;
+  return {
+    yes: parseBookLevels(legacy.yes, false),
+    no: parseBookLevels(legacy.no, false),
+  };
 }
 
 // --- Portfolio data: fills + settlements (for reconciliation) ----------------
