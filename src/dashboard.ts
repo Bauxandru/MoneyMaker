@@ -1690,18 +1690,28 @@ app.get("/api/wallet-arbs", async (_req, res) => {
       const pmRedeemable = Boolean((p as any).redeemable);
       const curPrice = Number((p as any).curPrice ?? 0);
 
-      // PM-only hedge: user holds BOTH sides of this PM market (YES + NO tokens), so total
-      // payout is $1 regardless of outcome → not naked, effectively an arb with locked profit.
-      // PM data-api exposes `oppositeAsset` on each position — if that tokenId is also in
-      // our held set (pmByTokenId), mark this row as pm-only-hedged.
+      // PM-only hedge detection:
+      //   - Both outcomes of this PM market held = $1 combined payout IF sizes match.
+      //   - The opposite tokenId must NOT already be claimed by a paired arb row (usedPm),
+      //     otherwise the "locked profit" coverage is already counted there.
+      //   - Sizes within $2 tolerance → balanced (pm-only-hedged).
+      //     Size delta > $2 → directionally imbalanced (pm-only-imbalanced) — NOT locked profit.
       const oppositeAsset = String((p as any).oppositeAsset ?? "");
-      const pmOnlyHedged = Boolean(oppositeAsset && pmByTokenId.has(oppositeAsset));
+      const oppositePos = oppositeAsset ? pmByTokenId.get(oppositeAsset) : undefined;
+      const oppositeAvailable = Boolean(oppositePos && !usedPm.has(oppositeAsset));
+      const oppositeShares = oppositeAvailable ? Number(oppositePos?.size ?? 0) : 0;
+      const PM_ONLY_SIZE_TOLERANCE = 2;
+      let pmOnlyBucket: "balanced" | "imbalanced" | "none" = "none";
+      if (oppositeAvailable && oppositeShares > 0.5) {
+        pmOnlyBucket = Math.abs(shares - oppositeShares) <= PM_ONLY_SIZE_TOLERANCE ? "balanced" : "imbalanced";
+      }
 
-      let pmStatus: "naked" | "pm-only-hedged" | "settled-winner" | "settled-loser" | "kal-settled-pm-pending" | "no-pair" | "void";
+      let pmStatus: "naked" | "pm-only-hedged" | "pm-only-imbalanced" | "settled-winner" | "settled-loser" | "kal-settled-pm-pending" | "no-pair" | "void";
       if (!pairMeta) pmStatus = "no-pair";
       else if (kalCanceled) pmStatus = "void";
       else if (pmRedeemable) pmStatus = curPrice >= 0.5 ? "settled-winner" : "settled-loser";
-      else if (pmOnlyHedged) pmStatus = "pm-only-hedged";
+      else if (pmOnlyBucket === "balanced") pmStatus = "pm-only-hedged";
+      else if (pmOnlyBucket === "imbalanced") pmStatus = "pm-only-imbalanced";
       else if (kalSettled) pmStatus = "kal-settled-pm-pending";
       else pmStatus = "naked";
 
@@ -1720,6 +1730,7 @@ app.get("/api/wallet-arbs", async (_req, res) => {
         pmRedeemable,
         negRisk: Boolean((p as any).negativeRisk),
         shares: Math.round(shares * 100) / 100,
+        oppositeShares: Math.round(oppositeShares * 100) / 100,
         avgPrice: Math.round(Number(p.avgPrice ?? 0) * 10000) / 10000,
         curPrice: Math.round(curPrice * 10000) / 10000,
         cost: Math.round(Number(p.initialValue ?? 0) * 100) / 100,
@@ -1730,10 +1741,11 @@ app.get("/api/wallet-arbs", async (_req, res) => {
     const totalKalCost = paired.reduce((s, r) => s + r.kalCost, 0) + unpairedKal.reduce((s, r) => s + r.cost, 0);
     const totalPmCost = paired.reduce((s, r) => s + r.pmCost, 0) + unpairedPm.reduce((s, r) => s + r.cost, 0);
 
-    // Split unpairedPm by status so the UI can render three buckets.
+    // Split unpairedPm by status so the UI can render separate buckets.
     const pmByStatus: Record<string, any[]> = {
       naked: [],
       "pm-only-hedged": [],
+      "pm-only-imbalanced": [],
       "settled-winner": [],
       "settled-loser": [],
       "kal-settled-pm-pending": [],
@@ -1752,6 +1764,7 @@ app.get("/api/wallet-arbs", async (_req, res) => {
         unpairedPmByStatus: {
           naked: pmByStatus.naked.length,
           pmOnlyHedged: pmByStatus["pm-only-hedged"].length,
+          pmOnlyImbalanced: pmByStatus["pm-only-imbalanced"].length,
           winners: pmByStatus["settled-winner"].length,
           losers: pmByStatus["settled-loser"].length,
           kalSettledPmPending: pmByStatus["kal-settled-pm-pending"].length,
@@ -2740,12 +2753,20 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
     <tbody id="walletArbsPmNakedBody"><tr><td colspan="10" class="empty">--</td></tr></tbody>
   </table>
   <div class="section-title" style="font-size:13px;margin-top:24px;color:#58a6ff">
-    PM-only hedges (both sides held) <span id="walletArbsPmOnlyCount" style="font-size:11px;color:#8b949e;font-weight:normal"></span>
-    <span style="font-size:11px;color:#8b949e;font-weight:normal;margin-left:8px">YES+NO tokens both held — $1 payout regardless, not actually naked</span>
+    PM-only hedges — BALANCED (both sides, matched sizes) <span id="walletArbsPmOnlyCount" style="font-size:11px;color:#8b949e;font-weight:normal"></span>
+    <span style="font-size:11px;color:#8b949e;font-weight:normal;margin-left:8px">sizes match within $2 — real $1-combined-payout arb, locked profit</span>
   </div>
   <table id="walletArbsPmOnlyTable">
-    <thead><tr><th>Match</th><th>Title / Outcome</th><th>Paired KAL</th><th>Shares</th><th>Avg</th><th>Cur Px</th><th>Cost</th><th>Cur Value</th><th>Actions</th></tr></thead>
-    <tbody id="walletArbsPmOnlyBody"><tr><td colspan="9" class="empty">--</td></tr></tbody>
+    <thead><tr><th>Match</th><th>Title / Outcome</th><th>Paired KAL</th><th>Shares</th><th>Opposite</th><th>Avg</th><th>Cur Px</th><th>Cost</th><th>Cur Value</th><th>Actions</th></tr></thead>
+    <tbody id="walletArbsPmOnlyBody"><tr><td colspan="10" class="empty">--</td></tr></tbody>
+  </table>
+  <div class="section-title" style="font-size:13px;margin-top:24px;color:#ff7b00">
+    PM-only hedges — IMBALANCED (both sides, mismatched sizes) <span id="walletArbsPmOnlyImbalCount" style="font-size:11px;color:#8b949e;font-weight:normal"></span>
+    <span style="font-size:11px;color:#8b949e;font-weight:normal;margin-left:8px">opposite held but sizes differ &gt; $2 — directional bet with partial PM floor</span>
+  </div>
+  <table id="walletArbsPmOnlyImbalTable">
+    <thead><tr><th>Match</th><th>Title / Outcome</th><th>Paired KAL</th><th>Shares</th><th>Opposite</th><th>Avg</th><th>Cur Px</th><th>Cost</th><th>Cur Value</th><th>Actions</th></tr></thead>
+    <tbody id="walletArbsPmOnlyImbalBody"><tr><td colspan="10" class="empty">--</td></tr></tbody>
   </table>
   <div class="section-title" style="font-size:13px;margin-top:24px;color:#d29922">
     KAL settled/closed, PM still open <span id="walletArbsKalPendingCount" style="font-size:11px;color:#8b949e;font-weight:normal"></span>
@@ -3797,6 +3818,7 @@ async function loadWalletArbs() {
       'PM: <b>' + totals.unpairedPm + '</b> ' +
       '(<span style="color:#f85149">naked ' + (bs.naked||0) + '</span>, ' +
       '<span style="color:#58a6ff">pm-only ' + (bs.pmOnlyHedged||0) + '</span>, ' +
+      '<span style="color:#ff7b00">pm-only-imbal ' + (bs.pmOnlyImbalanced||0) + '</span>, ' +
       '<span style="color:#d29922">kal-settled ' + (bs.kalSettledPmPending||0) + '</span>, ' +
       '<span style="color:#3fb950">win ' + (bs.winners||0) + '</span>, ' +
       '<span style="color:#8b949e">lose ' + (bs.losers||0) + '</span>, ' +
@@ -3850,18 +3872,20 @@ async function loadWalletArbs() {
         return '<tr><td style="font-size:11px">' + esc(r.ticker) + '</td><td>' + r.side.toUpperCase() + '</td><td>' + r.shares + '</td><td>' + r.avgPrice + '</td><td>$' + r.cost.toFixed(2) + '</td></tr>';
       }).join("");
     }
-    // Unpaired PM — split by status into 6 buckets (naked, pm-only-hedged, kal-settled-pm-pending, winner, loser, other)
-    var byStatus = { "naked": [], "pm-only-hedged": [], "kal-settled-pm-pending": [], "settled-winner": [], "settled-loser": [], "no-pair": [], "void": [] };
+    // Unpaired PM — split by status into buckets
+    var byStatus = { "naked": [], "pm-only-hedged": [], "pm-only-imbalanced": [], "kal-settled-pm-pending": [], "settled-winner": [], "settled-loser": [], "no-pair": [], "void": [] };
     (d.unpairedPm || []).forEach(function(r) { (byStatus[r.pmStatus] || byStatus.naked).push(r); });
 
     var nakedCt = byStatus.naked.length;
     var pmOnlyCt = byStatus["pm-only-hedged"].length;
+    var pmOnlyImbalCt = byStatus["pm-only-imbalanced"].length;
     var kalPendCt = byStatus["kal-settled-pm-pending"].length;
     var winCt = byStatus["settled-winner"].length;
     var loseCt = byStatus["settled-loser"].length;
     var otherCt = byStatus["no-pair"].length + byStatus.void.length;
     $("walletArbsNakedCount").textContent = "(" + nakedCt + ")";
     $("walletArbsPmOnlyCount").textContent = "(" + pmOnlyCt + ")";
+    $("walletArbsPmOnlyImbalCount").textContent = "(" + pmOnlyImbalCt + ")";
     $("walletArbsKalPendingCount").textContent = "(" + kalPendCt + ")";
     $("walletArbsWinnersCount").textContent = "(" + winCt + ")";
     $("walletArbsLosersCount").textContent = "(" + loseCt + ")";
@@ -3891,18 +3915,25 @@ async function loadWalletArbs() {
         '<td>' + sellBtn(r) + '</td></tr>';
     }).join("");
 
-    // PM-only hedged (both YES + NO tokens held)
-    var pob = $("walletArbsPmOnlyBody");
-    if (pmOnlyCt === 0) pob.innerHTML = '<tr><td colspan="9" class="empty">--</td></tr>';
-    else pob.innerHTML = byStatus["pm-only-hedged"].map(function(r) {
+    function pmOnlyRow(r) {
       return '<tr>' +
         '<td>' + esc(r.pairedMatchName || "?") + '</td>' +
         '<td>' + titleOutcome(r) + '</td>' +
         '<td style="font-size:11px">' + esc(r.pairedKalTicker || "-") + '</td>' +
-        '<td>' + r.shares + '</td><td>' + r.avgPrice + '</td><td>' + r.curPrice + '</td>' +
+        '<td>' + r.shares + '</td>' +
+        '<td>' + (r.oppositeShares || 0) + '</td>' +
+        '<td>' + r.avgPrice + '</td><td>' + r.curPrice + '</td>' +
         '<td>$' + r.cost.toFixed(2) + '</td><td>$' + r.currentValue.toFixed(2) + '</td>' +
         '<td>' + sellBtn(r) + '</td></tr>';
-    }).join("");
+    }
+    // PM-only hedged BALANCED (both sides held, sizes match)
+    var pob = $("walletArbsPmOnlyBody");
+    if (pmOnlyCt === 0) pob.innerHTML = '<tr><td colspan="10" class="empty">--</td></tr>';
+    else pob.innerHTML = byStatus["pm-only-hedged"].map(pmOnlyRow).join("");
+    // PM-only IMBALANCED (both sides held, sizes mismatched → directional exposure)
+    var poib = $("walletArbsPmOnlyImbalBody");
+    if (pmOnlyImbalCt === 0) poib.innerHTML = '<tr><td colspan="10" class="empty">--</td></tr>';
+    else poib.innerHTML = byStatus["pm-only-imbalanced"].map(pmOnlyRow).join("");
 
     // Kal-settled-pm-pending
     var kpb = $("walletArbsPmKalPendingBody");
