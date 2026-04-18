@@ -1510,20 +1510,19 @@ app.get("/api/wallet-arbs", async (_req, res) => {
       if (p?.asset && Number(p.size) > 0) pmByTokenId.set(String(p.asset), p);
     }
 
-    // 3. Build paired rows (KAL position that has a watchlist pair AND a matching PM position)
+    // 3. Build paired rows — each PM token can be claimed by at most one KAL ticker.
+    //    Two-pass: hedged pairings (opposite outcomes) get priority over same-direction ones.
+    //
+    //    Example: user holds KAL SAR + KAL AUR + PM SAR.
+    //      - KAL AUR + PM SAR = HEDGED (opposite outcomes) → real arb, gets the PM claim
+    //      - KAL SAR alone → naked unhedged, appears in unpairedKal
+    //    Previous single-pass logic created TWO paired rows sharing the same 7.25 PM SAR shares.
     const paired: any[] = [];
     const usedKal = new Set<string>();
     const usedPm = new Set<string>();
-    for (const [kalTicker, pos] of kalMap.entries()) {
-      const kalShares = (pos.yesCount ?? 0) + (pos.noCount ?? 0);
-      if (kalShares === 0) continue;
-      const pair = pairByKalTicker.get(kalTicker);
-      if (!pair) continue;
-      // PM side could be either pmLeg or pmOppLeg — check both, prefer the one we actually hold.
-      const pmLegHeld = pmByTokenId.get(pair.pmLeg.tokenId);
-      const pmOppLegHeld = pmByTokenId.get(pair.pmOppLeg.tokenId);
-      const pmHeld = pmLegHeld || pmOppLegHeld;
-      if (!pmHeld) continue;
+    const IMBALANCE_TOLERANCE_USD = 2;
+
+    function buildPairedRow(kalTicker: string, pos: any, pair: any, pmHeld: any, pairingKind: "hedged-structural" | "same-direction"): any {
       const pmTokenId = String(pmHeld.asset);
       const pmOutcome = String(pmHeld.outcome ?? "");
       const pmShares = Number(pmHeld.size ?? 0);
@@ -1534,23 +1533,11 @@ app.get("/api/wallet-arbs", async (_req, res) => {
       const kalNo = pos.noCount ?? 0;
       const kalSide: "yes" | "no" = kalYes >= kalNo ? "yes" : "no";
       const kalHeldShares = kalSide === "yes" ? kalYes : kalNo;
-      // Use marketExposureCents as the authoritative cost basis (kalshi's own tracked $ exposed
-      // to this position). avgPriceCents is derived from it, so this is internally consistent.
       const kalCost = ((pos as any).marketExposureCents ?? 0) / 100;
       const kalAvgPrice = kalHeldShares > 0 ? kalCost / kalHeldShares : 0;
 
-      // Classify (three states):
-      //   "hedged"        = OPPOSITE outcomes AND legs sized enough that the two win-case
-      //                     payouts are close → locked-in min-profit, the shape of a real arb.
-      //   "imbalanced"    = OPPOSITE outcomes BUT the sizes don't match — structurally an arb
-      //                     but economically a directional bet (e.g. 11 KAL / 75.89 PM).
-      //   "same-direction" = both legs on the SAME outcome — never was an arb.
-      const isStructurallyHedged = !!pmLegHeld;
-
-      // Scenario P&L (compute before classification so we can measure skew):
-      //   hedged: kal wins → kal pays kalShares, pm loses. pm wins → pm pays pmShares, kal loses.
-      //   same:   shared-outcome wins → BOTH pay out.   shared-outcome loses → BOTH lose.
       const kalTotalCost = kalCost + pmCost;
+      const isStructurallyHedged = pairingKind === "hedged-structural";
       const netIfKalWins = isStructurallyHedged
         ? kalHeldShares - kalTotalCost
         : kalHeldShares + pmShares - kalTotalCost;
@@ -1558,10 +1545,6 @@ app.get("/api/wallet-arbs", async (_req, res) => {
         ? pmShares - kalTotalCost
         : -kalTotalCost;
 
-      // Imbalance threshold: if the two outcomes pay the same $ within $2 tolerance, it's a real
-      // arb. Otherwise it's directional exposure masquerading as a hedge. $2 covers rounding +
-      // fractional PM fill slop; anything bigger is a genuine size mismatch.
-      const IMBALANCE_TOLERANCE_USD = 2;
       const pairingType: "hedged" | "imbalanced" | "same-direction" =
         !isStructurallyHedged
           ? "same-direction"
@@ -1569,17 +1552,12 @@ app.get("/api/wallet-arbs", async (_req, res) => {
             ? "hedged"
             : "imbalanced";
 
-      // Current mark-to-market for PM (KAL side mark = cost basis — no live KAL bid lookup here
-      // to keep the endpoint fast; KAL can't change mid-position anyway until settlement).
       const pmCurrentValue = Number(pmHeld.currentValue ?? 0);
-      const pmUnrealizedPnl = pmCurrentValue - pmCost;
-      // Total unrealized = PM mark vs cost + KAL assumed at cost basis (shares × avgPrice)
-      // = pmUnrealizedPnl + (kalCost - kalCost) = pmUnrealizedPnl
-      const currentPnl = pmUnrealizedPnl;
+      const currentPnl = pmCurrentValue - pmCost;
 
-      paired.push({
+      return {
         match: pair.matchName || pmHeld.title || "?",
-        historicalPair: Boolean((pair as any).historical),
+        historicalPair: Boolean(pair.historical),
         pairingType,
         kalTicker,
         kalSide,
@@ -1597,7 +1575,34 @@ app.get("/api/wallet-arbs", async (_req, res) => {
         netIfKalWins: Math.round(netIfKalWins * 100) / 100,
         netIfPmWins: Math.round(netIfPmWins * 100) / 100,
         currentPnl: Math.round(currentPnl * 100) / 100,
-      });
+      };
+    }
+
+    // Pass 1: HEDGED pairings (KAL + opposite-outcome PM). Real arbs get the PM claim.
+    for (const [kalTicker, pos] of kalMap.entries()) {
+      if ((pos.yesCount ?? 0) + (pos.noCount ?? 0) === 0) continue;
+      const pair = pairByKalTicker.get(kalTicker);
+      if (!pair) continue;
+      const pmLegHeld = pmByTokenId.get(pair.pmLeg.tokenId);
+      if (!pmLegHeld) continue;
+      const pmTokenId = String(pmLegHeld.asset);
+      if (usedPm.has(pmTokenId)) continue;
+      paired.push(buildPairedRow(kalTicker, pos, pair, pmLegHeld, "hedged-structural"));
+      usedKal.add(kalTicker);
+      usedPm.add(pmTokenId);
+    }
+    // Pass 2: SAME-DIRECTION pairings (KAL + same-outcome PM). Only for kalTickers whose hedged
+    // leg wasn't held and whose same-direction PM leg isn't already claimed by another row.
+    for (const [kalTicker, pos] of kalMap.entries()) {
+      if (usedKal.has(kalTicker)) continue;
+      if ((pos.yesCount ?? 0) + (pos.noCount ?? 0) === 0) continue;
+      const pair = pairByKalTicker.get(kalTicker);
+      if (!pair) continue;
+      const pmOppLegHeld = pmByTokenId.get(pair.pmOppLeg.tokenId);
+      if (!pmOppLegHeld) continue;
+      const pmTokenId = String(pmOppLegHeld.asset);
+      if (usedPm.has(pmTokenId)) continue;
+      paired.push(buildPairedRow(kalTicker, pos, pair, pmOppLegHeld, "same-direction"));
       usedKal.add(kalTicker);
       usedPm.add(pmTokenId);
     }
