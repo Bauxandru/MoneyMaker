@@ -27,6 +27,7 @@
 import { Contract, JsonRpcProvider, Wallet as WalletV6 } from "ethers";
 import { placePmFAKSell, createPmClient } from "./ttPmOrders.js";
 import { fetchPmBestBid } from "./ttHedge.js";
+import { placeKalshiOrder, fetchKalshiOrderbook } from "../kalshiTrade.js";
 
 const CTF_ADDRESS = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045";
 const USDC_E = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174";
@@ -161,6 +162,73 @@ export function isAutoExitKalSettledEnabled(): boolean {
 
 // Re-export createPmClient so the dashboard can warm the client before acting.
 export { createPmClient };
+
+export interface KalSellResult {
+  ok: boolean;
+  ticker: string;
+  side: "yes" | "no";
+  requestedShares: number;
+  priceCents: number;
+  dryRun: boolean;
+  orderResponse?: unknown;
+  error?: string;
+}
+
+/**
+ * Market-sell a Kalshi position via IOC at the best opposite-side bid.
+ * Handles both YES and NO positions.
+ *   - Selling YES at limit P means: accept any fill where the YES price ≥ P.
+ *     The natural bid is the highest price someone is willing to pay for YES,
+ *     which equals (100 - best_NO_ask) in Kalshi's two-sided convention.
+ *   - Selling NO uses the symmetric logic (best YES ask → NO bid).
+ */
+export async function sellKalshiAtMarket(args: {
+  ticker: string;
+  side: "yes" | "no";
+  shares: number;
+  dryRun: boolean;
+}): Promise<KalSellResult> {
+  const { ticker, side, shares, dryRun } = args;
+  if (shares <= 0) {
+    return { ok: false, ticker, side, requestedShares: shares, priceCents: 0, dryRun, error: "shares must be > 0" };
+  }
+  let priceCents = 0;
+  try {
+    const book = await fetchKalshiOrderbook(ticker);
+    // Best bid for YES = 100 - best NO ask. For NO, 100 - best YES ask.
+    // Kalshi ladders come sorted ascending by price; best ask = levels[0].
+    if (side === "yes") {
+      const bestNoAsk = book.no?.[0]?.[0];
+      if (bestNoAsk == null) return { ok: false, ticker, side, requestedShares: shares, priceCents: 0, dryRun, error: "no bid side on YES (NO ask ladder empty)" };
+      priceCents = Math.max(1, 100 - Math.floor(bestNoAsk));
+    } else {
+      const bestYesAsk = book.yes?.[0]?.[0];
+      if (bestYesAsk == null) return { ok: false, ticker, side, requestedShares: shares, priceCents: 0, dryRun, error: "no bid side on NO (YES ask ladder empty)" };
+      priceCents = Math.max(1, 100 - Math.floor(bestYesAsk));
+    }
+  } catch (e) {
+    return { ok: false, ticker, side, requestedShares: shares, priceCents: 0, dryRun, error: `orderbook fetch failed: ${(e as Error).message}` };
+  }
+  try {
+    const order = {
+      ticker,
+      side,
+      action: "sell" as const,
+      type: "limit" as const,
+      time_in_force: "immediate_or_cancel" as const,
+      // Kalshi wants the PRICE FOR THE SIDE being ordered (yes_price for YES, no_price for NO).
+      // For a SELL YES at priceCents, we pass yes_price = priceCents (min return we'll accept).
+      ...(side === "yes" ? { yes_price: priceCents } : { no_price: priceCents }),
+      count: shares,
+      count_fp: shares.toFixed(0),
+      sell_min_return: priceCents * shares,
+    };
+    const resp = await placeKalshiOrder(order, dryRun);
+    return { ok: true, ticker, side, requestedShares: shares, priceCents, dryRun, orderResponse: resp };
+  } catch (e) {
+    return { ok: false, ticker, side, requestedShares: shares, priceCents, dryRun, error: (e as Error).message };
+  }
+}
 
 /**
  * Periodic auto-close cycle. Called from runARB.ts every 5 min.

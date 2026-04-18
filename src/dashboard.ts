@@ -2060,6 +2060,24 @@ app.get("/api/open-orders", async (_req, res) => {
   }
 });
 
+app.post("/api/kal-sell", async (req, res) => {
+  try {
+    const { sellKalshiAtMarket } = await import("./ARB/ttSettleClose.js");
+    const { ticker, side, shares } = req.body ?? {};
+    if (!ticker || typeof ticker !== "string") return res.status(400).json({ error: "ticker required" });
+    if (side !== "yes" && side !== "no") return res.status(400).json({ error: "side must be 'yes' or 'no'" });
+    if (!Number.isFinite(Number(shares)) || Number(shares) <= 0) return res.status(400).json({ error: "shares > 0 required" });
+    const dryRun = String(process.env.DRY_RUN ?? "true").toLowerCase() !== "false";
+    const result = await sellKalshiAtMarket({
+      ticker: String(ticker),
+      side: side as "yes" | "no",
+      shares: Math.floor(Number(shares)),
+      dryRun,
+    });
+    res.json(result);
+  } catch (e) { res.status(500).json({ error: (e as Error).message }); }
+});
+
 app.post("/api/pm-sell", async (req, res) => {
   try {
     const { sellPmAtMarket } = await import("./ARB/ttSettleClose.js");
@@ -3916,6 +3934,24 @@ function renderAudit(data) {
 // --- Verified P&L ------------------------------------------------------------
 
 // --- Wallet Arbs ------------------------------------------------------------
+async function kalSellExit(ticker, side, shares) {
+  if (!confirm("Market-sell " + shares + " KAL " + side.toUpperCase() + " shares on " + ticker + " via IOC at best bid?\\n\\nNote: if DRY_RUN=true in settings, this just simulates.")) return;
+  try {
+    var res = await fetch("/api/kal-sell", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ticker: ticker, side: side, shares: shares }),
+    });
+    var j = await res.json();
+    if (j.ok) {
+      alert((j.dryRun ? "[DRY RUN] " : "") + "KAL SELL placed at " + j.priceCents + "¢ for " + j.requestedShares + " shares.");
+    } else {
+      alert("KAL SELL failed: " + (j.error || "unknown"));
+    }
+    loadWalletArbs();
+  } catch (e) { alert("KAL SELL request failed: " + e.message); }
+}
+
 async function ignorePos(kalTicker, pmTokenId) {
   try {
     var r = await fetch("/api/ignore", {
@@ -4091,12 +4127,16 @@ async function loadWalletArbs() {
           '</tr>';
       }).join("");
     }
-    // Unpaired KAL (now includes Match name + KAL status columns from Kalshi API)
+    // Unpaired KAL (Sell button only shown when KAL market is still active/tradable)
     var kb = $("walletArbsKalBody");
     if (!d.unpairedKal || d.unpairedKal.length === 0) {
       kb.innerHTML = '<tr><td colspan="10" class="empty">No unpaired Kalshi positions</td></tr>';
     } else {
       kb.innerHTML = d.unpairedKal.map(function(r) {
+        var sellable = String(r.kalStatus || "").toLowerCase() === "active";
+        var sellBtnHtml = sellable
+          ? '<button class="audit-btn" style="padding:2px 8px;font-size:11px" onclick="kalSellExit(\\'' + r.ticker + '\\', \\'' + r.side + '\\', ' + r.shares + ')">Sell at mkt</button>'
+          : '<span style="font-size:11px;color:#6e7681" title="KAL market not tradable (status: ' + esc(r.kalStatus || "?") + ')">—</span>';
         return '<tr>' +
           '<td>' + ageLabel(r.firstSeenAt) + '</td>' +
           '<td>' + esc(r.matchName || "—") + hedgeBadge(r.hedgeInfo) + '</td>' +
@@ -4107,7 +4147,7 @@ async function loadWalletArbs() {
           '<td>$' + r.cost.toFixed(2) + '</td>' +
           '<td style="font-size:11px">' + esc(r.kalStatus || "—") + '</td>' +
           '<td>' + (r.hedgeInfo ? '<span style="color:#3fb950;font-size:11px">hedging</span>' : '<span style="color:#8b949e;font-size:11px">—</span>') + '</td>' +
-          '<td>' + ignoreBtn(r.ticker, null) + '</td>' +
+          '<td>' + sellBtnHtml + ' ' + ignoreBtn(r.ticker, null) + '</td>' +
           '</tr>';
       }).join("");
     }
