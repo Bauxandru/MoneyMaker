@@ -1507,8 +1507,10 @@ app.get("/api/wallet-arbs", async (_req, res) => {
       const kalNo = pos.noCount ?? 0;
       const kalSide: "yes" | "no" = kalYes >= kalNo ? "yes" : "no";
       const kalHeldShares = kalSide === "yes" ? kalYes : kalNo;
-      const kalAvgPrice = (pos.avgPriceCents ?? 0) / 100;
-      const kalCost = kalHeldShares * kalAvgPrice;
+      // Use marketExposureCents as the authoritative cost basis (kalshi's own tracked $ exposed
+      // to this position). avgPriceCents is derived from it, so this is internally consistent.
+      const kalCost = ((pos as any).marketExposureCents ?? 0) / 100;
+      const kalAvgPrice = kalHeldShares > 0 ? kalCost / kalHeldShares : 0;
 
       paired.push({
         match: pair.matchName || pmHeld.title || "?",
@@ -1544,14 +1546,15 @@ app.get("/api/wallet-arbs", async (_req, res) => {
       const no = pos.noCount ?? 0;
       const side: "yes" | "no" = yes >= no ? "yes" : "no";
       const held = side === "yes" ? yes : no;
-      const avg = (pos.avgPriceCents ?? 0) / 100;
+      const cost = ((pos as any).marketExposureCents ?? 0) / 100;
+      const avg = held > 0 ? cost / held : 0;
       unpairedKal.push({
         exchange: "kalshi",
         ticker,
         side,
         shares: held,
         avgPrice: Math.round(avg * 10000) / 10000,
-        cost: Math.round(held * avg * 100) / 100,
+        cost: Math.round(cost * 100) / 100,
       });
     }
     // 4a. Pre-fetch Kalshi market status for every paired KAL ticker we need to classify.

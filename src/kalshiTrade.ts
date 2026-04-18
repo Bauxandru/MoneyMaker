@@ -294,10 +294,16 @@ export async function getKalshiOpenYesPositions(): Promise<Array<{ ticker: strin
   }
 }
 
-// Returns all positions as a Map: ticker -> { yesCount, noCount, avgPriceCents }.
+// Returns all positions as a Map: ticker -> { yesCount, noCount, avgPriceCents, marketExposureCents, feesPaidCents }.
 // Single API call replaces multiple getKalshiPosition() + getKalshiNoPosition() calls.
-export async function getKalshiPositionMap(): Promise<Map<string, { yesCount: number; noCount: number; avgPriceCents: number }>> {
-  const map = new Map<string, { yesCount: number; noCount: number; avgPriceCents: number }>();
+//
+// avgPriceCents is derived from `market_exposure / |position|` — the cost of the CURRENTLY-held
+// shares only. Previously this was derived from `total_traded`, which is the cumulative traded
+// volume (buys + sells) and diverges wildly from cost-basis once a position has any churn — we
+// saw a 467-share position with total_traded ≈ $1284 while market_exposure was the actual
+// per-share cost. total_traded is useless as a cost-basis signal; market_exposure is authoritative.
+export async function getKalshiPositionMap(): Promise<Map<string, { yesCount: number; noCount: number; avgPriceCents: number; marketExposureCents: number; feesPaidCents: number }>> {
+  const map = new Map<string, { yesCount: number; noCount: number; avgPriceCents: number; marketExposureCents: number; feesPaidCents: number }>();
   try {
     const path = `/portfolio/positions?count_filter=position&limit=200`;
     const res = await kalshiSignedFetch("GET", path) as Record<string, unknown>;
@@ -306,18 +312,21 @@ export async function getKalshiPositionMap(): Promise<Map<string, { yesCount: nu
     for (const item of items) {
       const ticker = String(item.ticker ?? "");
       if (!ticker) continue;
-      // Kalshi API uses _fp (fractional precision) and _dollars suffixed fields
       const pos = Number(item.position ?? item.position_fp ?? 0);
-      // total_traded_dollars is in dollars (e.g. "8.9000"); legacy total_traded was in cents
-      const totalTradedDollars = item.total_traded_dollars != null
-        ? Number(item.total_traded_dollars)
-        : Number(item.total_traded ?? 0) / 100;
       const yesCount = Math.max(0, Math.round(pos));
       const noCount = pos < 0 ? Math.round(Math.abs(pos)) : 0;
-      const avgPriceCents = yesCount > 0 && totalTradedDollars > 0
-        ? Math.round((totalTradedDollars / yesCount) * 100)
+      const heldShares = Math.abs(pos);
+      // Kalshi API uses _dollars suffixed fields (e.g. "4.670000"); legacy unsuffixed was in cents.
+      const marketExposureCents = item.market_exposure_dollars != null
+        ? Math.round(Number(item.market_exposure_dollars) * 100)
+        : Math.round(Number(item.market_exposure ?? 0));
+      const feesPaidCents = item.fees_paid_dollars != null
+        ? Math.round(Number(item.fees_paid_dollars) * 100)
+        : Math.round(Number(item.fees_paid ?? 0));
+      const avgPriceCents = heldShares > 0
+        ? Math.round(marketExposureCents / heldShares)
         : 0;
-      map.set(ticker, { yesCount, noCount, avgPriceCents });
+      map.set(ticker, { yesCount, noCount, avgPriceCents, marketExposureCents, feesPaidCents });
     }
   } catch { /* return empty map on error */ }
   return map;
