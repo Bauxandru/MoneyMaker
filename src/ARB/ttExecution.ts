@@ -596,9 +596,17 @@ export async function executeArb(
       pmAvail = pmFull.totalQty;
     }
 
-    // Dynamic share sizing: reduce shares to match available depth instead of aborting
+    // Dynamic share sizing: reduce shares to match available depth instead of aborting.
+    // EMPTY PM BOOK HANDLING: when pmAskLevels came back empty (CLOB returned [] despite
+    // gamma reporting an ask), don't treat pmAvail=0 as "no depth" — it's "unknown depth".
+    // Discovery saw a price, execution's book fetch missed it (resting order cancelled
+    // between the two calls, or WS not subscribed yet). Placing FAK is safe: if nothing
+    // matches it fills 0 and parallel KAL will enter hedge mode. See Q3 analysis
+    // 2026-04-18 — 10/10 pm-depth-insufficient aborts had empty books.
+    const pmBookUnknown = pmAskLevels.length === 0;
+    const effectivePmAvailForSizing = pmBookUnknown ? Infinity : pmAvail;
     const maxByDepth = MIN_DEPTH_MULT > 0
-      ? Math.floor(Math.min(kalAvail, pmAvail) / MIN_DEPTH_MULT)
+      ? Math.floor(Math.min(kalAvail, effectivePmAvailForSizing) / MIN_DEPTH_MULT)
       : Infinity;
     const originalShares = shares;
 
