@@ -1706,10 +1706,19 @@ app.get("/api/wallet-arbs", async (_req, res) => {
         pmOnlyBucket = Math.abs(shares - oppositeShares) <= PM_ONLY_SIZE_TOLERANCE ? "balanced" : "imbalanced";
       }
 
+      // Effectively-resolved detection: PM `redeemable` flag has latency between market
+      // resolution and the flag flipping. If curPrice is extreme (< 0.02 or > 0.98), the
+      // market has functionally resolved — winner shares ~= $1, loser shares ~= $0.
+      // Classify as settled-winner/loser based on curPrice; the row will surface a
+      // "pending redemption" note so the user knows to wait for the redeem flag.
+      const curPriceLooksResolved = curPrice > 0.98 || curPrice < 0.02;
+      const effectivelyResolved = pmRedeemable || curPriceLooksResolved;
+      const pendingRedemption = curPriceLooksResolved && !pmRedeemable;
+
       let pmStatus: "naked" | "pm-only-hedged" | "pm-only-imbalanced" | "settled-winner" | "settled-loser" | "kal-settled-pm-pending" | "no-pair" | "void";
       if (!pairMeta) pmStatus = "no-pair";
       else if (kalCanceled) pmStatus = "void";
-      else if (pmRedeemable) pmStatus = curPrice >= 0.5 ? "settled-winner" : "settled-loser";
+      else if (effectivelyResolved) pmStatus = curPrice >= 0.5 ? "settled-winner" : "settled-loser";
       else if (pmOnlyBucket === "balanced") pmStatus = "pm-only-hedged";
       else if (pmOnlyBucket === "imbalanced") pmStatus = "pm-only-imbalanced";
       else if (kalSettled) pmStatus = "kal-settled-pm-pending";
@@ -1728,6 +1737,7 @@ app.get("/api/wallet-arbs", async (_req, res) => {
         kalResult: kalMkt?.result ?? "",
         pmStatus,
         pmRedeemable,
+        pendingRedemption,
         negRisk: Boolean((p as any).negativeRisk),
         shares: Math.round(shares * 100) / 100,
         oppositeShares: Math.round(oppositeShares * 100) / 100,
@@ -3949,12 +3959,15 @@ async function loadWalletArbs() {
         '<td>' + sellBtn(r) + '</td></tr>';
     }).join("");
 
+    function pendingTag(r) {
+      return r.pendingRedemption ? ' <span style="font-size:10px;color:#d29922" title="PM market looks resolved by price but redeemable flag is still false. Wait a few minutes for PM to mark as redeemable.">(pending)</span>' : '';
+    }
     // Winners
     var wb = $("walletArbsPmWinnersBody");
     if (winCt === 0) wb.innerHTML = '<tr><td colspan="8" class="empty">--</td></tr>';
     else wb.innerHTML = byStatus["settled-winner"].map(function(r) {
       return '<tr>' +
-        '<td>' + esc(r.pairedMatchName || "?") + '</td>' +
+        '<td>' + esc(r.pairedMatchName || "?") + pendingTag(r) + '</td>' +
         '<td>' + titleOutcome(r) + '</td>' +
         '<td style="font-size:11px">' + esc(r.pairedKalTicker || "-") + '</td>' +
         '<td>' + r.shares + '</td><td>' + r.avgPrice + '</td><td>' + r.curPrice + '</td>' +
@@ -3967,7 +3980,7 @@ async function loadWalletArbs() {
     if (loseCt === 0) lb.innerHTML = '<tr><td colspan="6" class="empty">--</td></tr>';
     else lb.innerHTML = byStatus["settled-loser"].map(function(r) {
       return '<tr>' +
-        '<td>' + esc(r.pairedMatchName || "?") + '</td>' +
+        '<td>' + esc(r.pairedMatchName || "?") + pendingTag(r) + '</td>' +
         '<td>' + titleOutcome(r) + '</td>' +
         '<td>' + r.shares + '</td><td>' + r.avgPrice + '</td><td>' + r.curPrice + '</td>' +
         '<td>' + redeemBtn(r) + '</td></tr>';
