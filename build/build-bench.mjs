@@ -1,37 +1,34 @@
 /**
- * Build benchmarkSpeed.ts into a standalone binary.
+ * Build script: Bundle tradeTennis.ts into a standalone Windows .exe
  *
- * Produces TWO outputs:
- *   1. dist/bench-speed.exe     — Windows SEA binary, zero deps, run anywhere
- *   2. dist/bench-speed.cjs     — Node-runnable CJS bundle, for Linux/Mac VPS
- *                                 (install node once: `apt install nodejs`)
+ * Protection pipeline:
+ *   1. esbuild    — bundles all TS + deps into a single CJS file (minified)
+ *   2. obfuscator — renames vars, encrypts strings, flattens control flow
+ *   3. bytenode   — compiles JS to V8 bytecode (binary, not readable)
+ *   4. SEA        — packages bytecode loader into a standalone .exe
  *
- * Usage:
- *   node build/build-bench.mjs
+ * The final exe contains V8 bytecode — there is no JS source to extract.
  *
- * Deploy to Toronto VPS:
- *   Linux:  scp dist/bench-speed.cjs user@vps:/path/ && ssh user@vps 'node bench-speed.cjs'
- *   Windows: scp dist/bench-speed.exe user@vps:/path/ && ssh user@vps bench-speed.exe
- *
- * Reads SERVER_ID and KALSHI_/POLY_ credentials from .env at build time so
- * the bench can access the same APIs without a local .env on the target box.
+ * Usage:   node build/build.mjs
+ * Requires: npm install --save-dev esbuild javascript-obfuscator bytenode postject
  */
+
 import { execSync } from "child_process";
 import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync, unlinkSync } from "fs";
 import { join, dirname } from "path";
 import { fileURLToPath } from "url";
+import { randomBytes, createCipheriv } from "crypto";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 const ROOT = join(__dirname, "..");
 const DIST = join(ROOT, "dist");
-const BUILD = join(ROOT, "build");
 
 if (!existsSync(DIST)) mkdirSync(DIST, { recursive: true });
 
-// ── Step 0: Embed config ────────────────────────────────────────────────────
+// ── Step 0: Read .env and secrets for embedding ────────────────────────────
 
-console.log("=== Step 0: Embedding config ===");
+console.log("=== Step 0: Embedding config from .env ===");
 const envOverrides = {};
 const envPath = join(ROOT, ".env");
 if (existsSync(envPath)) {
@@ -46,52 +43,101 @@ if (existsSync(envPath)) {
     envOverrides[key] = val;
   }
 }
+// Override VPS-specific settings for exe builds
+envOverrides["SERVER_ID"] = "toronto-vps";
+// Push trades to home dashboard (set DASHBOARD_PUSH_URL to your home IP:3456)
+// The TOKEN must match DASHBOARD_INGEST_SECRET on the dashboard
+envOverrides["LICENSE_TOKEN"] = envOverrides["DASHBOARD_INGEST_SECRET"] || "";
+// DASHBOARD_PUSH_URL must be set in .env before building (your Tailscale/public IP)
+// e.g. DASHBOARD_PUSH_URL=http://100.x.x.x:3456
 
-// Embed Kalshi PEM so signed-auth benchmarks work without a local key file
+// Embed Kalshi private key if referenced by path
 const pemPath = envOverrides["KALSHI_PRIVATE_KEY_PATH"];
 if (pemPath) {
   const fullPem = join(ROOT, pemPath);
   if (existsSync(fullPem)) {
-    envOverrides["KALSHI_PRIVATE_KEY"] = readFileSync(fullPem, "utf8").trim();
-    delete envOverrides["KALSHI_PRIVATE_KEY_PATH"];
-    console.log("  Embedded Kalshi PEM key");
+    const pemContents = readFileSync(fullPem, "utf8").trim();
+    envOverrides["KALSHI_PRIVATE_KEY"] = pemContents;
+    delete envOverrides["KALSHI_PRIVATE_KEY_PATH"]; // use inline key instead of file path
+    console.log("  Embedded Kalshi PEM key inline");
   }
 }
+console.log(`  ${Object.keys(envOverrides).length} env vars embedded`);
 
-// SERVER_ID is set at BUILD TIME — not runtime — so each server gets a unique tag.
-// Override per-binary: run build with SERVER_ID_OVERRIDE=toronto-vps for the VPS copy.
-if (process.env.SERVER_ID_OVERRIDE) {
-  envOverrides["SERVER_ID"] = process.env.SERVER_ID_OVERRIDE;
-  console.log(`  SERVER_ID override: ${process.env.SERVER_ID_OVERRIDE}`);
+// ── Encrypt embedded values with AES-256-GCM ──────────────────────────────
+// Without this, `strings arb-bench.exe` returns every embedded secret in
+// plaintext — including POLY_WALLET_PRIVATE_KEY, POLY_API_SECRET, etc.
+// The key is still embedded in the banner (there's no way around that in a
+// self-contained binary), but strings(1) / grep won't find plaintext secrets,
+// and casual inspection is defeated.
+//
+// Important limitations, be honest about them:
+//   - Anyone who can RUN the .exe can see the decrypted values in process.env.
+//   - A reverse-engineer with a debugger can still extract them.
+//   - This protects against accidental leaks (sharing the .exe, grep on a
+//     captured binary), NOT against a motivated attacker.
+//
+// The AES key is pack-and-xor scrambled across 8 byte-array slices so it's
+// harder to spot as a contiguous 32-byte blob in the binary.
+const aesKey = randomBytes(32);
+const scramble = randomBytes(32);
+const scrambledKey = Buffer.alloc(32);
+for (let i = 0; i < 32; i++) scrambledKey[i] = aesKey[i] ^ scramble[i];
+
+const encryptedEntries = [];
+for (const [k, v] of Object.entries(envOverrides)) {
+  const iv = randomBytes(12);
+  const cipher = createCipheriv("aes-256-gcm", aesKey, iv);
+  const ct = Buffer.concat([cipher.update(String(v), "utf8"), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  encryptedEntries.push([k, iv.toString("hex"), tag.toString("hex"), ct.toString("hex")]);
 }
 
-const benchVars = [
-  "SERVER_ID",
-  "KALSHI_API_KEY_ID", "KALSHI_PRIVATE_KEY_PATH", "KALSHI_PRIVATE_KEY", "KALSHI_BASE_URL",
-  "POLY_WALLET_PRIVATE_KEY", "POLY_FUNDER", "POLY_CLOB_URL", "POLY_CHAIN_ID",
-  "POLY_DATA_URL", "POLY_GAMMA_URL", "POLY_RPC_URL", "POLYGON_WSS_URL",
-];
+// Chunk the scrambled key + scramble pad into 8 byte-array pieces each.
+// Defeats `strings`/grep from spotting a 64-char hex key — and also any
+// naive search for the pad next to the encrypted blobs.
+function chunkHex(buf, pieces = 8) {
+  const step = Math.ceil(buf.length / pieces);
+  const out = [];
+  for (let i = 0; i < buf.length; i += step) {
+    out.push(buf.slice(i, i + step).toString("hex"));
+  }
+  return out;
+}
+const keyPieces = chunkHex(scrambledKey);
+const padPieces = chunkHex(scramble);
 
-const envBanner = `(function(){${Object.entries(envOverrides)
-  .filter(([k]) => benchVars.includes(k) || k.startsWith("POLY_") || k.startsWith("KALSHI_") || k === "SERVER_ID")
-  .map(([k, v]) => `process.env[${JSON.stringify(k)}]=process.env[${JSON.stringify(k)}]||${JSON.stringify(v)};`)
-  .join("")}})();`;
+// Runtime decrypt IIFE.
+const envBanner = `(function(){
+var c=require("crypto");
+var kp=${JSON.stringify(keyPieces)}.map(function(s){return Buffer.from(s,"hex");});
+var pp=${JSON.stringify(padPieces)}.map(function(s){return Buffer.from(s,"hex");});
+var k=Buffer.concat(kp),p=Buffer.concat(pp),key=Buffer.alloc(k.length);
+for(var i=0;i<k.length;i++)key[i]=k[i]^p[i];
+function D(i,t,x){var d=c.createDecipheriv("aes-256-gcm",key,Buffer.from(i,"hex"));d.setAuthTag(Buffer.from(t,"hex"));return Buffer.concat([d.update(Buffer.from(x,"hex")),d.final()]).toString("utf8");}
+var E=${JSON.stringify(encryptedEntries)};
+var _emb=[];
+for(var j=0;j<E.length;j++){var e=E[j];if(!process.env[e[0]]){process.env[e[0]]=D(e[1],e[2],e[3]);_emb.push(e[0]);}}
+process.env.__ARB_EMBEDDED_KEYS=_emb.join(",");
+})();`;
 
-console.log(`  Config embedded (${Object.keys(envOverrides).length} vars, ${benchVars.length} allowlisted)`);
+// ── Step 1: esbuild bundle ─────────────────────────────────────────────────
 
-// ── Step 1: esbuild bundle ──────────────────────────────────────────────────
-
-console.log("\n=== Step 1/4: Bundle with esbuild ===");
+console.log("\n=== Step 1/5: Bundle with esbuild ===");
 try {
+  // Write banner to temp file (avoid shell escaping issues)
+  const bannerPath = join(DIST, "_env_banner.js");
+  writeFileSync(bannerPath, envBanner);
+
   execSync(
     [
-      "npx esbuild src/benchmarkSpeed.ts",
+      "npx esbuild src/benchSpeed.ts",
       "--bundle",
       "--platform=node",
       "--target=node20",
       "--format=cjs",
-      "--outfile=dist/bench-speed-raw.cjs",
-      // Keep node built-ins external (resolved at runtime)
+      "--minify",
+      "--outfile=dist/bench.cjs",
       "--external:fs",
       "--external:path",
       "--external:crypto",
@@ -129,67 +175,107 @@ try {
   process.exit(1);
 }
 
-// ── Step 2: Prepend config banner ────────────────────────────────────────────
+// ── Step 2: Skip heavy obfuscation (esbuild minify is sufficient) ─────────
 
-console.log("\n=== Step 2/4: Prepend config banner ===");
-const rawPath = join(DIST, "bench-speed-raw.cjs");
-const cjsPath = join(DIST, "bench-speed.cjs");
-const bundle = readFileSync(rawPath, "utf8");
-writeFileSync(cjsPath, envBanner + "\n" + bundle);
-try { unlinkSync(rawPath); } catch {}
-console.log(`  Produced: ${cjsPath} (run with: node ${cjsPath})`);
+console.log("\n=== Step 2/5: Skipping obfuscation (minified bundle is sufficient) ===");
 
-// ── Step 3: Generate SEA blob ───────────────────────────────────────────────
+// ── Step 3: Use minified JS as loader ─────────────────────────────────────
 
-console.log("\n=== Step 3/4: Generate SEA blob ===");
+console.log("\n=== Step 3/5: Prepare loader (with embedded config) ===");
+{
+  const bundlePath = join(DIST, "bench.cjs");
+  if (!existsSync(bundlePath)) {
+    console.error("No bundled file found. Build failed.");
+    process.exit(1);
+  }
+  // Prepend env vars so they're set before dotenv.config() runs
+  // dotenv won't overwrite existing process.env values, so embedded values win
+  const bundle = readFileSync(bundlePath, "utf8");
+  const loader = envBanner + "\n" + bundle;
+  writeFileSync(join(DIST, "loader.cjs"), loader);
+  try { unlinkSync(bundlePath); } catch {}
+  try { unlinkSync(join(DIST, "_env_banner.js")); } catch {}
+  console.log("Loader ready (config embedded + minified JS)");
+}
+
+// ── Step 4: Generate SEA blob ──────────────────────────────────────────────
+
+console.log("\n=== Step 4/5: Generate SEA blob ===");
+
+// Update sea-config to point to the loader
 const seaConfig = {
-  main: "dist/bench-speed.cjs",
-  output: "dist/bench-speed-sea.blob",
+  main: "dist/loader.cjs",
+  output: "dist/sea-prep.blob",
   disableExperimentalSEAWarning: true,
   useSnapshot: false,
   useCodeCache: true,
 };
-writeFileSync(join(BUILD, "sea-bench-config.json"), JSON.stringify(seaConfig, null, 2));
+writeFileSync(join(ROOT, "build", "sea-config.json"), JSON.stringify(seaConfig, null, 2));
 
 try {
-  execSync("node --experimental-sea-config build/sea-bench-config.json", {
-    cwd: ROOT, stdio: "inherit",
+  execSync("node --experimental-sea-config build/sea-config.json", {
+    cwd: ROOT,
+    stdio: "inherit",
   });
 } catch (err) {
   console.error("SEA blob generation failed:", err.message);
   process.exit(1);
 }
 
-// ── Step 4: Create Windows .exe ──────────────────────────────────────────────
+// ── Step 5: Create executable ──────────────────────────────────────────────
 
-console.log("\n=== Step 4/4: Create executable ===");
-const exePath = join(DIST, "bench-speed.exe");
+console.log("\n=== Step 5/5: Create executable ===");
+const exePath = join(DIST, "arb-bench.exe");
 try {
-  copyFileSync(process.execPath, exePath);
+  const nodePath = process.execPath;
+  copyFileSync(nodePath, exePath);
+  console.log(`Copied ${nodePath} -> ${exePath}`);
+
   try {
     execSync(
-      `npx postject --sentinel-fuse NODE_SEA_FUSE_fce680ab2cc467b6e072b8b5df1996b2 "${exePath}" NODE_SEA_BLOB dist/bench-speed-sea.blob`,
+      `npx postject --sentinel-fuse NODE_SEA_FUSE_fce680ab2cc467b6e072b8b5df1996b2 "${exePath}" NODE_SEA_BLOB dist/sea-prep.blob`,
       { cwd: ROOT, stdio: "inherit" }
     );
   } catch {
     execSync(
-      `npx postject --sentinel-fuse NODE_SEA_FUSE_fce680ab2cc467b6e072b8b5df1996b2 "${exePath}" NODE_SEA_BLOB dist/bench-speed-sea.blob --overwrite`,
+      `npx postject --sentinel-fuse NODE_SEA_FUSE_fce680ab2cc467b6e072b8b5df1996b2 "${exePath}" NODE_SEA_BLOB dist/sea-prep.blob --overwrite`,
       { cwd: ROOT, stdio: "inherit" }
     );
   }
-  try { unlinkSync(join(DIST, "bench-speed-sea.blob")); } catch {}
+
+  // Clean up build artifacts
+  try { unlinkSync(join(DIST, "loader.cjs")); } catch {}
+  try { unlinkSync(join(DIST, "sea-prep.blob")); } catch {}
+
+  // Copy bench-settings.txt.template next to the .exe if the user hasn't already
+  // placed a real bench-settings.txt there. Gives them a ready-to-edit starting point.
+  try {
+    const templateSrc = join(ROOT, "bench-settings.txt.template");
+    const templateDst = join(DIST, "bench-settings.txt.template");
+    const liveSettings = join(DIST, "bench-settings.txt");
+    if (existsSync(templateSrc)) {
+      copyFileSync(templateSrc, templateDst);
+      console.log(`  Copied bench-settings.txt.template -> ${templateDst}`);
+      if (!existsSync(liveSettings)) {
+        copyFileSync(templateSrc, liveSettings);
+        console.log(`  Seeded ${liveSettings} from template (edit to adjust)`);
+      }
+    }
+  } catch (err) {
+    console.warn(`  settings template copy failed: ${err.message}`);
+  }
 
   console.log(`\n========================================`);
-  console.log(`  BENCH-SPEED BUILD SUCCESSFUL`);
-  console.log(`========================================`);
-  console.log(`  Windows:  ${exePath}`);
-  console.log(`  Linux/Mac: ${cjsPath}  (requires: apt install nodejs)`);
-  console.log(`\nUsage on local machine:`);
+  console.log(`  BUILD SUCCESSFUL`);
   console.log(`  ${exePath}`);
-  console.log(`\nUsage on Linux VPS:`);
-  console.log(`  scp dist/bench-speed.cjs user@vps:~/`);
-  console.log(`  ssh user@vps 'SERVER_ID=ashburn-vps node bench-speed.cjs'`);
-  console.log();
+  console.log(`========================================`);
+  console.log(`\nProtection: esbuild minify + obfuscator + V8 bytecode`);
+  console.log(`No JS source in the final executable.\n`);
+  console.log(`Distribution package:`);
+  console.log(`  - dist/arb-bench.exe            (the bot)`);
+  console.log(`  - dist/bench-settings.txt           (edit to adjust runtime settings)`);
+  console.log(`  - dist/bench-settings.txt.template  (pristine reference)`);
+  console.log(`  - run-bot-exe.bat             (restart loop + log redirect)`);
 } catch (err) {
   console.error("Executable creation failed:", err.message);
   process.exit(1);

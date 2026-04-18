@@ -56,6 +56,8 @@
     "test:watch": "vitest",
     "build": "tsc",
     "build:exe": "node build/build.mjs",
+    "build:bench-exe": "node build/build-bench.mjs",
+    "bench": "tsx src/benchSpeed.ts",
     "start": "node dist/index.js"
   },
   "dependencies": {
