@@ -1849,6 +1849,8 @@ app.get("/api/wallet-arbs", async (_req, res) => {
         title: String(p.title ?? ""),
         pairedKalTicker: pairMeta?.kalTicker ?? "",
         pairedMatchName: pairMeta?.matchName ?? "",
+        pmSlug: pairMeta?.pmSlug ?? String((p as any).slug ?? ""),
+        eventSlug: String((p as any).eventSlug ?? pairMeta?.pmSlug ?? ""),
         kalStatus: kalMkt?.status ?? "",
         kalResult: kalMkt?.result ?? "",
         pmStatus,
@@ -3350,6 +3352,25 @@ function esc(s) {
 }
 
 function pnlClass(val) { return val > 0.001 ? "green" : val < -0.001 ? "red" : "gray"; }
+// Hyperlink helpers. Open in a new tab (_blank) with noopener to prevent the
+// target page from reaching back into this window.
+function kalLink(ticker, text) {
+  if (!ticker) return esc(text || "—");
+  // Kalshi market URL: /markets/{SERIES_LOWER}/#{full-ticker-lower}. The series
+  // prefix is the first dash-delimited segment of the ticker (e.g. KXMLBGAME).
+  var series = String(ticker).split("-")[0].toLowerCase();
+  var href = "https://kalshi.com/markets/" + series + "/#" + String(ticker).toLowerCase();
+  return '<a href="' + esc(href) + '" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;border-bottom:1px dotted #58a6ff" title="Open on Kalshi">' + esc(text || ticker) + '</a>';
+}
+function pmLink(slug, text) {
+  if (!slug) return esc(text || "—");
+  // Polymarket's event page expects the raw slug path-segment (no percent-encoding of
+  // hyphens). encodeURI keeps most slug chars intact; encodeURIComponent would over-encode.
+  var href = "https://polymarket.com/event/" + encodeURI(String(slug));
+  return '<a href="' + esc(href) + '" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;border-bottom:1px dotted #58a6ff" title="Open on Polymarket">' + esc(text || slug) + '</a>';
+}
+// Resolver: pick the best slug available on a row (eventSlug preferred, pmSlug fallback).
+function pmSlugFor(r) { return r && (r.eventSlug || r.pmSlug) || ""; }
 // Relative-time helper for the "First Seen" column: shows "12m", "3h", "2d" etc.
 // Returns "--" if ts is missing. Purely cosmetic — tooltip shows the full ISO string.
 function ageLabel(ts) {
@@ -4141,14 +4162,14 @@ async function loadWalletArbs() {
         }
         return '<tr>' +
           '<td>' + ageLabel(r.firstSeenAt) + '</td>' +
-          '<td>' + esc(r.match) + '</td>' +
+          '<td>' + kalLink(r.kalTicker, r.match) + '</td>' +
           '<td>' + typeBadge + '</td>' +
-          '<td style="font-size:11px">' + esc(r.kalTicker) + '</td>' +
+          '<td style="font-size:11px">' + kalLink(r.kalTicker, r.kalTicker) + '</td>' +
           '<td><span class="dir dir-' + (r.kalSide === "no" ? "C" : "A") + '">' + r.kalSide.toUpperCase() + '</span></td>' +
           '<td>' + r.kalShares + '</td>' +
           '<td>' + r.kalAvgPrice + '</td>' +
           '<td>$' + r.kalCost.toFixed(2) + '</td>' +
-          '<td>' + esc(r.pmOutcome) + '</td>' +
+          '<td>' + pmLink(pmSlugFor(r), r.pmOutcome) + '</td>' +
           '<td>' + r.pmShares + '</td>' +
           '<td>' + r.pmAvgPrice + '</td>' +
           '<td>$' + r.pmCost.toFixed(2) + '</td>' +
@@ -4182,8 +4203,8 @@ async function loadWalletArbs() {
         }
         return '<tr>' +
           '<td>' + ageLabel(r.firstSeenAt) + '</td>' +
-          '<td>' + esc(r.matchName || "—") + hedgeBadge(r.hedgeInfo) + '</td>' +
-          '<td style="font-size:11px;color:#8b949e">' + esc(r.ticker) + '</td>' +
+          '<td>' + kalLink(r.ticker, r.matchName || "—") + hedgeBadge(r.hedgeInfo) + '</td>' +
+          '<td style="font-size:11px;color:#8b949e">' + kalLink(r.ticker, r.ticker) + '</td>' +
           '<td>' + r.side.toUpperCase() + '</td>' +
           '<td>' + r.shares + '</td>' +
           '<td>' + r.avgPrice + '</td>' +
@@ -4247,9 +4268,9 @@ async function loadWalletArbs() {
     else nb.innerHTML = byStatus.naked.map(function(r) {
       return '<tr>' +
         '<td>' + ageLabel(r.firstSeenAt) + '</td>' +
-        '<td>' + esc(r.pairedMatchName || "?") + hedgeBadge(r.hedgeInfo) + '</td>' +
-        '<td>' + titleOutcome(r) + '</td>' +
-        '<td style="font-size:11px">' + esc(r.pairedKalTicker || "-") + '</td>' +
+        '<td>' + pmLink(pmSlugFor(r), r.pairedMatchName || "?") + hedgeBadge(r.hedgeInfo) + '</td>' +
+        '<td>' + pmLink(pmSlugFor(r), (r.title || "").slice(0, 48) + " / " + r.outcome) + '</td>' +
+        '<td style="font-size:11px">' + kalLink(r.pairedKalTicker, r.pairedKalTicker || "-") + '</td>' +
         '<td>' + esc(r.kalStatus || "-") + '</td>' +
         '<td>' + r.shares + '</td><td>' + r.avgPrice + '</td><td>' + r.curPrice + '</td>' +
         '<td>$' + r.cost.toFixed(2) + '</td><td>$' + r.currentValue.toFixed(2) + '</td>' +
@@ -4259,9 +4280,9 @@ async function loadWalletArbs() {
     function pmOnlyRow(r) {
       return '<tr>' +
         '<td>' + ageLabel(r.firstSeenAt) + '</td>' +
-        '<td>' + esc(r.pairedMatchName || "?") + '</td>' +
-        '<td>' + titleOutcome(r) + '</td>' +
-        '<td style="font-size:11px">' + esc(r.pairedKalTicker || "-") + '</td>' +
+        '<td>' + pmLink(pmSlugFor(r), r.pairedMatchName || "?") + '</td>' +
+        '<td>' + pmLink(pmSlugFor(r), (r.title || "").slice(0, 48) + " / " + r.outcome) + '</td>' +
+        '<td style="font-size:11px">' + kalLink(r.pairedKalTicker, r.pairedKalTicker || "-") + '</td>' +
         '<td>' + r.shares + '</td>' +
         '<td>' + (r.oppositeShares || 0) + '</td>' +
         '<td>' + r.avgPrice + '</td><td>' + r.curPrice + '</td>' +
@@ -4283,9 +4304,9 @@ async function loadWalletArbs() {
     else kpb.innerHTML = byStatus["kal-settled-pm-pending"].map(function(r) {
       return '<tr>' +
         '<td>' + ageLabel(r.firstSeenAt) + '</td>' +
-        '<td>' + esc(r.pairedMatchName || "?") + '</td>' +
-        '<td>' + titleOutcome(r) + '</td>' +
-        '<td style="font-size:11px">' + esc(r.pairedKalTicker || "-") + '</td>' +
+        '<td>' + pmLink(pmSlugFor(r), r.pairedMatchName || "?") + '</td>' +
+        '<td>' + pmLink(pmSlugFor(r), (r.title || "").slice(0, 48) + " / " + r.outcome) + '</td>' +
+        '<td style="font-size:11px">' + kalLink(r.pairedKalTicker, r.pairedKalTicker || "-") + '</td>' +
         '<td>' + esc(r.kalResult || "?") + '</td>' +
         '<td>' + r.shares + '</td><td>' + r.avgPrice + '</td><td>' + r.curPrice + '</td>' +
         '<td>$' + r.cost.toFixed(2) + '</td><td>$' + r.currentValue.toFixed(2) + '</td>' +
@@ -4301,9 +4322,9 @@ async function loadWalletArbs() {
     else wb.innerHTML = byStatus["settled-winner"].map(function(r) {
       return '<tr>' +
         '<td>' + ageLabel(r.firstSeenAt) + '</td>' +
-        '<td>' + esc(r.pairedMatchName || "?") + pendingTag(r) + '</td>' +
-        '<td>' + titleOutcome(r) + '</td>' +
-        '<td style="font-size:11px">' + esc(r.pairedKalTicker || "-") + '</td>' +
+        '<td>' + pmLink(pmSlugFor(r), r.pairedMatchName || "?") + pendingTag(r) + '</td>' +
+        '<td>' + pmLink(pmSlugFor(r), (r.title || "").slice(0, 48) + " / " + r.outcome) + '</td>' +
+        '<td style="font-size:11px">' + kalLink(r.pairedKalTicker, r.pairedKalTicker || "-") + '</td>' +
         '<td>' + r.shares + '</td><td>' + r.avgPrice + '</td><td>' + r.curPrice + '</td>' +
         '<td style="color:#3fb950">$' + r.shares.toFixed(2) + '</td>' +
         '<td>' + redeemBtn(r) + '</td></tr>';
@@ -4315,8 +4336,8 @@ async function loadWalletArbs() {
     else lb.innerHTML = byStatus["settled-loser"].map(function(r) {
       return '<tr>' +
         '<td>' + ageLabel(r.firstSeenAt) + '</td>' +
-        '<td>' + esc(r.pairedMatchName || "?") + pendingTag(r) + '</td>' +
-        '<td>' + titleOutcome(r) + '</td>' +
+        '<td>' + pmLink(pmSlugFor(r), r.pairedMatchName || "?") + pendingTag(r) + '</td>' +
+        '<td>' + pmLink(pmSlugFor(r), (r.title || "").slice(0, 48) + " / " + r.outcome) + '</td>' +
         '<td>' + r.shares + '</td><td>' + r.avgPrice + '</td><td>' + r.curPrice + '</td>' +
         '<td>' + redeemBtn(r) + '</td></tr>';
     }).join("");
@@ -4327,7 +4348,7 @@ async function loadWalletArbs() {
     if (other.length === 0) ob.innerHTML = '<tr><td colspan="7" class="empty">--</td></tr>';
     else ob.innerHTML = other.map(function(r) {
       return '<tr><td>' + ageLabel(r.firstSeenAt) + '</td>' +
-        '<td>' + titleOutcome(r) + '</td>' +
+        '<td>' + pmLink(pmSlugFor(r), (r.title || "").slice(0, 48) + " / " + r.outcome) + '</td>' +
         '<td style="font-size:11px">' + esc(r.tokenId.slice(0, 20)) + '...</td>' +
         '<td>' + esc(r.pmStatus) + '</td>' +
         '<td>' + r.shares + '</td><td>' + r.avgPrice + '</td><td>$' + r.cost.toFixed(2) + '</td></tr>';
