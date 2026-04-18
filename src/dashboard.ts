@@ -1539,21 +1539,35 @@ app.get("/api/wallet-arbs", async (_req, res) => {
       const kalCost = ((pos as any).marketExposureCents ?? 0) / 100;
       const kalAvgPrice = kalHeldShares > 0 ? kalCost / kalHeldShares : 0;
 
-      // Classify: "hedged" = KAL + PM on OPPOSITE outcomes ($1 combined payout when either wins)
-      //           "same-direction" = both on SAME outcome (either both win or both lose)
-      //           Stored in the watchlist as pmLeg (opposite of KAL-YES) and pmOppLeg (same as KAL-YES).
-      const pairingType: "hedged" | "same-direction" = pmLegHeld ? "hedged" : "same-direction";
+      // Classify (three states):
+      //   "hedged"        = OPPOSITE outcomes AND legs sized enough that the two win-case
+      //                     payouts are close → locked-in min-profit, the shape of a real arb.
+      //   "imbalanced"    = OPPOSITE outcomes BUT the sizes don't match — structurally an arb
+      //                     but economically a directional bet (e.g. 11 KAL / 75.89 PM).
+      //   "same-direction" = both legs on the SAME outcome — never was an arb.
+      const isStructurallyHedged = !!pmLegHeld;
 
-      // Scenario P&L:
-      //   hedged: kal wins → kal pays kalShares, pm loses pmCost. pm wins → pm pays pmShares, kal loses kalCost.
+      // Scenario P&L (compute before classification so we can measure skew):
+      //   hedged: kal wins → kal pays kalShares, pm loses. pm wins → pm pays pmShares, kal loses.
       //   same:   shared-outcome wins → BOTH pay out.   shared-outcome loses → BOTH lose.
       const kalTotalCost = kalCost + pmCost;
-      const netIfKalWins = pairingType === "hedged"
+      const netIfKalWins = isStructurallyHedged
         ? kalHeldShares - kalTotalCost
         : kalHeldShares + pmShares - kalTotalCost;
-      const netIfPmWins = pairingType === "hedged"
+      const netIfPmWins = isStructurallyHedged
         ? pmShares - kalTotalCost
         : -kalTotalCost;
+
+      // Imbalance threshold: if the two outcomes pay the same $ within $2 tolerance, it's a real
+      // arb. Otherwise it's directional exposure masquerading as a hedge. $2 covers rounding +
+      // fractional PM fill slop; anything bigger is a genuine size mismatch.
+      const IMBALANCE_TOLERANCE_USD = 2;
+      const pairingType: "hedged" | "imbalanced" | "same-direction" =
+        !isStructurallyHedged
+          ? "same-direction"
+          : Math.abs(netIfKalWins - netIfPmWins) <= IMBALANCE_TOLERANCE_USD
+            ? "hedged"
+            : "imbalanced";
 
       // Current mark-to-market for PM (KAL side mark = cost basis — no live KAL bid lookup here
       // to keep the endpoint fast; KAL can't change mid-position anyway until settlement).
@@ -3602,9 +3616,14 @@ async function loadWalletArbs() {
         var netKalC = r.netIfKalWins >= 0 ? '#3fb950' : '#f85149';
         var netPmC = r.netIfPmWins >= 0 ? '#3fb950' : '#f85149';
         var curC = r.currentPnl >= 0 ? '#3fb950' : '#f85149';
-        var typeBadge = r.pairingType === 'same-direction'
-          ? '<span style="color:#d29922;font-size:10px;padding:1px 4px;border:1px solid #d29922;border-radius:3px">SAME-SIDE</span>'
-          : '<span style="color:#3fb950;font-size:10px;padding:1px 4px;border:1px solid #3fb950;border-radius:3px">HEDGED</span>';
+        var typeBadge;
+        if (r.pairingType === 'same-direction') {
+          typeBadge = '<span style="color:#d29922;font-size:10px;padding:1px 4px;border:1px solid #d29922;border-radius:3px" title="Both legs on the SAME outcome — directional bet, never was an arb">SAME-SIDE</span>';
+        } else if (r.pairingType === 'imbalanced') {
+          typeBadge = '<span style="color:#ff7b00;font-size:10px;padding:1px 4px;border:1px solid #ff7b00;border-radius:3px" title="Opposite outcomes but sizes mismatched — directional exposure dressed as a hedge">IMBALANCED</span>';
+        } else {
+          typeBadge = '<span style="color:#3fb950;font-size:10px;padding:1px 4px;border:1px solid #3fb950;border-radius:3px" title="Opposite outcomes, sizes balanced — locked-in min-profit arb">HEDGED</span>';
+        }
         return '<tr>' +
           '<td>' + esc(r.match) + '</td>' +
           '<td>' + typeBadge + '</td>' +
