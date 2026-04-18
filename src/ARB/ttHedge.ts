@@ -2721,20 +2721,32 @@ export async function detectUnhedgedPmPositions(watchlist: WatchEntry[], hedgeSt
       return tid === m.pmOppLeg!.tokenId ? sum + sz : sum;
     }, 0)) : 0;
 
-    // Count how many shares are already covered by the Kalshi leg (complete-kal path)
-    // IMPORTANT: check the correct side (YES or NO) based on what the hedge needs.
-    // For 3-way markets with kalSide3Way="no", the hedge buys KAL NO, so existing
-    // KAL NO positions are the coverage. getKalshiPosition() only returns YES count,
-    // which would miss NO positions and cause false "unhedged" detection.
+    // Count how many shares are already covered by the Kalshi leg (complete-kal path).
+    // For the canonical hedge: holding pm1 → need kal2 YES (or equivalently kal1 NO, since
+    // YES+NO=$1 on the same ticker means kal1 NO pays whenever kal2 YES pays).
+    // For 3-way markets with kalSide3Way="no", the hedge buys KAL NO on the SAME outcome.
     const detectedKalSideForCheck: "yes" | "no" = m.kalSide3Way ?? "yes";
     let kalAlreadyFilled: number;
     if (kalPosMap) {
       const kalPos = kalPosMap.get(m.kalLeg.ticker);
-      kalAlreadyFilled = detectedKalSideForCheck === "no"
+      const canonicalCount = detectedKalSideForCheck === "no"
         ? (kalPos?.noCount ?? 0)
         : (kalPos?.yesCount ?? 0);
+      // 2-way only: also count the OTHER ticker's NO shares (semantically equivalent).
+      // For total markets kal1.ticker === kal2.ticker — skip to avoid double-counting.
+      let equivalentNoCount = 0;
+      if (!m.entry.is3Way && m.entry.kal1 && m.entry.kal2) {
+        const otherTicker = m.kalLeg.ticker === m.entry.kal1.ticker
+          ? m.entry.kal2.ticker
+          : m.entry.kal1.ticker;
+        if (otherTicker && otherTicker !== m.kalLeg.ticker) {
+          equivalentNoCount = kalPosMap.get(otherTicker)?.noCount ?? 0;
+        }
+      }
+      kalAlreadyFilled = canonicalCount + equivalentNoCount;
     } else {
-      // Fallback: use per-ticker API calls (legacy path)
+      // Fallback: per-ticker API calls (legacy path). No opposite-ticker-NO lookup here
+      // to avoid extra API calls; kalPosMap path above is the normal code-path.
       const kalAlreadyFilledRaw = detectedKalSideForCheck === "no"
         ? await getKalshiNoPosition(m.kalLeg.ticker)
         : await getKalshiPosition(m.kalLeg.ticker);

@@ -1679,15 +1679,29 @@ app.get("/api/wallet-arbs", async (_req, res) => {
       if (shares === 0) continue;
       const pairMeta = pairByPmTokenId.get(tokenId);
       const kalMkt = pairMeta?.kalTicker ? kalMarketStatus.get(pairMeta.kalTicker) : undefined;
-      const kalSettled = kalMkt ? (kalMkt.status === "finalized" || kalMkt.status === "settled") : false;
+      // Kalshi is tradable ONLY in "active" state. Everything else means the market isn't
+      // accepting new orders — closed (game over), determined (result known), finalized
+      // (payouts), settled, inactive, unopened. In all these, KAL can't be traded and the
+      // right move for a lingering PM side is to close it into the book.
+      const KAL_TRADABLE = new Set(["active"]);
+      const kalStatusNorm = kalMkt ? String(kalMkt.status).toLowerCase() : "";
+      const kalSettled = Boolean(kalMkt) && !KAL_TRADABLE.has(kalStatusNorm);
       const kalCanceled = kalMkt ? (kalMkt.status === "canceled" || kalMkt.status === "cancelled" || kalMkt.status === "void") : false;
       const pmRedeemable = Boolean((p as any).redeemable);
       const curPrice = Number((p as any).curPrice ?? 0);
 
-      let pmStatus: "naked" | "settled-winner" | "settled-loser" | "kal-settled-pm-pending" | "no-pair" | "void";
+      // PM-only hedge: user holds BOTH sides of this PM market (YES + NO tokens), so total
+      // payout is $1 regardless of outcome → not naked, effectively an arb with locked profit.
+      // PM data-api exposes `oppositeAsset` on each position — if that tokenId is also in
+      // our held set (pmByTokenId), mark this row as pm-only-hedged.
+      const oppositeAsset = String((p as any).oppositeAsset ?? "");
+      const pmOnlyHedged = Boolean(oppositeAsset && pmByTokenId.has(oppositeAsset));
+
+      let pmStatus: "naked" | "pm-only-hedged" | "settled-winner" | "settled-loser" | "kal-settled-pm-pending" | "no-pair" | "void";
       if (!pairMeta) pmStatus = "no-pair";
       else if (kalCanceled) pmStatus = "void";
       else if (pmRedeemable) pmStatus = curPrice >= 0.5 ? "settled-winner" : "settled-loser";
+      else if (pmOnlyHedged) pmStatus = "pm-only-hedged";
       else if (kalSettled) pmStatus = "kal-settled-pm-pending";
       else pmStatus = "naked";
 
@@ -1719,6 +1733,7 @@ app.get("/api/wallet-arbs", async (_req, res) => {
     // Split unpairedPm by status so the UI can render three buckets.
     const pmByStatus: Record<string, any[]> = {
       naked: [],
+      "pm-only-hedged": [],
       "settled-winner": [],
       "settled-loser": [],
       "kal-settled-pm-pending": [],
@@ -1736,6 +1751,7 @@ app.get("/api/wallet-arbs", async (_req, res) => {
         unpairedPm: unpairedPm.length,
         unpairedPmByStatus: {
           naked: pmByStatus.naked.length,
+          pmOnlyHedged: pmByStatus["pm-only-hedged"].length,
           winners: pmByStatus["settled-winner"].length,
           losers: pmByStatus["settled-loser"].length,
           kalSettledPmPending: pmByStatus["kal-settled-pm-pending"].length,
@@ -2723,9 +2739,17 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
     <thead><tr><th>Match</th><th>Title / Outcome</th><th>Paired KAL</th><th>KAL Status</th><th>Shares</th><th>Avg</th><th>Cur Px</th><th>Cost</th><th>Cur Value</th><th>Actions</th></tr></thead>
     <tbody id="walletArbsPmNakedBody"><tr><td colspan="10" class="empty">--</td></tr></tbody>
   </table>
+  <div class="section-title" style="font-size:13px;margin-top:24px;color:#58a6ff">
+    PM-only hedges (both sides held) <span id="walletArbsPmOnlyCount" style="font-size:11px;color:#8b949e;font-weight:normal"></span>
+    <span style="font-size:11px;color:#8b949e;font-weight:normal;margin-left:8px">YES+NO tokens both held — $1 payout regardless, not actually naked</span>
+  </div>
+  <table id="walletArbsPmOnlyTable">
+    <thead><tr><th>Match</th><th>Title / Outcome</th><th>Paired KAL</th><th>Shares</th><th>Avg</th><th>Cur Px</th><th>Cost</th><th>Cur Value</th><th>Actions</th></tr></thead>
+    <tbody id="walletArbsPmOnlyBody"><tr><td colspan="9" class="empty">--</td></tr></tbody>
+  </table>
   <div class="section-title" style="font-size:13px;margin-top:24px;color:#d29922">
-    KAL settled, PM still open <span id="walletArbsKalPendingCount" style="font-size:11px;color:#8b949e;font-weight:normal"></span>
-    <span style="font-size:11px;color:#8b949e;font-weight:normal;margin-left:8px">outcome known — can market-sell PM to exit</span>
+    KAL settled/closed, PM still open <span id="walletArbsKalPendingCount" style="font-size:11px;color:#8b949e;font-weight:normal"></span>
+    <span style="font-size:11px;color:#8b949e;font-weight:normal;margin-left:8px">KAL no longer tradable — market-sell PM to exit</span>
   </div>
   <table id="walletArbsPmKalPendingTable">
     <thead><tr><th>Match</th><th>Title / Outcome</th><th>Paired KAL</th><th>KAL Result</th><th>Shares</th><th>Avg</th><th>Cur Px</th><th>Cost</th><th>Cur Value</th><th>Actions</th></tr></thead>
@@ -3772,6 +3796,7 @@ async function loadWalletArbs() {
       'Unpaired KAL: <b>' + totals.unpairedKal + '</b>  &bull;  ' +
       'PM: <b>' + totals.unpairedPm + '</b> ' +
       '(<span style="color:#f85149">naked ' + (bs.naked||0) + '</span>, ' +
+      '<span style="color:#58a6ff">pm-only ' + (bs.pmOnlyHedged||0) + '</span>, ' +
       '<span style="color:#d29922">kal-settled ' + (bs.kalSettledPmPending||0) + '</span>, ' +
       '<span style="color:#3fb950">win ' + (bs.winners||0) + '</span>, ' +
       '<span style="color:#8b949e">lose ' + (bs.losers||0) + '</span>, ' +
@@ -3825,16 +3850,18 @@ async function loadWalletArbs() {
         return '<tr><td style="font-size:11px">' + esc(r.ticker) + '</td><td>' + r.side.toUpperCase() + '</td><td>' + r.shares + '</td><td>' + r.avgPrice + '</td><td>$' + r.cost.toFixed(2) + '</td></tr>';
       }).join("");
     }
-    // Unpaired PM — split by status into 5 buckets
-    var byStatus = { "naked": [], "kal-settled-pm-pending": [], "settled-winner": [], "settled-loser": [], "no-pair": [], "void": [] };
+    // Unpaired PM — split by status into 6 buckets (naked, pm-only-hedged, kal-settled-pm-pending, winner, loser, other)
+    var byStatus = { "naked": [], "pm-only-hedged": [], "kal-settled-pm-pending": [], "settled-winner": [], "settled-loser": [], "no-pair": [], "void": [] };
     (d.unpairedPm || []).forEach(function(r) { (byStatus[r.pmStatus] || byStatus.naked).push(r); });
 
     var nakedCt = byStatus.naked.length;
+    var pmOnlyCt = byStatus["pm-only-hedged"].length;
     var kalPendCt = byStatus["kal-settled-pm-pending"].length;
     var winCt = byStatus["settled-winner"].length;
     var loseCt = byStatus["settled-loser"].length;
     var otherCt = byStatus["no-pair"].length + byStatus.void.length;
     $("walletArbsNakedCount").textContent = "(" + nakedCt + ")";
+    $("walletArbsPmOnlyCount").textContent = "(" + pmOnlyCt + ")";
     $("walletArbsKalPendingCount").textContent = "(" + kalPendCt + ")";
     $("walletArbsWinnersCount").textContent = "(" + winCt + ")";
     $("walletArbsLosersCount").textContent = "(" + loseCt + ")";
@@ -3859,6 +3886,19 @@ async function loadWalletArbs() {
         '<td>' + titleOutcome(r) + '</td>' +
         '<td style="font-size:11px">' + esc(r.pairedKalTicker || "-") + '</td>' +
         '<td>' + esc(r.kalStatus || "-") + '</td>' +
+        '<td>' + r.shares + '</td><td>' + r.avgPrice + '</td><td>' + r.curPrice + '</td>' +
+        '<td>$' + r.cost.toFixed(2) + '</td><td>$' + r.currentValue.toFixed(2) + '</td>' +
+        '<td>' + sellBtn(r) + '</td></tr>';
+    }).join("");
+
+    // PM-only hedged (both YES + NO tokens held)
+    var pob = $("walletArbsPmOnlyBody");
+    if (pmOnlyCt === 0) pob.innerHTML = '<tr><td colspan="9" class="empty">--</td></tr>';
+    else pob.innerHTML = byStatus["pm-only-hedged"].map(function(r) {
+      return '<tr>' +
+        '<td>' + esc(r.pairedMatchName || "?") + '</td>' +
+        '<td>' + titleOutcome(r) + '</td>' +
+        '<td style="font-size:11px">' + esc(r.pairedKalTicker || "-") + '</td>' +
         '<td>' + r.shares + '</td><td>' + r.avgPrice + '</td><td>' + r.curPrice + '</td>' +
         '<td>$' + r.cost.toFixed(2) + '</td><td>$' + r.currentValue.toFixed(2) + '</td>' +
         '<td>' + sellBtn(r) + '</td></tr>';
