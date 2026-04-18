@@ -61,12 +61,14 @@
   "dependencies": {
     "@ethersproject/wallet": "^5.8.0",
     "@polymarket/clob-client": "^5.2.1",
+    "@polymarket/clob-client-v2": "^1.0.0",
     "@types/ws": "^8.18.1",
     "better-sqlite3": "^11.5.0",
     "dependency-cruiser": "^17.3.10",
     "dotenv": "^16.4.5",
     "ethers": "^6.16.0",
     "express": "^5.2.1",
+    "viem": "^2.48.1",
     "ws": "^8.19.0"
   },
   "devDependencies": {

@@ -370,6 +370,24 @@ Test files under `src/ARB/*.test.ts` (run with `npm run test`):
 
 ---
 
+## Polymarket CLOB V2 Migration (cutover 2026-04-22 ~11:00 UTC)
+
+V2 migration is **prepared but not active**. See [MIGRATION-V2.md](MIGRATION-V2.md) for the full plan + cutover checklist.
+
+**Key files:**
+- [ttPmOrdersV2.ts](src/ARB/ttPmOrdersV2.ts) — V2 adapter, mirrors V1 public API. Not wired into the main bot yet.
+- `package.json` — has both `@polymarket/clob-client` (V1) and `@polymarket/clob-client-v2@1.0.0`
+- [tmp_test_pm_v2.ts](tmp_test_pm_v2.ts) — smoke test against `clob-v2.polymarket.com`, confirmed working 2026-04-18
+
+**Known V2 breaking changes:**
+- Order struct removes `nonce`/`feeRateBps`/`taker`, adds `timestamp`/`metadata`/`builder`
+- Collateral: USDC.e → **pUSD** (wrap via CollateralOnramp at `0x93070a847efEf7F70739046A929D47a521F5B8ee`)
+- New Exchange contracts (CTF V2 + NegRisk V2)
+- EIP-712 Exchange domain bumps `"1"` → `"2"` (ClobAuth stays `"1"`)
+- All open orders wiped at cutover (bot will replace on next hedge cycle)
+
+**Do NOT flip to V2 before Apr 22** — V1 host is still live and authoritative. After Apr 22, `clob.polymarket.com` transparently becomes V2 and V1 stops working.
+
 ## Known Limitations & Technical Debt
 
 These are known issues. Do not waste time "discovering" them — they're documented here intentionally. Tags: **[important]** = watch for regressions / fix when related work touches it, **[cosmetic]** = acknowledged, low priority.
