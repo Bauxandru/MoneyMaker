@@ -2635,41 +2635,14 @@ export async function detectUnhedgedPmPositions(watchlist: WatchEntry[], hedgeSt
   if (!positions.length) return [];
   const results: HedgeState[] = [];
 
-  // Load resolved trades to avoid re-processing PM positions that are already accounted for.
-  // When a Kalshi market settles, the KAL position disappears from the portfolio, making
-  // the PM tokens look "unhedged". But the arb was already resolved -- don't re-process.
-  const existingTrades = loadArbTrades();
-  const resolvedSharesByPm = new Map<string, number>(); // key: "pmSlug|pmOutcome" -> total resolved shares
-  const resolvedSharesByTokenId = new Map<string, number>(); // key: pmTokenId -> total resolved shares
-  // Also track by slug alone: hedge-complete trades buy OPPOSITE outcome tokens.
-  // Those tokens aren't tracked by pmOutcome, but they're covered by the arb.
-  // Any trade on this slug (resolved/hedging) means positions are accounted for.
-  const resolvedSharesBySlug = new Map<string, number>(); // key: pmSlug -> total shares across ALL outcomes
-  for (const t of existingTrades) {
-    if (t.status === "resolved" || t.status === "filled") {
-      const key = `${t.pmSlug}|${t.pmOutcome}`;
-      resolvedSharesByPm.set(key, (resolvedSharesByPm.get(key) ?? 0) + (t.shares ?? 0));
-      if (t.pmTokenId) {
-        resolvedSharesByTokenId.set(t.pmTokenId, (resolvedSharesByTokenId.get(t.pmTokenId) ?? 0) + (t.shares ?? 0));
-      }
-      if (t.pmSlug) {
-        resolvedSharesBySlug.set(t.pmSlug, (resolvedSharesBySlug.get(t.pmSlug) ?? 0) + (t.shares ?? 0));
-      }
-    } else if (t.status === "hedging") {
-      // Only count "hedging" trades as tracked if they're actually in hedge_state.json.
-      // If hedge state was lost (crash/restart), these positions need to be re-detected.
-      if (hedgeStateTickers?.has(t.kalTicker)) {
-        const key = `${t.pmSlug}|${t.pmOutcome}`;
-        resolvedSharesByPm.set(key, (resolvedSharesByPm.get(key) ?? 0) + (t.shares ?? 0));
-        if (t.pmTokenId) {
-          resolvedSharesByTokenId.set(t.pmTokenId, (resolvedSharesByTokenId.get(t.pmTokenId) ?? 0) + (t.shares ?? 0));
-        }
-        if (t.pmSlug) {
-          resolvedSharesBySlug.set(t.pmSlug, (resolvedSharesBySlug.get(t.pmSlug) ?? 0) + (t.shares ?? 0));
-        }
-      }
-    }
-  }
+  // WALLET-FIRST: coverage is determined purely by on-chain/on-exchange positions.
+  // Previously this function loaded arb_trades.json and summed "resolved" shares per
+  // slug+outcome+tokenId as an ADDITIONAL source of coverage, plus a "hedge artifact"
+  // skip driven by the journal. That masked real wallet imbalances — a same-direction
+  // compound stack (KAL 16 Over + PM 76 Over) got marked resolved and the 65-share
+  // PM excess was invisible to the hedge detector. We now trust only the wallet:
+  // if PM holds N shares and KAL doesn't cover them (via opposite-side tokens or KAL
+  // same-outcome NO/YES), the position is unhedged, regardless of journal state.
 
   // Build tokenId -> watchlist leg lookup.
   // 2-way: Holding pm1 -> needs kal2 YES to complete (dir=B), oppLeg=pm2
@@ -2772,69 +2745,30 @@ export async function detectUnhedgedPmPositions(watchlist: WatchEntry[], hedgeSt
       kalAlreadyFilled = kalAlreadyFilledRaw;
     }
 
-    // Count shares already accounted for in resolved/active arb trades
-    // Use BOTH slug+outcome and tokenId lookups -- whichever finds more (handles string mismatches)
-    const tradeKey = `${m.entry.pmSlug}|${m.pmLeg.outcome}`;
-    const bySlug = resolvedSharesByPm.get(tradeKey) ?? 0;
-    const byToken = resolvedSharesByTokenId.get(m.pmLeg.tokenId) ?? 0;
-    // Also check by slug alone: hedge-complete trades create opposite PM tokens
-    // that aren't tracked by outcome. Any trade on this slug covers positions.
-    const bySlugAny = resolvedSharesBySlug.get(m.entry.pmSlug) ?? 0;
-
-    // CRITICAL: If no trade ever directly bought THIS outcome (bySlug=0, byToken=0)
-    // but trades exist on the same slug for the OPPOSITE outcome (bySlugAny > 0),
-    // then these PM tokens are hedge artifacts — bought by the hedge cycle to cover
-    // the opposite side. They do NOT need their own hedge. Skip entirely.
-    // Without this, every restart creates phantom hedge trades for hedge artifacts,
-    // buying more tokens in a snowball loop.
-    if (bySlug === 0 && byToken === 0 && bySlugAny > 0) {
-      console.log(
-        `[STARTUP] PM ${totalPmShares}x${m.pmLeg.outcome} -- hedge artifact` +
-        ` (no direct trade for this outcome, but ${bySlugAny} shares on same slug). Skipping.\n`
-      );
-      continue;
-    }
-
-    const alreadyTracked = Math.max(bySlug, byToken, bySlugAny);
-
-    // CRITICAL: if there's an active hedging trade for this ticker that is NOT in hedgeStates,
-    // it means the hedge was lost (crash/restart). Don't count it as covered — it needs re-detection.
-    const hasOrphanedHedge = existingTrades.some(t =>
-      t.status === "hedging" && t.kalTicker === m.kalLeg.ticker &&
-      !hedgeStateTickers?.has(t.kalTicker)
-    );
-    if (hasOrphanedHedge) {
-      console.log(`[STARTUP] PM ${totalPmShares}x${m.pmLeg.outcome} -- orphaned hedging trade on ${m.kalLeg.ticker}. Needs re-detection.`);
-      // Fall through to unhedged detection below
-    }
-
-    // Net unhedged = total PM shares minus whatever is already covered on either side.
-    // alreadyTracked counts shares from trade records (resolved + active hedging trades).
-    // oppPmSize counts PM opposite tokens in the wallet (from hedge-complete PM hedges).
-    // kalAlreadyFilled counts KAL positions on this ticker.
-    // These CAN be additive: tracked shares = completed arbs, oppPmSize = hedge tokens
-    // that aren't in any trade record's share count. Use sum, capped at totalPmShares.
-    const covered = hasOrphanedHedge ? 0 : Math.min(totalPmShares, alreadyTracked + oppPmSize + kalAlreadyFilled);
+    // Net unhedged = total PM shares minus wallet-derived coverage.
+    // oppPmSize counts PM opposite-outcome tokens in the wallet (hedge-complete artifact).
+    // kalAlreadyFilled counts KAL positions on the required side for the hedge.
+    // Both sum capped at totalPmShares — covering the PM count. Any excess PM shares
+    // beyond what KAL/opp-PM covers is genuinely unhedged (directional exposure).
+    const covered = Math.min(totalPmShares, oppPmSize + kalAlreadyFilled);
     const sharesHeld = totalPmShares - covered;
 
-    // Audit: log every PM position evaluation so we can trace detection decisions
-    audit({ module: "hedge", fn: "detectUnhedgedPmPositions", action: sharesHeld > 0 ? "pm-position-unhedged" : "pm-position-covered", kalTicker: m.kalLeg.ticker, pmSlug: m.entry.pmSlug, shares: totalPmShares, context: { outcome: m.pmLeg.outcome, tokenId: m.pmLeg.tokenId.slice(0, 20), bySlug, byToken, bySlugAny, alreadyTracked, oppPmSize, kalAlreadyFilled, covered, sharesHeld, tradeKey } });
+    audit({ module: "hedge", fn: "detectUnhedgedPmPositions", action: sharesHeld > 0 ? "pm-position-unhedged" : "pm-position-covered", kalTicker: m.kalLeg.ticker, pmSlug: m.entry.pmSlug, shares: totalPmShares, context: { outcome: m.pmLeg.outcome, tokenId: m.pmLeg.tokenId.slice(0, 20), oppPmSize, kalAlreadyFilled, covered, sharesHeld } });
 
     if (sharesHeld <= 0) {
       const parts: string[] = [];
       if (kalAlreadyFilled > 0) parts.push(`KAL ${kalAlreadyFilled}`);
       if (oppPmSize > 0) parts.push(`PM-opp ${oppPmSize}`);
-      if (alreadyTracked > 0) parts.push(`trades ${alreadyTracked}`);
       console.log(
-        `[STARTUP] PM ${totalPmShares}x${m.pmLeg.outcome} -- fully covered` +
-        ` (${parts.join(" + ")}). Arb complete, skipping.\n`
+        `[STARTUP] PM ${totalPmShares}x${m.pmLeg.outcome} -- fully covered by wallet` +
+        ` (${parts.join(" + ") || "nothing, size<0.5"}). Skipping.\n`
       );
       continue;
     }
 
     if (covered > 0) {
       console.log(
-        `[STARTUP] PM ${totalPmShares}x${m.pmLeg.outcome} -- ${covered} already covered` +
+        `[STARTUP] PM ${totalPmShares}x${m.pmLeg.outcome} -- ${covered} covered by wallet` +
         ` (KAL ${kalAlreadyFilled} + PM-opp ${oppPmSize}). Net unhedged: ${sharesHeld}.`
       );
     }
@@ -2966,22 +2900,12 @@ export async function detectUnhedgedKalPositions(watchlist: WatchEntry[], kalPos
 
   const results: HedgeState[] = [];
 
-  // Load resolved trades to avoid re-processing Kalshi positions already accounted for.
-  const existingTrades = loadArbTrades();
-  const resolvedSharesByKal = new Map<string, number>(); // key: kalTicker -> total resolved shares
-  for (const t of existingTrades) {
-    if (t.status === "resolved" || t.status === "filled") {
-      resolvedSharesByKal.set(t.kalTicker, (resolvedSharesByKal.get(t.kalTicker) ?? 0) + (t.shares ?? 0));
-    } else if (t.status === "hedging") {
-      // Only count "hedging" trades as tracked if they're actually in hedge_state.json.
-      // If hedge state was lost (crash/restart), these positions need to be re-detected.
-      if (hedgeStateTickers?.has(t.kalTicker)) {
-        resolvedSharesByKal.set(t.kalTicker, (resolvedSharesByKal.get(t.kalTicker) ?? 0) + (t.shares ?? 0));
-      } else {
-        console.warn(`[STARTUP] Orphaned hedge trade: ${t.kalTicker} (${t.shares} shares) -- status=hedging but NOT in hedge_state.json. Will re-detect.`);
-      }
-    }
-  }
+  // WALLET-FIRST: coverage is wallet-only. Previously we loaded arb_trades.json
+  // and used resolved-shares totals as a coverage signal, via
+  //   covered = max(liveWalletCoverage, alreadyTracked)
+  // which silently hid wallet imbalances whenever the journal reported "resolved"
+  // even if the wallet told a different story. Removed — any unhedged KAL share
+  // in the wallet now triggers hedge detection, regardless of journal state.
 
   for (const { ticker, yesCount, avgPriceCents } of kalYesPositions) {
     const m = kalTickerMap.get(ticker);
@@ -3026,32 +2950,27 @@ export async function detectUnhedgedKalPositions(watchlist: WatchEntry[], kalPos
       return tid === m.pmLeg.tokenId ? sum + sz : sum;
     }, 0));
 
-    // Count shares already accounted for in resolved/active arb trades
-    const alreadyTracked = resolvedSharesByKal.get(ticker) ?? 0;
+    console.log(`[STARTUP] KAL ${totalKalShares}x${ticker}: kalNO=${kalNoFilled} pmHeld=${pmHeld} inHedgeState=${hedgeStateTickers?.has(ticker) ?? "n/a"}`);
 
-    console.log(`[STARTUP] KAL ${totalKalShares}x${ticker}: kalNO=${kalNoFilled} pmHeld=${pmHeld} tracked=${alreadyTracked} inHedgeState=${hedgeStateTickers?.has(ticker) ?? "n/a"}`);
-
-    // Net unhedged = total Kalshi YES minus whatever is already covered on either side
-    // alreadyTracked may overlap with kalNoFilled/pmHeld, so use max to avoid double-counting
-    const liveCoverage = kalNoFilled + pmHeld;
-    const covered = Math.min(totalKalShares, Math.max(liveCoverage, alreadyTracked));
+    // Net unhedged = total Kalshi YES minus wallet-derived coverage.
+    // KAL NO (YES+NO=$1) and PM opposite-side tokens both cover one KAL YES share each.
+    const covered = Math.min(totalKalShares, kalNoFilled + pmHeld);
     const sharesHeld = totalKalShares - covered;
 
     if (sharesHeld <= 0) {
       const parts: string[] = [];
       if (kalNoFilled > 0) parts.push(`KAL NO ${kalNoFilled}`);
       if (pmHeld > 0) parts.push(`PM ${pmHeld}`);
-      if (alreadyTracked > 0) parts.push(`trades ${alreadyTracked}`);
       console.log(
-        `[STARTUP] Kalshi ${totalKalShares}x${ticker} YES -- fully covered` +
-        ` (${parts.join(" + ")}). Arb complete, skipping.\n`
+        `[STARTUP] Kalshi ${totalKalShares}x${ticker} YES -- fully covered by wallet` +
+        ` (${parts.join(" + ") || "—"}). Skipping.\n`
       );
       continue;
     }
 
     if (covered > 0) {
       console.log(
-        `[STARTUP] Kalshi ${totalKalShares}x${ticker} YES -- ${covered} already covered` +
+        `[STARTUP] Kalshi ${totalKalShares}x${ticker} YES -- ${covered} covered by wallet` +
         ` (KAL NO ${kalNoFilled} + PM ${pmHeld}). Net unhedged: ${sharesHeld}.`
       );
     }
