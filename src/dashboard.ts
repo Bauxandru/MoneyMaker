@@ -1458,7 +1458,14 @@ app.get("/api/wallet-arbs", async (_req, res) => {
       if (!w.kal1 || !w.kal2 || !w.pm1 || !w.pm2) continue;
       const matchName = `${w.kal1.surname ?? ""} vs ${w.kal2.surname ?? ""}`;
       pairByKalTicker.set(w.kal1.ticker, { pmLeg: w.pm2, pmOppLeg: w.pm1, pmSlug: w.pmSlug, matchName });
-      pairByKalTicker.set(w.kal2.ticker, { pmLeg: w.pm1, pmOppLeg: w.pm2, pmSlug: w.pmSlug, matchName });
+      // Only set kal2 if the tickers differ. For Kalshi total markets (O/U 1.5 etc.)
+      // both kal1 and kal2 point to the SAME ticker (teams are labels; the ticker
+      // represents "total goes over line"). Setting both would overwrite the kal1
+      // mapping with one where pmLeg = pm1 (same-direction of kal YES) instead of
+      // pm2 (opposite) — breaking the "hedged" classification downstream.
+      if (w.kal2.ticker !== w.kal1.ticker) {
+        pairByKalTicker.set(w.kal2.ticker, { pmLeg: w.pm1, pmOppLeg: w.pm2, pmSlug: w.pmSlug, matchName });
+      }
       pairByPmTokenId.set(w.pm1.tokenId, { kalTicker: w.kal1.ticker, matchName, pmSlug: w.pmSlug });
       pairByPmTokenId.set(w.pm2.tokenId, { kalTicker: w.kal2.ticker, matchName, pmSlug: w.pmSlug });
     }
@@ -1532,9 +1539,34 @@ app.get("/api/wallet-arbs", async (_req, res) => {
       const kalCost = ((pos as any).marketExposureCents ?? 0) / 100;
       const kalAvgPrice = kalHeldShares > 0 ? kalCost / kalHeldShares : 0;
 
+      // Classify: "hedged" = KAL + PM on OPPOSITE outcomes ($1 combined payout when either wins)
+      //           "same-direction" = both on SAME outcome (either both win or both lose)
+      //           Stored in the watchlist as pmLeg (opposite of KAL-YES) and pmOppLeg (same as KAL-YES).
+      const pairingType: "hedged" | "same-direction" = pmLegHeld ? "hedged" : "same-direction";
+
+      // Scenario P&L:
+      //   hedged: kal wins → kal pays kalShares, pm loses pmCost. pm wins → pm pays pmShares, kal loses kalCost.
+      //   same:   shared-outcome wins → BOTH pay out.   shared-outcome loses → BOTH lose.
+      const kalTotalCost = kalCost + pmCost;
+      const netIfKalWins = pairingType === "hedged"
+        ? kalHeldShares - kalTotalCost
+        : kalHeldShares + pmShares - kalTotalCost;
+      const netIfPmWins = pairingType === "hedged"
+        ? pmShares - kalTotalCost
+        : -kalTotalCost;
+
+      // Current mark-to-market for PM (KAL side mark = cost basis — no live KAL bid lookup here
+      // to keep the endpoint fast; KAL can't change mid-position anyway until settlement).
+      const pmCurrentValue = Number(pmHeld.currentValue ?? 0);
+      const pmUnrealizedPnl = pmCurrentValue - pmCost;
+      // Total unrealized = PM mark vs cost + KAL assumed at cost basis (shares × avgPrice)
+      // = pmUnrealizedPnl + (kalCost - kalCost) = pmUnrealizedPnl
+      const currentPnl = pmUnrealizedPnl;
+
       paired.push({
         match: pair.matchName || pmHeld.title || "?",
         historicalPair: Boolean((pair as any).historical),
+        pairingType,
         kalTicker,
         kalSide,
         kalShares: kalHeldShares,
@@ -1546,12 +1578,11 @@ app.get("/api/wallet-arbs", async (_req, res) => {
         pmShares: Math.round(pmShares * 100) / 100,
         pmAvgPrice: Math.round(pmAvgPrice * 10000) / 10000,
         pmCost: Math.round(pmCost * 100) / 100,
-        totalCost: Math.round((kalCost + pmCost) * 100) / 100,
-        // Projected net P&L per outcome (assumes both legs pay $1 per winning share):
-        //   If KAL side wins:  payout = kalHeldShares, PM loses (pays 0)
-        //   If PM side wins:   payout = pmShares, KAL loses
-        netIfKalWins: Math.round((kalHeldShares - kalCost - pmCost) * 100) / 100,
-        netIfPmWins: Math.round((pmShares - kalCost - pmCost) * 100) / 100,
+        pmCurrentValue: Math.round(pmCurrentValue * 100) / 100,
+        totalCost: Math.round(kalTotalCost * 100) / 100,
+        netIfKalWins: Math.round(netIfKalWins * 100) / 100,
+        netIfPmWins: Math.round(netIfPmWins * 100) / 100,
+        currentPnl: Math.round(currentPnl * 100) / 100,
       });
       usedKal.add(kalTicker);
       usedPm.add(pmTokenId);
@@ -2517,6 +2548,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
     <thead>
       <tr>
         <th>Match</th>
+        <th>Type</th>
         <th>KAL Ticker</th>
         <th>KAL Side</th>
         <th>KAL Shares</th>
@@ -2527,11 +2559,12 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
         <th>PM Avg</th>
         <th>PM Cost</th>
         <th>Total Cost</th>
-        <th>Net if KAL wins</th>
-        <th>Net if PM wins</th>
+        <th title="Current mark-to-market P&amp;L (PM data-api currentValue − cost)">Current P&amp;L</th>
+        <th>Net if KAL-side wins</th>
+        <th>Net if OPPOSITE wins</th>
       </tr>
     </thead>
-    <tbody id="walletArbsPairedBody"><tr><td colspan="13" class="empty">Click Refresh to load</td></tr></tbody>
+    <tbody id="walletArbsPairedBody"><tr><td colspan="15" class="empty">Click Refresh to load</td></tr></tbody>
   </table>
   <div class="section-title" style="font-size:13px;margin-top:24px">Unpaired Kalshi positions</div>
   <table id="walletArbsKalTable">
@@ -3550,13 +3583,18 @@ async function loadWalletArbs() {
     // Paired table
     var tb = $("walletArbsPairedBody");
     if (!d.paired || d.paired.length === 0) {
-      tb.innerHTML = '<tr><td colspan="13" class="empty">No paired arbs found</td></tr>';
+      tb.innerHTML = '<tr><td colspan="15" class="empty">No paired arbs found</td></tr>';
     } else {
       tb.innerHTML = d.paired.map(function(r) {
         var netKalC = r.netIfKalWins >= 0 ? '#3fb950' : '#f85149';
         var netPmC = r.netIfPmWins >= 0 ? '#3fb950' : '#f85149';
+        var curC = r.currentPnl >= 0 ? '#3fb950' : '#f85149';
+        var typeBadge = r.pairingType === 'same-direction'
+          ? '<span style="color:#d29922;font-size:10px;padding:1px 4px;border:1px solid #d29922;border-radius:3px">SAME-SIDE</span>'
+          : '<span style="color:#3fb950;font-size:10px;padding:1px 4px;border:1px solid #3fb950;border-radius:3px">HEDGED</span>';
         return '<tr>' +
           '<td>' + esc(r.match) + '</td>' +
+          '<td>' + typeBadge + '</td>' +
           '<td style="font-size:11px">' + esc(r.kalTicker) + '</td>' +
           '<td><span class="dir dir-' + (r.kalSide === "no" ? "C" : "A") + '">' + r.kalSide.toUpperCase() + '</span></td>' +
           '<td>' + r.kalShares + '</td>' +
@@ -3567,6 +3605,7 @@ async function loadWalletArbs() {
           '<td>' + r.pmAvgPrice + '</td>' +
           '<td>$' + r.pmCost.toFixed(2) + '</td>' +
           '<td>$' + r.totalCost.toFixed(2) + '</td>' +
+          '<td style="color:' + curC + '">$' + (r.currentPnl || 0).toFixed(2) + '</td>' +
           '<td style="color:' + netKalC + '">$' + r.netIfKalWins.toFixed(2) + '</td>' +
           '<td style="color:' + netPmC + '">$' + r.netIfPmWins.toFixed(2) + '</td>' +
           '</tr>';
