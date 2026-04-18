@@ -155,6 +155,146 @@ async function benchWs(url: string, label: string, samples: number = 5): Promise
   return s;
 }
 
+// --- Polygon balanceOf eth_call test ---------------------------------------
+// Most bot executions bottleneck on postVerifyMs — the time for an ERC-1155
+// balanceOf() RPC call against the ConditionalTokens contract. This is far
+// slower than eth_blockNumber because it's a state read with a specific
+// contract + slot. Testing it directly matches the bot's actual hot-path cost.
+const CTF_ADDRESS = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"; // Polygon
+async function benchBalanceOf(): Promise<Record<string, number>> {
+  if (!POLY_RPC) { console.log("  (POLY_RPC_URL not set — skipping balanceOf test)"); return {} as any; }
+  const funder = process.env.POLY_FUNDER || "";
+  if (!funder) { console.log("  (POLY_FUNDER not set — skipping balanceOf test)"); return {} as any; }
+  // Pick any active PM tokenId for the balance read. Content of the balance
+  // doesn't matter — we only time the RPC roundtrip.
+  const tokenId = await pickPmTokenId();
+  if (!tokenId) { console.log("  (no PM token picked — skipping balanceOf test)"); return {} as any; }
+
+  // Build eth_call data:
+  //   selector = keccak256("balanceOf(address,uint256)")[0:4] = 0x00fdd58e
+  //   args     = address (32-byte padded) + uint256 (32-byte padded)
+  const addrPadded = funder.toLowerCase().replace("0x", "").padStart(64, "0");
+  const tidHex = BigInt(tokenId).toString(16).padStart(64, "0");
+  const callData = "0x00fdd58e" + addrPadded + tidHex;
+
+  const times: number[] = [];
+  for (let i = 0; i < SAMPLES; i++) {
+    const t0 = performance.now();
+    const ok = await new Promise<boolean>((resolve) => {
+      const url = new URL(POLY_RPC);
+      const lib = url.protocol === "https:" ? https : http;
+      const body = JSON.stringify({
+        jsonrpc: "2.0", id: 1, method: "eth_call",
+        params: [{ to: CTF_ADDRESS, data: callData }, "latest"]
+      });
+      const req = lib.request({
+        method: "POST", hostname: url.hostname, port: url.port || (url.protocol === "https:" ? 443 : 80),
+        path: url.pathname + url.search,
+        headers: { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(body).toString() },
+        timeout: 10000,
+      }, (res) => {
+        let d = ""; res.on("data", c => d += c); res.on("end", () => {
+          try { const j = JSON.parse(d); resolve(!j.error && typeof j.result === "string"); }
+          catch { resolve(false); }
+        });
+      });
+      req.on("error", () => resolve(false)); req.on("timeout", () => { req.destroy(); resolve(false); });
+      req.write(body); req.end();
+    });
+    if (ok) times.push(Math.round(performance.now() - t0));
+    await new Promise(r => setTimeout(r, 200));
+  }
+  const s = stats("Polygon balanceOf", times);
+  printRow("Polygon balanceOf (eth_call)", s);
+  return s as any;
+}
+
+// --- Kalshi single-market GET + authenticated endpoints --------------------
+async function benchKalSingleMarket(ticker: string | null): Promise<Record<string, number>> {
+  if (!ticker) { console.log("  (no KAL ticker — skipping single-market test)"); return {} as any; }
+  const times: number[] = [];
+  for (let i = 0; i < SAMPLES; i++) {
+    const t0 = performance.now();
+    const ok = await new Promise<boolean>((resolve) => {
+      const url = new URL(KAL_BASE + "/markets/" + encodeURIComponent(ticker));
+      const req = https.request({ method: "GET", hostname: url.hostname, port: 443, path: url.pathname + url.search, headers: { Accept: "application/json" }, timeout: 8000 }, (res) => {
+        let d = ""; res.on("data", c => d += c); res.on("end", () => resolve(res.statusCode === 200));
+      });
+      req.on("error", () => resolve(false)); req.on("timeout", () => { req.destroy(); resolve(false); });
+      req.end();
+    });
+    if (ok) times.push(Math.round(performance.now() - t0));
+    await new Promise(r => setTimeout(r, 150));
+  }
+  const s = stats("KAL /markets/{ticker}", times);
+  printRow("KAL GET /markets/{ticker}", s);
+  return s as any;
+}
+
+// --- PM CLOB orderbook fetch -----------------------------------------------
+async function benchPmBook(tokenId: string | null): Promise<Record<string, number>> {
+  if (!tokenId) { console.log("  (no PM tokenId — skipping orderbook test)"); return {} as any; }
+  const times: number[] = [];
+  for (let i = 0; i < SAMPLES; i++) {
+    const t0 = performance.now();
+    const ok = await new Promise<boolean>((resolve) => {
+      const url = new URL(PM_CLOB + "/book?token_id=" + encodeURIComponent(tokenId));
+      const req = https.request({ method: "GET", hostname: url.hostname, port: 443, path: url.pathname + url.search, headers: { Accept: "application/json" }, timeout: 8000 }, (res) => {
+        let d = ""; res.on("data", c => d += c); res.on("end", () => resolve(res.statusCode === 200));
+      });
+      req.on("error", () => resolve(false)); req.on("timeout", () => { req.destroy(); resolve(false); });
+      req.end();
+    });
+    if (ok) times.push(Math.round(performance.now() - t0));
+    await new Promise(r => setTimeout(r, 150));
+  }
+  const s = stats("PM CLOB /book", times);
+  printRow("PM CLOB /book?token_id=X", s);
+  return s as any;
+}
+
+// --- Kalshi authenticated WS connect ----------------------------------------
+async function benchKalAuthWs(): Promise<Record<string, number>> {
+  const apiKeyId = process.env.KALSHI_API_KEY_ID;
+  const privateKey = process.env.KALSHI_PRIVATE_KEY || (process.env.KALSHI_PRIVATE_KEY_PATH ? (() => { try { return fs.readFileSync(process.env.KALSHI_PRIVATE_KEY_PATH!, "utf8"); } catch { return ""; } })() : "");
+  if (!apiKeyId || !privateKey) { console.log("  (missing KAL auth — skipping auth WS test)"); return {} as any; }
+  const times: number[] = [];
+  for (let i = 0; i < 5; i++) {
+    const ts = String(Date.now());
+    let sig = "";
+    try {
+      const signer = crypto.createSign("RSA-SHA256");
+      signer.update(`${ts}GET/trade-api/ws/v2`); signer.end();
+      sig = signer.sign({ key: privateKey, padding: crypto.constants.RSA_PKCS1_PSS_PADDING, saltLength: 32 }, "base64");
+    } catch (e: any) { console.warn("  [KAL WS] sign failed: " + e.message); break; }
+    const t0 = performance.now();
+    const connMs = await new Promise<number>((resolve) => {
+      try {
+        const ws = new WebSocket(KAL_WS, {
+          handshakeTimeout: 10000,
+          headers: {
+            "KALSHI-ACCESS-KEY": apiKeyId,
+            "KALSHI-ACCESS-TIMESTAMP": ts,
+            "KALSHI-ACCESS-SIGNATURE": sig,
+          },
+        });
+        const timer = setTimeout(() => { try { ws.close(); } catch {} resolve(-1); }, 10000);
+        ws.on("open", () => {
+          const t = Math.round(performance.now() - t0);
+          clearTimeout(timer); ws.close();
+          resolve(t);
+        });
+        ws.on("error", () => { clearTimeout(timer); resolve(-1); });
+      } catch { resolve(-1); }
+    });
+    if (connMs > 0) times.push(connMs);
+    await new Promise(r => setTimeout(r, 300));
+  }
+  const s = stats("KAL WS (auth)", times);
+  printRow("KAL WS connect (authenticated)", s);
+  return s as any;
+}
+
 // --- Auto-pick active markets for live order tests -------------------------
 // Queries Kalshi and Polymarket at runtime to pick liquid markets to place
 // 1¢ orders against. Prefers high-volume, tight-spread books so the 1¢ order
@@ -331,11 +471,12 @@ async function benchKalOrders(): Promise<Record<string, Record<string, number>>>
   printRow("KAL place GTC (roundtrip)", ps);
   printRow("KAL cancel GTC (roundtrip)", cs);
 
-  // --- KAL IOC test (taker, self-cancels on non-fill) --------------------
+  // --- KAL IOC test (taker, self-cancels on non-fill) + order-status poll -
   // Place IOC BUY YES @ 1¢. Since no real ask is at 1¢, the IOC matches
-  // nothing and auto-cancels server-side. We measure the full round-trip.
-  // No manual cancel needed. This simulates the bot's fast-arb path.
+  // nothing and auto-cancels server-side. Then fetch the order status via
+  // GET /portfolio/orders/{id} — this is the bot's post-fill verify path.
   const iocs: number[] = [];
+  const iocStatusChecks: number[] = [];
   for (let i = 0; i < SAMPLES; i++) {
     const iocBody = {
       ticker: kalTickerForTest,
@@ -348,12 +489,20 @@ async function benchKalOrders(): Promise<Record<string, Record<string, number>>>
     const r = await kalReq("POST", "/portfolio/orders", iocBody);
     if (r.status === 200 || r.status === 201) iocs.push(r.ms);
     else if (i === 0) console.warn("  [KAL IOC] status=" + r.status + " body=" + JSON.stringify(r.body).slice(0, 200));
+    // Poll status right after — matches the bot's immediate-poll pattern
+    const orderId = r.body?.order?.order_id ?? r.body?.order_id;
+    if (orderId) {
+      const s = await kalReq("GET", "/portfolio/orders/" + orderId);
+      if (s.status === 200) iocStatusChecks.push(s.ms);
+    }
     await new Promise(res => setTimeout(res, 500));
   }
   const is = stats("KAL place IOC", iocs);
+  const iss = stats("KAL GET /orders/{id}", iocStatusChecks);
   printRow("KAL place IOC (roundtrip)", is);
+  printRow("KAL GET /orders/{id}", iss);
 
-  return { place: ps, cancel: cs, ioc: is } as any;
+  return { place: ps, cancel: cs, ioc: is, status: iss } as any;
 }
 
 // --- Polymarket live order test --------------------------------------------
@@ -490,14 +639,26 @@ async function main() {
   report.pm_gamma = await benchHttp(PM_GAMMA + "/events?limit=1", "PM gamma /events");
   report.pm_data_api = await benchHttp(PM_DATA_API + "/positions?user=0x0000000000000000000000000000000000000000", "PM data-api /positions");
 
+  // Pick markets ONCE so single-market / book / balanceOf tests share the same
+  // target (and we don't call the auto-picker 3 times).
+  const kalTickerForProbes = await pickKalTicker();
+  const pmTokenForProbes = await pickPmTokenId();
+
+  console.log();
+  console.log("--- Market-specific endpoint probes ---");
+  report.kalshi_single_market = await benchKalSingleMarket(kalTickerForProbes);
+  report.pm_clob_book = await benchPmBook(pmTokenForProbes);
+
   console.log();
   console.log("--- WebSocket connect times ---");
-  report.kalshi_ws = await benchWs(KAL_WS, "Kalshi WS connect");
+  report.kalshi_ws = await benchWs(KAL_WS, "Kalshi WS connect (unauth)");
+  report.kalshi_ws_auth = await benchKalAuthWs();
   report.pm_ws = await benchWs(PM_WS_MARKET, "PM WS connect");
 
   console.log();
   console.log("--- Polygon RPC ---");
   report.polygon_rpc = await benchRpc();
+  report.polygon_balance_of = await benchBalanceOf();
 
   if (!SKIP_LIVE) {
     console.log();
@@ -517,10 +678,11 @@ async function main() {
   const kw = report.kalshi_ws ?? {};
   const pw = report.pm_ws ?? {};
   const rpc = report.polygon_rpc ?? {};
-  console.log("  KAL API total p50=" + (h.p50 || "-") + "ms  PM CLOB total p50=" + (p.p50 || "-") + "ms");
-  console.log("  KAL WS p50=" + (kw.p50 || "-") + "ms  PM WS p50=" + (pw.p50 || "-") + "ms");
-  console.log("  Polygon RPC p50=" + (rpc.p50 || "-") + "ms");
-  if (report.kal_orders?.place?.p50) console.log("  KAL GTC place p50=" + report.kal_orders.place.p50 + "ms  cancel p50=" + (report.kal_orders.cancel?.p50 || "-") + "ms");
+  console.log("  KAL /markets p50=" + (h.p50 || "-") + "ms      PM CLOB /ok p50=" + (p.p50 || "-") + "ms");
+  console.log("  KAL /markets/{t} p50=" + (report.kalshi_single_market?.p50 || "-") + "ms  PM /book p50=" + (report.pm_clob_book?.p50 || "-") + "ms");
+  console.log("  KAL WS unauth p50=" + (kw.p50 || "-") + "ms   KAL WS auth p50=" + (report.kalshi_ws_auth?.p50 || "-") + "ms   PM WS p50=" + (pw.p50 || "-") + "ms");
+  console.log("  Polygon blockNumber p50=" + (rpc.p50 || "-") + "ms   balanceOf p50=" + (report.polygon_balance_of?.p50 || "-") + "ms");
+  if (report.kal_orders?.place?.p50) console.log("  KAL GTC place p50=" + report.kal_orders.place.p50 + "ms  cancel p50=" + (report.kal_orders.cancel?.p50 || "-") + "ms  status p50=" + (report.kal_orders.status?.p50 || "-") + "ms");
   if (report.kal_orders?.ioc?.p50) console.log("  KAL IOC place p50=" + report.kal_orders.ioc.p50 + "ms");
   if (report.pm_orders?.place?.p50) console.log("  PM  GTC place p50=" + report.pm_orders.place.p50 + "ms  cancel p50=" + (report.pm_orders.cancel?.p50 || "-") + "ms");
   if (report.pm_orders?.fak?.p50) console.log("  PM  FAK place p50=" + report.pm_orders.fak.p50 + "ms");
