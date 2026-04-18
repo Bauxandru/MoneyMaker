@@ -1449,19 +1449,18 @@ app.get("/api/wallet-arbs", async (_req, res) => {
       try { watchlist = JSON.parse(readFileSync(cachePath, "utf8"))?.watchlist ?? []; }
       catch { watchlist = []; }
     }
-    // kalTicker → pair metadata (incl both PM outcomes so we know which side pairs with which)
-    const pairByKalTicker = new Map<string, { pmLeg: any; pmOppLeg: any; pmSlug: string; matchName: string; kalSide: "yes" | "no" }>();
-    const pairByPmTokenId = new Map<string, { kalTicker: string; kalSurname: string; pmSlug: string; matchName: string }>();
+    // kalTicker → both PM legs (we accept whichever side is actually held in the wallet).
+    const pairByKalTicker = new Map<string, { pmLeg: any; pmOppLeg: any; pmSlug: string; matchName: string }>();
+    // pmTokenId → the paired KAL ticker/match, used to annotate unpaired PM rows when the
+    // KAL leg is flat (so we can still show "this PM position belongs to Alcaraz vs Sinner").
+    const pairByPmTokenId = new Map<string, { kalTicker: string; matchName: string; pmSlug: string }>();
     for (const w of watchlist) {
       if (!w.kal1 || !w.kal2 || !w.pm1 || !w.pm2) continue;
       const matchName = `${w.kal1.surname ?? ""} vs ${w.kal2.surname ?? ""}`;
-      // Dir A: KAL P1 YES + PM P2 opposite; Dir C: KAL P1 NO + PM P1 same.
-      // We tag kalSide as "yes" here (canonical dir A pairing); PM side is
-      // whichever outcome is actually in the wallet.
-      pairByKalTicker.set(w.kal1.ticker, { pmLeg: w.pm2, pmOppLeg: w.pm1, pmSlug: w.pmSlug, matchName, kalSide: "yes" });
-      pairByKalTicker.set(w.kal2.ticker, { pmLeg: w.pm1, pmOppLeg: w.pm2, pmSlug: w.pmSlug, matchName, kalSide: "yes" });
-      pairByPmTokenId.set(w.pm1.tokenId, { kalTicker: w.kal1.ticker, kalSurname: w.kal1.surname, pmSlug: w.pmSlug, matchName });
-      pairByPmTokenId.set(w.pm2.tokenId, { kalTicker: w.kal2.ticker, kalSurname: w.kal2.surname, pmSlug: w.pmSlug, matchName });
+      pairByKalTicker.set(w.kal1.ticker, { pmLeg: w.pm2, pmOppLeg: w.pm1, pmSlug: w.pmSlug, matchName });
+      pairByKalTicker.set(w.kal2.ticker, { pmLeg: w.pm1, pmOppLeg: w.pm2, pmSlug: w.pmSlug, matchName });
+      pairByPmTokenId.set(w.pm1.tokenId, { kalTicker: w.kal1.ticker, matchName, pmSlug: w.pmSlug });
+      pairByPmTokenId.set(w.pm2.tokenId, { kalTicker: w.kal2.ticker, matchName, pmSlug: w.pmSlug });
     }
 
     // 2. Fetch live KAL + PM positions in parallel
@@ -1560,11 +1559,17 @@ app.get("/api/wallet-arbs", async (_req, res) => {
       if (usedPm.has(tokenId)) continue;
       const shares = Number(p.size ?? 0);
       if (shares === 0) continue;
+      // If we have a watchlist pair for this PM token but the KAL leg was flat,
+      // annotate the row with the paired KAL ticker + match name so it's obvious
+      // the PM share is an orphan from a known arb pair, not a random PM position.
+      const pairMeta = pairByPmTokenId.get(tokenId);
       unpairedPm.push({
         exchange: "polymarket",
         tokenId,
         outcome: String(p.outcome ?? ""),
         title: String(p.title ?? ""),
+        pairedKalTicker: pairMeta?.kalTicker ?? "",
+        pairedMatchName: pairMeta?.matchName ?? "",
         shares: Math.round(shares * 100) / 100,
         avgPrice: Math.round(Number(p.avgPrice ?? 0) * 10000) / 10000,
         cost: Math.round(Number(p.initialValue ?? 0) * 100) / 100,
