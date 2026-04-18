@@ -637,6 +637,46 @@ export async function executeArb(
 
     // Both sides passed — log as executed opportunity
     logDepthOpp("executed");
+
+    // Snapshot both orderbooks right before order placement. We only store books for
+    // arbs that actually send transactions (no snapshot for discovery-only or aborted
+    // attempts) — per-trade diagnostic record for post-hoc analysis (partial fills,
+    // depth-vs-fill mismatches, slippage tracking).
+    if (!DRY_RUN) {
+      try {
+        const kalBookForSnap = getWsKalBook(kalLeg.ticker);
+        const pmAsksForSnap = getWsPmAsks(pmLeg.tokenId) ?? pmAskLevels ?? [];
+        const pmBidsForSnap = getWsPmBids(pmLeg.tokenId) ?? [];
+        saveBookTrack({
+          id: `exec-${Date.now()}`,
+          ts: new Date().toISOString(),
+          phase: "execution",
+          match: `${entry.kal1.surname} vs ${entry.kal2.surname}`,
+          dir,
+          kalTicker: kalLeg.ticker,
+          pmTokenId: pmLeg.tokenId,
+          pmOutcome: pmLeg.outcome,
+          kalAskAtDiscovery: kalAsk,
+          pmAskAtDiscovery: pmAsk,
+          edge,
+          samples: [{
+            t: 0,
+            kalYesAsks: kalBookForSnap?.yes ?? [],
+            kalNoAsks: kalBookForSnap?.no ?? [],
+            // Kalshi WS exposes only the ASK side per outcome; bid = complement. Derived
+            // on-read if needed, so leave empty here to keep the snapshot compact.
+            kalYesBids: [],
+            kalNoBids: [],
+            pmAsks: pmAsksForSnap,
+            pmBids: pmBidsForSnap,
+            source: (kalBookForSnap && pmAsksForSnap.length > 0) ? "ws" : "mixed",
+          }],
+        });
+      } catch (e) {
+        // Never block execution on snapshot failures — best-effort only.
+        console.warn(`[BOOK-SNAP] failed to save execution snapshot: ${(e as Error).message}`);
+      }
+    }
   }
 
   // Helper: build a UnhedgedPosition when one leg is held and the other is missing.
