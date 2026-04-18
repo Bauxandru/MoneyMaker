@@ -67,3 +67,14 @@ DRIFT_WARN_USD=5
 # Disable the backfill on the "secondary" bot to keep its journal clean.
 # Best practice: run one wallet per bot and leave this at its default (false).
 # DISABLE_AUTO_BACKFILL=true
+
+# ── Post-settlement PM auto-close (all default OFF) ───────────────────────
+# After a Kalshi market settles, PM shares stay in the wallet until you either
+# market-sell them (loser side) or redeem them on-chain (winner side). Flip
+# these on to have the bot do it automatically every 5 min. With all three
+# false (the default) nothing is done — use the dashboard "Wallet Arbs" tab
+# buttons to close positions manually.
+#
+# AUTO_CLAIM_PM_WINNERS=false      # on-chain redeemPositions for winning PM shares (non-negRisk only)
+# AUTO_SELL_PM_LOSERS=false        # FAK SELL worthless PM shares into any bid
+# AUTO_EXIT_PM_KAL_SETTLED=false   # reserved — currently no-op in the auto cycle

@@ -15,7 +15,7 @@ import {
   type ExchangeEvent, type ComputedTradeRecord,
 } from "./ARB/ttEventLog.js";
 import WebSocket from "ws";
-import { fetchAllKalshiFills, fetchAllKalshiSettlements, getKalshiPositionMap, type KalFill } from "./kalshiTrade.js";
+import { fetchAllKalshiFills, fetchAllKalshiSettlements, fetchKalshiMarket, getKalshiPositionMap, type KalFill } from "./kalshiTrade.js";
 import { ClobClient } from "@polymarket/clob-client";
 import { Wallet } from "@ethersproject/wallet";
 import { resolvePolyApiCreds } from "./polyAuth.js";
@@ -1554,24 +1554,69 @@ app.get("/api/wallet-arbs", async (_req, res) => {
         cost: Math.round(held * avg * 100) / 100,
       });
     }
+    // 4a. Pre-fetch Kalshi market status for every paired KAL ticker we need to classify.
+    // Parallel — one round-trip per unique ticker, bounded by the unpaired-PM count.
+    const kalTickersToCheck = new Set<string>();
+    for (const [tokenId, p] of pmByTokenId.entries()) {
+      if (usedPm.has(tokenId)) continue;
+      if (Number(p.size ?? 0) === 0) continue;
+      const pairMeta = pairByPmTokenId.get(tokenId);
+      if (pairMeta?.kalTicker) kalTickersToCheck.add(pairMeta.kalTicker);
+    }
+    const kalMarketStatus = new Map<string, { status: string; result: string }>();
+    await Promise.all(Array.from(kalTickersToCheck).map(async (ticker) => {
+      try {
+        const mkt = await fetchKalshiMarket(ticker) as Record<string, unknown>;
+        kalMarketStatus.set(ticker, {
+          status: String(mkt.status ?? ""),
+          result: String(mkt.result ?? ""),
+        });
+      } catch { /* network error — leave unset, classify as naked */ }
+    }));
+
+    // 4b. Build unpaired-PM rows with settlement classification.
+    // pmStatus values:
+    //   naked                   — PM shares, KAL market still active → genuinely unhedged
+    //   settled-winner          — PM market resolved, our shares pay ~$1 → claim on-chain
+    //   settled-loser           — PM market resolved, our shares pay ~$0 → worthless (sell dust or ignore)
+    //   kal-settled-pm-pending  — KAL market settled, PM still open → can market-sell PM now to exit
+    //   no-pair                 — no watchlist pair for this token (orphan/manual)
     const unpairedPm: any[] = [];
     for (const [tokenId, p] of pmByTokenId.entries()) {
       if (usedPm.has(tokenId)) continue;
       const shares = Number(p.size ?? 0);
       if (shares === 0) continue;
-      // If we have a watchlist pair for this PM token but the KAL leg was flat,
-      // annotate the row with the paired KAL ticker + match name so it's obvious
-      // the PM share is an orphan from a known arb pair, not a random PM position.
       const pairMeta = pairByPmTokenId.get(tokenId);
+      const kalMkt = pairMeta?.kalTicker ? kalMarketStatus.get(pairMeta.kalTicker) : undefined;
+      const kalSettled = kalMkt ? (kalMkt.status === "finalized" || kalMkt.status === "settled") : false;
+      const kalCanceled = kalMkt ? (kalMkt.status === "canceled" || kalMkt.status === "cancelled" || kalMkt.status === "void") : false;
+      const pmRedeemable = Boolean((p as any).redeemable);
+      const curPrice = Number((p as any).curPrice ?? 0);
+
+      let pmStatus: "naked" | "settled-winner" | "settled-loser" | "kal-settled-pm-pending" | "no-pair" | "void";
+      if (!pairMeta) pmStatus = "no-pair";
+      else if (kalCanceled) pmStatus = "void";
+      else if (pmRedeemable) pmStatus = curPrice >= 0.5 ? "settled-winner" : "settled-loser";
+      else if (kalSettled) pmStatus = "kal-settled-pm-pending";
+      else pmStatus = "naked";
+
       unpairedPm.push({
         exchange: "polymarket",
         tokenId,
+        conditionId: String((p as any).conditionId ?? ""),
         outcome: String(p.outcome ?? ""),
+        outcomeIndex: Number((p as any).outcomeIndex ?? 0),
         title: String(p.title ?? ""),
         pairedKalTicker: pairMeta?.kalTicker ?? "",
         pairedMatchName: pairMeta?.matchName ?? "",
+        kalStatus: kalMkt?.status ?? "",
+        kalResult: kalMkt?.result ?? "",
+        pmStatus,
+        pmRedeemable,
+        negRisk: Boolean((p as any).negativeRisk),
         shares: Math.round(shares * 100) / 100,
         avgPrice: Math.round(Number(p.avgPrice ?? 0) * 10000) / 10000,
+        curPrice: Math.round(curPrice * 10000) / 10000,
         cost: Math.round(Number(p.initialValue ?? 0) * 100) / 100,
         currentValue: Math.round(Number(p.currentValue ?? 0) * 100) / 100,
       });
@@ -1580,6 +1625,17 @@ app.get("/api/wallet-arbs", async (_req, res) => {
     const totalKalCost = paired.reduce((s, r) => s + r.kalCost, 0) + unpairedKal.reduce((s, r) => s + r.cost, 0);
     const totalPmCost = paired.reduce((s, r) => s + r.pmCost, 0) + unpairedPm.reduce((s, r) => s + r.cost, 0);
 
+    // Split unpairedPm by status so the UI can render three buckets.
+    const pmByStatus: Record<string, any[]> = {
+      naked: [],
+      "settled-winner": [],
+      "settled-loser": [],
+      "kal-settled-pm-pending": [],
+      "no-pair": [],
+      void: [],
+    };
+    for (const r of unpairedPm) (pmByStatus[r.pmStatus] ?? pmByStatus.naked).push(r);
+
     res.json({
       ts: new Date().toISOString(),
       watchlistEntries: watchlist.length,
@@ -1587,6 +1643,14 @@ app.get("/api/wallet-arbs", async (_req, res) => {
         pairedArbs: paired.length,
         unpairedKal: unpairedKal.length,
         unpairedPm: unpairedPm.length,
+        unpairedPmByStatus: {
+          naked: pmByStatus.naked.length,
+          winners: pmByStatus["settled-winner"].length,
+          losers: pmByStatus["settled-loser"].length,
+          kalSettledPmPending: pmByStatus["kal-settled-pm-pending"].length,
+          noPair: pmByStatus["no-pair"].length,
+          void: pmByStatus.void.length,
+        },
         totalKalCost: Math.round(totalKalCost * 100) / 100,
         totalPmCost: Math.round(totalPmCost * 100) / 100,
         totalCapitalAtRisk: Math.round((totalKalCost + totalPmCost) * 100) / 100,
@@ -1595,6 +1659,48 @@ app.get("/api/wallet-arbs", async (_req, res) => {
       unpairedKal,
       unpairedPm,
     });
+  } catch (e) {
+    res.status(500).json({ error: (e as Error).message });
+  }
+});
+
+// -- Manual-trigger PM close actions ------------------------------------------
+// POST /api/pm-sell  { tokenId, shares, negRisk }     → FAK SELL at best bid
+// POST /api/pm-redeem { conditionId, outcomeIndex, negRisk } → on-chain redeem
+// Both respect DRY_RUN=true by default (returns what-would-happen without sending).
+
+app.post("/api/pm-sell", async (req, res) => {
+  try {
+    const { sellPmAtMarket } = await import("./ARB/ttSettleClose.js");
+    const { tokenId, shares, negRisk } = req.body ?? {};
+    if (!tokenId || typeof tokenId !== "string") return res.status(400).json({ error: "tokenId required" });
+    if (!Number.isFinite(Number(shares)) || Number(shares) <= 0) return res.status(400).json({ error: "shares > 0 required" });
+    const dryRun = String(process.env.DRY_RUN ?? "true").toLowerCase() !== "false";
+    const result = await sellPmAtMarket({
+      tokenId: String(tokenId),
+      shares: Number(shares),
+      negRisk: Boolean(negRisk),
+      dryRun,
+    });
+    res.json(result);
+  } catch (e) {
+    res.status(500).json({ error: (e as Error).message });
+  }
+});
+
+app.post("/api/pm-redeem", async (req, res) => {
+  try {
+    const { redeemPmWinner } = await import("./ARB/ttSettleClose.js");
+    const { conditionId, outcomeIndex, negRisk } = req.body ?? {};
+    if (!conditionId || typeof conditionId !== "string") return res.status(400).json({ error: "conditionId required" });
+    const dryRun = String(process.env.DRY_RUN ?? "true").toLowerCase() !== "false";
+    const result = await redeemPmWinner({
+      conditionId: String(conditionId),
+      outcomeIndex: Number(outcomeIndex ?? 0),
+      negRisk: Boolean(negRisk),
+      dryRun,
+    });
+    res.json(result);
   } catch (e) {
     res.status(500).json({ error: (e as Error).message });
   }
@@ -2408,10 +2514,44 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
     <thead><tr><th>Ticker</th><th>Side</th><th>Shares</th><th>Avg</th><th>Cost</th></tr></thead>
     <tbody id="walletArbsKalBody"><tr><td colspan="5" class="empty">--</td></tr></tbody>
   </table>
-  <div class="section-title" style="font-size:13px;margin-top:24px">Unpaired Polymarket positions</div>
-  <table id="walletArbsPmTable">
-    <thead><tr><th>Title / Outcome</th><th>TokenId</th><th>Shares</th><th>Avg</th><th>Cost</th><th>Current Value</th></tr></thead>
-    <tbody id="walletArbsPmBody"><tr><td colspan="6" class="empty">--</td></tr></tbody>
+  <!-- PM positions split by settlement status. Each bucket renders into its own table. -->
+  <div class="section-title" style="font-size:13px;margin-top:24px;color:#f85149">
+    Genuinely NAKED Polymarket positions <span id="walletArbsNakedCount" style="font-size:11px;color:#8b949e;font-weight:normal"></span>
+    <span style="font-size:11px;color:#8b949e;font-weight:normal;margin-left:8px">KAL market still active — take action</span>
+  </div>
+  <table id="walletArbsPmNakedTable">
+    <thead><tr><th>Match</th><th>Title / Outcome</th><th>Paired KAL</th><th>KAL Status</th><th>Shares</th><th>Avg</th><th>Cur Px</th><th>Cost</th><th>Cur Value</th><th>Actions</th></tr></thead>
+    <tbody id="walletArbsPmNakedBody"><tr><td colspan="10" class="empty">--</td></tr></tbody>
+  </table>
+  <div class="section-title" style="font-size:13px;margin-top:24px;color:#d29922">
+    KAL settled, PM still open <span id="walletArbsKalPendingCount" style="font-size:11px;color:#8b949e;font-weight:normal"></span>
+    <span style="font-size:11px;color:#8b949e;font-weight:normal;margin-left:8px">outcome known — can market-sell PM to exit</span>
+  </div>
+  <table id="walletArbsPmKalPendingTable">
+    <thead><tr><th>Match</th><th>Title / Outcome</th><th>Paired KAL</th><th>KAL Result</th><th>Shares</th><th>Avg</th><th>Cur Px</th><th>Cost</th><th>Cur Value</th><th>Actions</th></tr></thead>
+    <tbody id="walletArbsPmKalPendingBody"><tr><td colspan="10" class="empty">--</td></tr></tbody>
+  </table>
+  <div class="section-title" style="font-size:13px;margin-top:24px;color:#3fb950">
+    Settled WINNERS (redeemable) <span id="walletArbsWinnersCount" style="font-size:11px;color:#8b949e;font-weight:normal"></span>
+    <span style="font-size:11px;color:#8b949e;font-weight:normal;margin-left:8px">PM resolved, claim on-chain</span>
+  </div>
+  <table id="walletArbsPmWinnersTable">
+    <thead><tr><th>Match</th><th>Title / Outcome</th><th>Paired KAL</th><th>Shares</th><th>Avg</th><th>Cur Px</th><th>Est Payout</th><th>Actions</th></tr></thead>
+    <tbody id="walletArbsPmWinnersBody"><tr><td colspan="8" class="empty">--</td></tr></tbody>
+  </table>
+  <div class="section-title" style="font-size:13px;margin-top:24px;color:#8b949e">
+    Settled LOSERS (redeemable, ~worthless) <span id="walletArbsLosersCount" style="font-size:11px;color:#8b949e;font-weight:normal"></span>
+  </div>
+  <table id="walletArbsPmLosersTable">
+    <thead><tr><th>Match</th><th>Title / Outcome</th><th>Shares</th><th>Avg</th><th>Cur Px</th><th>Actions</th></tr></thead>
+    <tbody id="walletArbsPmLosersBody"><tr><td colspan="6" class="empty">--</td></tr></tbody>
+  </table>
+  <div class="section-title" style="font-size:13px;margin-top:24px;color:#8b949e">
+    No known pair / void <span id="walletArbsOtherCount" style="font-size:11px;color:#8b949e;font-weight:normal"></span>
+  </div>
+  <table id="walletArbsPmOtherTable">
+    <thead><tr><th>Title / Outcome</th><th>TokenId</th><th>Status</th><th>Shares</th><th>Avg</th><th>Cost</th></tr></thead>
+    <tbody id="walletArbsPmOtherBody"><tr><td colspan="6" class="empty">--</td></tr></tbody>
   </table>
 </div>
 
@@ -3316,6 +3456,48 @@ function renderAudit(data) {
 // --- Verified P&L ------------------------------------------------------------
 
 // --- Wallet Arbs ------------------------------------------------------------
+async function pmSellExit(tokenId, shares, negRisk) {
+  if (!confirm("Market-sell " + shares + " PM shares at best bid via FAK?\\n\\n" +
+               "Note: if DRY_RUN=true in settings, this just simulates.")) return;
+  try {
+    var res = await fetch("/api/pm-sell", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ tokenId: tokenId, shares: shares, negRisk: !!negRisk }),
+    });
+    var j = await res.json();
+    if (j.ok) {
+      alert((j.dryRun ? "[DRY RUN] " : "") + "SELL placed at $" + j.price + " for " + j.requestedShares + " shares.");
+    } else {
+      alert("SELL failed: " + (j.error || "unknown"));
+    }
+    loadWalletArbs();
+  } catch (e) { alert("SELL request failed: " + e.message); }
+}
+
+async function pmRedeem(conditionId, outcomeIndex, negRisk) {
+  if (negRisk) {
+    var slug = prompt("negRisk markets can't be redeemed automatically yet.\\nOpen your Polymarket portfolio to redeem manually?", "yes");
+    if (slug === "yes") window.open("https://polymarket.com/portfolio", "_blank");
+    return;
+  }
+  if (!confirm("Redeem winning position on-chain?\\n\\nconditionId: " + conditionId.slice(0, 16) + "...\\noutcome: " + outcomeIndex + "\\n\\nIf DRY_RUN=true, this just simulates.")) return;
+  try {
+    var res = await fetch("/api/pm-redeem", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ conditionId: conditionId, outcomeIndex: outcomeIndex, negRisk: !!negRisk }),
+    });
+    var j = await res.json();
+    if (j.ok) {
+      alert((j.dryRun ? "[DRY RUN] " : "") + "REDEEM " + (j.dryRun ? "simulated" : "submitted") + ". txHash: " + j.txHash);
+    } else {
+      alert("REDEEM failed: " + (j.error || "unknown"));
+    }
+    loadWalletArbs();
+  } catch (e) { alert("REDEEM request failed: " + e.message); }
+}
+
 async function loadWalletArbs() {
   var btn = $("walletArbsRefreshBtn");
   if (btn) btn.textContent = "Loading...";
@@ -3327,10 +3509,16 @@ async function loadWalletArbs() {
       return;
     }
     var totals = d.totals || {};
+    var bs = totals.unpairedPmByStatus || {};
     $("walletArbsTotals").innerHTML =
       'Paired arbs: <b>' + totals.pairedArbs + '</b>  &bull;  ' +
       'Unpaired KAL: <b>' + totals.unpairedKal + '</b>  &bull;  ' +
-      'Unpaired PM: <b>' + totals.unpairedPm + '</b>  &bull;  ' +
+      'PM: <b>' + totals.unpairedPm + '</b> ' +
+      '(<span style="color:#f85149">naked ' + (bs.naked||0) + '</span>, ' +
+      '<span style="color:#d29922">kal-settled ' + (bs.kalSettledPmPending||0) + '</span>, ' +
+      '<span style="color:#3fb950">win ' + (bs.winners||0) + '</span>, ' +
+      '<span style="color:#8b949e">lose ' + (bs.losers||0) + '</span>, ' +
+      'other ' + ((bs.noPair||0) + (bs.void||0)) + ')  &bull;  ' +
       'KAL cost: <b>$' + (totals.totalKalCost || 0).toFixed(2) + '</b>  &bull;  ' +
       'PM cost: <b>$' + (totals.totalPmCost || 0).toFixed(2) + '</b>  &bull;  ' +
       'Total at risk: <b>$' + (totals.totalCapitalAtRisk || 0).toFixed(2) + '</b>  &bull;  ' +
@@ -3369,19 +3557,93 @@ async function loadWalletArbs() {
         return '<tr><td style="font-size:11px">' + esc(r.ticker) + '</td><td>' + r.side.toUpperCase() + '</td><td>' + r.shares + '</td><td>' + r.avgPrice + '</td><td>$' + r.cost.toFixed(2) + '</td></tr>';
       }).join("");
     }
-    // Unpaired PM
-    var pb = $("walletArbsPmBody");
-    if (!d.unpairedPm || d.unpairedPm.length === 0) {
-      pb.innerHTML = '<tr><td colspan="6" class="empty">No unpaired Polymarket positions</td></tr>';
-    } else {
-      pb.innerHTML = d.unpairedPm.map(function(r) {
-        return '<tr><td>' + esc(r.title ? r.title.slice(0, 40) : "") + ' / ' + esc(r.outcome) + '</td>' +
-          '<td style="font-size:11px">' + esc(r.tokenId.slice(0, 20)) + '...</td>' +
-          '<td>' + r.shares + '</td><td>' + r.avgPrice + '</td>' +
-          '<td>$' + r.cost.toFixed(2) + '</td>' +
-          '<td>$' + r.currentValue.toFixed(2) + '</td></tr>';
-      }).join("");
+    // Unpaired PM — split by status into 5 buckets
+    var byStatus = { "naked": [], "kal-settled-pm-pending": [], "settled-winner": [], "settled-loser": [], "no-pair": [], "void": [] };
+    (d.unpairedPm || []).forEach(function(r) { (byStatus[r.pmStatus] || byStatus.naked).push(r); });
+
+    var nakedCt = byStatus.naked.length;
+    var kalPendCt = byStatus["kal-settled-pm-pending"].length;
+    var winCt = byStatus["settled-winner"].length;
+    var loseCt = byStatus["settled-loser"].length;
+    var otherCt = byStatus["no-pair"].length + byStatus.void.length;
+    $("walletArbsNakedCount").textContent = "(" + nakedCt + ")";
+    $("walletArbsKalPendingCount").textContent = "(" + kalPendCt + ")";
+    $("walletArbsWinnersCount").textContent = "(" + winCt + ")";
+    $("walletArbsLosersCount").textContent = "(" + loseCt + ")";
+    $("walletArbsOtherCount").textContent = "(" + otherCt + ")";
+
+    function titleOutcome(r) {
+      return esc((r.title || "").slice(0, 48)) + " / " + esc(r.outcome);
     }
+    function sellBtn(r) {
+      return '<button class="audit-btn" style="padding:2px 8px;font-size:11px" onclick="pmSellExit(\'' + r.tokenId + '\', ' + r.shares + ', ' + (r.negRisk ? 'true' : 'false') + ')">Sell at mkt</button>';
+    }
+    function redeemBtn(r) {
+      return '<button class="audit-btn" style="padding:2px 8px;font-size:11px;background:#238636" onclick="pmRedeem(\'' + r.conditionId + '\', ' + r.outcomeIndex + ', ' + (r.negRisk ? 'true' : 'false') + ')">Redeem</button>';
+    }
+
+    // Naked
+    var nb = $("walletArbsPmNakedBody");
+    if (nakedCt === 0) nb.innerHTML = '<tr><td colspan="10" class="empty">No naked PM positions</td></tr>';
+    else nb.innerHTML = byStatus.naked.map(function(r) {
+      return '<tr>' +
+        '<td>' + esc(r.pairedMatchName || "?") + '</td>' +
+        '<td>' + titleOutcome(r) + '</td>' +
+        '<td style="font-size:11px">' + esc(r.pairedKalTicker || "-") + '</td>' +
+        '<td>' + esc(r.kalStatus || "-") + '</td>' +
+        '<td>' + r.shares + '</td><td>' + r.avgPrice + '</td><td>' + r.curPrice + '</td>' +
+        '<td>$' + r.cost.toFixed(2) + '</td><td>$' + r.currentValue.toFixed(2) + '</td>' +
+        '<td>' + sellBtn(r) + '</td></tr>';
+    }).join("");
+
+    // Kal-settled-pm-pending
+    var kpb = $("walletArbsPmKalPendingBody");
+    if (kalPendCt === 0) kpb.innerHTML = '<tr><td colspan="10" class="empty">--</td></tr>';
+    else kpb.innerHTML = byStatus["kal-settled-pm-pending"].map(function(r) {
+      return '<tr>' +
+        '<td>' + esc(r.pairedMatchName || "?") + '</td>' +
+        '<td>' + titleOutcome(r) + '</td>' +
+        '<td style="font-size:11px">' + esc(r.pairedKalTicker || "-") + '</td>' +
+        '<td>' + esc(r.kalResult || "?") + '</td>' +
+        '<td>' + r.shares + '</td><td>' + r.avgPrice + '</td><td>' + r.curPrice + '</td>' +
+        '<td>$' + r.cost.toFixed(2) + '</td><td>$' + r.currentValue.toFixed(2) + '</td>' +
+        '<td>' + sellBtn(r) + '</td></tr>';
+    }).join("");
+
+    // Winners
+    var wb = $("walletArbsPmWinnersBody");
+    if (winCt === 0) wb.innerHTML = '<tr><td colspan="8" class="empty">--</td></tr>';
+    else wb.innerHTML = byStatus["settled-winner"].map(function(r) {
+      return '<tr>' +
+        '<td>' + esc(r.pairedMatchName || "?") + '</td>' +
+        '<td>' + titleOutcome(r) + '</td>' +
+        '<td style="font-size:11px">' + esc(r.pairedKalTicker || "-") + '</td>' +
+        '<td>' + r.shares + '</td><td>' + r.avgPrice + '</td><td>' + r.curPrice + '</td>' +
+        '<td style="color:#3fb950">$' + r.shares.toFixed(2) + '</td>' +
+        '<td>' + redeemBtn(r) + '</td></tr>';
+    }).join("");
+
+    // Losers
+    var lb = $("walletArbsPmLosersBody");
+    if (loseCt === 0) lb.innerHTML = '<tr><td colspan="6" class="empty">--</td></tr>';
+    else lb.innerHTML = byStatus["settled-loser"].map(function(r) {
+      return '<tr>' +
+        '<td>' + esc(r.pairedMatchName || "?") + '</td>' +
+        '<td>' + titleOutcome(r) + '</td>' +
+        '<td>' + r.shares + '</td><td>' + r.avgPrice + '</td><td>' + r.curPrice + '</td>' +
+        '<td>' + redeemBtn(r) + '</td></tr>';
+    }).join("");
+
+    // No-pair / void
+    var ob = $("walletArbsPmOtherBody");
+    var other = byStatus["no-pair"].concat(byStatus.void);
+    if (other.length === 0) ob.innerHTML = '<tr><td colspan="6" class="empty">--</td></tr>';
+    else ob.innerHTML = other.map(function(r) {
+      return '<tr><td>' + titleOutcome(r) + '</td>' +
+        '<td style="font-size:11px">' + esc(r.tokenId.slice(0, 20)) + '...</td>' +
+        '<td>' + esc(r.pmStatus) + '</td>' +
+        '<td>' + r.shares + '</td><td>' + r.avgPrice + '</td><td>$' + r.cost.toFixed(2) + '</td></tr>';
+    }).join("");
   } catch (e) {
     $("walletArbsTotals").textContent = "Failed: " + e.message;
   } finally {

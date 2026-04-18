@@ -336,6 +336,16 @@ async function main() {
       .catch(() => { /* swallow first-run errors */ });
   }, 60_000);
 
+  // Schedule settlement-close cycle — scans unpaired PM positions every 5 min and
+  // auto-sells losers / auto-redeems winners / auto-exits kal-settled. Every action
+  // is gated by a per-type env flag; with all flags false (the default) this cycle
+  // is a no-op beyond a quick log line, so it's safe to keep scheduled unconditionally.
+  setInterval(() => {
+    import("./ARB/ttSettleClose.js")
+      .then(m => m.runSettlementCloseCycle?.())
+      .catch(err => console.error(`[SETTLE-CLOSE] cycle failed: ${(err as Error).message}`));
+  }, 5 * 60 * 1000);
+
   // -- Build conditionId index for settlement filtering --
   const { conditionIds: watchedConditions, conditionToSlug } = await buildConditionIdIndex(watchlist);
 
