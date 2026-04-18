@@ -1497,8 +1497,18 @@ app.get("/api/wallet-arbs", async (_req, res) => {
       return undefined;
     }
 
-    // 2. Fetch live KAL + PM positions in parallel
-    const [kalMap, pmPositionsRaw] = await Promise.all([
+    // Ignore list — positions the user has marked "don't monitor". Filter them out
+    // of the active buckets and surface separately at the bottom of the UI.
+    const ignoreMod = await import("./ARB/ttIgnoreList.js");
+    const ignored = ignoreMod.loadIgnoreList();
+    function isIgnored(kalTicker?: string, pmTokenId?: string): boolean {
+      if (kalTicker && ignored.kalTickers.has(kalTicker)) return true;
+      if (pmTokenId && ignored.pmTokenIds.has(pmTokenId)) return true;
+      return false;
+    }
+
+    // 2. Fetch live KAL + PM positions + open PM orders (for hedge-in-flight detection)
+    const [kalMap, pmPositionsRaw, pmOpenOrdersRaw] = await Promise.all([
       getKalshiPositionMap().catch(() => new Map()),
       (async () => {
         const funder = process.env.POLY_FUNDER;
@@ -1509,7 +1519,58 @@ app.get("/api/wallet-arbs", async (_req, res) => {
           return Array.isArray(j) ? j : [];
         } catch { return []; }
       })(),
+      (async () => {
+        try {
+          const { createPmClient } = await import("./ARB/ttPmOrders.js");
+          const { client } = await createPmClient();
+          const all = await (client as unknown as { getOpenOrders(p?: unknown): Promise<unknown[]> }).getOpenOrders({});
+          return Array.isArray(all) ? all : [];
+        } catch { return []; }
+      })(),
     ]);
+    // Index open PM orders by tokenId for fast hedge-info lookup per row.
+    // openOrdersByToken[tokenId] = { side: "BUY"|"SELL", price, remaining, filled, total$ }
+    const openOrdersByToken = new Map<string, { side: string; price: number; remaining: number; filled: number; total: number }>();
+    for (const o of pmOpenOrdersRaw as Array<Record<string, unknown>>) {
+      const tid = String((o as any).asset_id ?? "");
+      if (!tid) continue;
+      const price = Number((o as any).price ?? 0);
+      const origSize = Number((o as any).original_size ?? 0);
+      const sizeMatched = Number((o as any).size_matched ?? 0);
+      const remaining = Math.max(0, origSize - sizeMatched);
+      const existing = openOrdersByToken.get(tid);
+      if (existing) {
+        // Aggregate multiple orders on same token
+        existing.remaining += remaining;
+        existing.filled += sizeMatched;
+        existing.total += origSize * price;
+      } else {
+        openOrdersByToken.set(tid, {
+          side: String((o as any).side ?? "").toUpperCase(),
+          price,
+          remaining,
+          filled: sizeMatched,
+          total: origSize * price,
+        });
+      }
+    }
+    // Helper: given a ticker/tokenId for a naked position, find the PM tokenId that
+    // would hedge it and return any matching open order. For unpaired KAL (YES), the
+    // hedge is the opposite PM (pairedPmTokenId). For unpaired KAL NO, it's the
+    // same-named PM (pmTokenId). For naked PM, it's the oppositeAsset token.
+    function hedgeInfoForKal(ticker: string, side: "yes" | "no"): any {
+      const entry = pairHistory.get(ticker);
+      if (!entry) return null;
+      const hedgeToken = side === "yes" ? entry.pairedPmTokenId : entry.pmTokenId;
+      if (!hedgeToken) return null;
+      const order = openOrdersByToken.get(hedgeToken);
+      return order ? { hedgeToken, ...order } : null;
+    }
+    function hedgeInfoForPm(tokenId: string, oppositeAsset: string): any {
+      if (!oppositeAsset) return null;
+      const order = openOrdersByToken.get(oppositeAsset);
+      return order ? { hedgeToken: oppositeAsset, ...order } : null;
+    }
 
     // Build PM positions index by asset_id (tokenId)
     const pmByTokenId = new Map<string, any>();
@@ -1652,6 +1713,7 @@ app.get("/api/wallet-arbs", async (_req, res) => {
         avgPrice: Math.round(avg * 10000) / 10000,
         cost: Math.round(cost * 100) / 100,
         firstSeenAt: getFirstSeenAt(ticker, undefined),
+        hedgeInfo: hedgeInfoForKal(ticker, side),
       });
     }
     // 4a. Pre-fetch Kalshi market status for every paired KAL ticker we need to classify.
@@ -1755,6 +1817,7 @@ app.get("/api/wallet-arbs", async (_req, res) => {
         cost: Math.round(Number(p.initialValue ?? 0) * 100) / 100,
         currentValue: Math.round(Number(p.currentValue ?? 0) * 100) / 100,
         firstSeenAt: getFirstSeenAt(pairMeta?.kalTicker, tokenId),
+        hedgeInfo: hedgeInfoForPm(tokenId, oppositeAsset),
       });
     }
 
@@ -1804,6 +1867,29 @@ app.get("/api/wallet-arbs", async (_req, res) => {
     };
     for (const r of unpairedPm) (pmByStatus[r.pmStatus] ?? pmByStatus.naked).push(r);
 
+    // Pull out ignored positions from every bucket and put them in a dedicated list.
+    // This keeps the active tables clean while still letting the operator audit what
+    // they've chosen to stop monitoring (and un-ignore with one click).
+    const ignoredRows: any[] = [];
+    const pairedActive = paired.filter(r => {
+      if (isIgnored(r.kalTicker, r.pmTokenId)) { ignoredRows.push({ ...r, _src: "paired" }); return false; }
+      return true;
+    });
+    const unpairedKalActive = unpairedKal.filter(r => {
+      if (isIgnored(r.ticker, undefined)) { ignoredRows.push({ ...r, _src: "unpairedKal" }); return false; }
+      return true;
+    });
+    for (const key of Object.keys(pmByStatus)) {
+      const keep = [];
+      for (const r of pmByStatus[key]) {
+        if (isIgnored(undefined, r.tokenId)) ignoredRows.push({ ...r, _src: "unpairedPm:" + key });
+        else keep.push(r);
+      }
+      pmByStatus[key] = keep;
+    }
+    paired.length = 0; paired.push(...pairedActive);
+    unpairedKal.length = 0; unpairedKal.push(...unpairedKalActive);
+
     // Chronological sort: oldest first within each bucket, so the Wallet Arbs tab reads
     // like a timeline — newer positions appear at the bottom.
     const byAge = (a: any, b: any) => (a.firstSeenAt ?? 0) - (b.firstSeenAt ?? 0);
@@ -1836,6 +1922,7 @@ app.get("/api/wallet-arbs", async (_req, res) => {
       paired,
       unpairedKal,
       unpairedPm,
+      ignored: ignoredRows,
     });
   } catch (e) {
     res.status(500).json({ error: (e as Error).message });
@@ -1846,6 +1933,29 @@ app.get("/api/wallet-arbs", async (_req, res) => {
 // POST /api/pm-sell  { tokenId, shares, negRisk }     → FAK SELL at best bid
 // POST /api/pm-redeem { conditionId, outcomeIndex, negRisk } → on-chain redeem
 // Both respect DRY_RUN=true by default (returns what-would-happen without sending).
+
+// ── Ignore list: POST /api/ignore + POST /api/unignore ─────────────────────
+// Lets the user mark positions as "don't monitor" so they stop cluttering the
+// active buckets. Ignored positions render in a separate grey section at the
+// bottom of Wallet Arbs with an Unignore button.
+app.post("/api/ignore", async (req, res) => {
+  try {
+    const { addToIgnoreList } = await import("./ARB/ttIgnoreList.js");
+    const { kalTicker, pmTokenId, reason } = req.body ?? {};
+    if (!kalTicker && !pmTokenId) return res.status(400).json({ error: "kalTicker or pmTokenId required" });
+    const entry = addToIgnoreList({ kalTicker, pmTokenId, reason });
+    res.json({ ok: true, entry });
+  } catch (e) { res.status(500).json({ error: (e as Error).message }); }
+});
+app.post("/api/unignore", async (req, res) => {
+  try {
+    const { removeFromIgnoreList } = await import("./ARB/ttIgnoreList.js");
+    const { kalTicker, pmTokenId } = req.body ?? {};
+    if (!kalTicker && !pmTokenId) return res.status(400).json({ error: "kalTicker or pmTokenId required" });
+    const removed = removeFromIgnoreList({ kalTicker, pmTokenId });
+    res.json({ ok: removed });
+  } catch (e) { res.status(500).json({ error: (e as Error).message }); }
+});
 
 // Live open orders from both exchanges. Used by the Wallet Arbs tab to show
 // resting GTC bids from the hedge cycle alongside the paired-arbs view.
@@ -2799,8 +2909,8 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
   </table>
   <div class="section-title" style="font-size:13px;margin-top:24px">Unpaired Kalshi positions</div>
   <table id="walletArbsKalTable">
-    <thead><tr><th>Age</th><th>Ticker</th><th>Side</th><th>Shares</th><th>Avg</th><th>Cost</th></tr></thead>
-    <tbody id="walletArbsKalBody"><tr><td colspan="6" class="empty">--</td></tr></tbody>
+    <thead><tr><th>Age</th><th>Ticker</th><th>Side</th><th>Shares</th><th>Avg</th><th>Cost</th><th>Hedge</th><th>Actions</th></tr></thead>
+    <tbody id="walletArbsKalBody"><tr><td colspan="8" class="empty">--</td></tr></tbody>
   </table>
   <!-- PM positions split by settlement status. Each bucket renders into its own table. -->
   <div class="section-title" style="font-size:13px;margin-top:24px;color:#f85149">
@@ -2856,6 +2966,14 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
   <table id="walletArbsPmOtherTable">
     <thead><tr><th>Age</th><th>Title / Outcome</th><th>TokenId</th><th>Status</th><th>Shares</th><th>Avg</th><th>Cost</th></tr></thead>
     <tbody id="walletArbsPmOtherBody"><tr><td colspan="7" class="empty">--</td></tr></tbody>
+  </table>
+  <div class="section-title" style="font-size:13px;margin-top:24px;color:#6e7681">
+    Ignored positions <span id="walletArbsIgnoredCount" style="font-size:11px;color:#8b949e;font-weight:normal"></span>
+    <span style="font-size:11px;color:#8b949e;font-weight:normal;margin-left:8px">manually marked "don't monitor" — still in wallet, just hidden from active buckets</span>
+  </div>
+  <table id="walletArbsIgnoredTable">
+    <thead><tr><th>Age</th><th>Source bucket</th><th>Match / Ticker</th><th>Side / Outcome</th><th>Shares</th><th>Avg</th><th>Cost</th><th>Actions</th></tr></thead>
+    <tbody id="walletArbsIgnoredBody"><tr><td colspan="8" class="empty">--</td></tr></tbody>
   </table>
 </div>
 
@@ -3785,6 +3903,31 @@ function renderAudit(data) {
 // --- Verified P&L ------------------------------------------------------------
 
 // --- Wallet Arbs ------------------------------------------------------------
+async function ignorePos(kalTicker, pmTokenId) {
+  try {
+    var r = await fetch("/api/ignore", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ kalTicker: kalTicker, pmTokenId: pmTokenId }),
+    });
+    var j = await r.json();
+    if (!j.ok) { alert("Ignore failed: " + (j.error || "unknown")); return; }
+    loadWalletArbs();
+  } catch (e) { alert("Ignore request failed: " + e.message); }
+}
+async function unignorePos(kalTicker, pmTokenId) {
+  try {
+    var r = await fetch("/api/unignore", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ kalTicker: kalTicker, pmTokenId: pmTokenId }),
+    });
+    var j = await r.json();
+    if (!j.ok) { alert("Unignore failed: " + (j.error || "not found")); return; }
+    loadWalletArbs();
+  } catch (e) { alert("Unignore request failed: " + e.message); }
+}
+
 async function pmSellExit(tokenId, shares, negRisk) {
   if (!confirm("Market-sell " + shares + " PM shares at best bid via FAK?\\n\\n" +
                "Note: if DRY_RUN=true in settings, this just simulates.")) return;
@@ -3935,13 +4078,21 @@ async function loadWalletArbs() {
           '</tr>';
       }).join("");
     }
-    // Unpaired KAL
+    // Unpaired KAL (now includes hedge-status + ignore button columns)
     var kb = $("walletArbsKalBody");
     if (!d.unpairedKal || d.unpairedKal.length === 0) {
-      kb.innerHTML = '<tr><td colspan="6" class="empty">No unpaired Kalshi positions</td></tr>';
+      kb.innerHTML = '<tr><td colspan="8" class="empty">No unpaired Kalshi positions</td></tr>';
     } else {
       kb.innerHTML = d.unpairedKal.map(function(r) {
-        return '<tr><td>' + ageLabel(r.firstSeenAt) + '</td><td style="font-size:11px">' + esc(r.ticker) + '</td><td>' + r.side.toUpperCase() + '</td><td>' + r.shares + '</td><td>' + r.avgPrice + '</td><td>$' + r.cost.toFixed(2) + '</td></tr>';
+        return '<tr><td>' + ageLabel(r.firstSeenAt) + '</td>' +
+          '<td style="font-size:11px">' + esc(r.ticker) + hedgeBadge(r.hedgeInfo) + '</td>' +
+          '<td>' + r.side.toUpperCase() + '</td>' +
+          '<td>' + r.shares + '</td>' +
+          '<td>' + r.avgPrice + '</td>' +
+          '<td>$' + r.cost.toFixed(2) + '</td>' +
+          '<td>' + (r.hedgeInfo ? '<span style="color:#3fb950;font-size:11px">hedging</span>' : '<span style="color:#8b949e;font-size:11px">—</span>') + '</td>' +
+          '<td>' + ignoreBtn(r.ticker, null) + '</td>' +
+          '</tr>';
       }).join("");
     }
     // Unpaired PM — split by status into buckets
@@ -3972,20 +4123,36 @@ async function loadWalletArbs() {
     function redeemBtn(r) {
       return '<button class="audit-btn" style="padding:2px 8px;font-size:11px;background:#238636" onclick="pmRedeem(\\'' + r.conditionId + '\\', ' + r.outcomeIndex + ', ' + (r.negRisk ? 'true' : 'false') + ')">Redeem</button>';
     }
+    function ignoreBtn(kalTicker, pmTokenId) {
+      var kt = kalTicker ? '\\'' + kalTicker + '\\'' : 'null';
+      var tid = pmTokenId ? '\\'' + pmTokenId + '\\'' : 'null';
+      return '<button class="audit-btn" style="padding:2px 8px;font-size:11px;background:#21262d" title="Stop monitoring this position" onclick="ignorePos(' + kt + ', ' + tid + ')">✖ Ignore</button>';
+    }
+    function unignoreBtn(kalTicker, pmTokenId) {
+      var kt = kalTicker ? '\\'' + kalTicker + '\\'' : 'null';
+      var tid = pmTokenId ? '\\'' + pmTokenId + '\\'' : 'null';
+      return '<button class="audit-btn" style="padding:2px 8px;font-size:11px;background:#1f6feb" onclick="unignorePos(' + kt + ', ' + tid + ')">Un-ignore</button>';
+    }
+    // Shared hedge-status badge: shows "🔄 7 @ $0.34" when an open order is actively hedging this row.
+    function hedgeBadge(h) {
+      if (!h || !h.remaining) return '';
+      return ' <span style="font-size:10px;color:#58a6ff;padding:1px 4px;border:1px solid #58a6ff;border-radius:3px" ' +
+             'title="Open ' + esc(h.side) + ' order hedging this position">🔄 ' + h.remaining + ' @ $' + (h.price || 0).toFixed(2) + '</span>';
+    }
 
-    // Naked
+    // Naked (shows hedge-in-flight badge + ignore button)
     var nb = $("walletArbsPmNakedBody");
     if (nakedCt === 0) nb.innerHTML = '<tr><td colspan="11" class="empty">No naked PM positions</td></tr>';
     else nb.innerHTML = byStatus.naked.map(function(r) {
       return '<tr>' +
         '<td>' + ageLabel(r.firstSeenAt) + '</td>' +
-        '<td>' + esc(r.pairedMatchName || "?") + '</td>' +
+        '<td>' + esc(r.pairedMatchName || "?") + hedgeBadge(r.hedgeInfo) + '</td>' +
         '<td>' + titleOutcome(r) + '</td>' +
         '<td style="font-size:11px">' + esc(r.pairedKalTicker || "-") + '</td>' +
         '<td>' + esc(r.kalStatus || "-") + '</td>' +
         '<td>' + r.shares + '</td><td>' + r.avgPrice + '</td><td>' + r.curPrice + '</td>' +
         '<td>$' + r.cost.toFixed(2) + '</td><td>$' + r.currentValue.toFixed(2) + '</td>' +
-        '<td>' + sellBtn(r) + '</td></tr>';
+        '<td>' + sellBtn(r) + ' ' + ignoreBtn(null, r.tokenId) + '</td></tr>';
     }).join("");
 
     function pmOnlyRow(r) {
@@ -4063,6 +4230,31 @@ async function loadWalletArbs() {
         '<td style="font-size:11px">' + esc(r.tokenId.slice(0, 20)) + '...</td>' +
         '<td>' + esc(r.pmStatus) + '</td>' +
         '<td>' + r.shares + '</td><td>' + r.avgPrice + '</td><td>$' + r.cost.toFixed(2) + '</td></tr>';
+    }).join("");
+
+    // Ignored section — manually hidden positions. Unignore button returns them to active buckets.
+    var ignRows = d.ignored || [];
+    $("walletArbsIgnoredCount").textContent = "(" + ignRows.length + ")";
+    var ib = $("walletArbsIgnoredBody");
+    if (ignRows.length === 0) ib.innerHTML = '<tr><td colspan="8" class="empty">No ignored positions</td></tr>';
+    else ib.innerHTML = ignRows.map(function(r) {
+      var kal = r.ticker || r.kalTicker || "";
+      var pm = r.tokenId || "";
+      var match = r.match || r.pairedMatchName || r.title || kal || pm.slice(0, 18) + "...";
+      var outcome = r.side ? r.side.toUpperCase() : (r.outcome || "");
+      var shares = r.shares != null ? r.shares : (r.kalShares || r.pmShares || 0);
+      var avg = r.avgPrice != null ? r.avgPrice : (r.kalAvgPrice != null ? r.kalAvgPrice : (r.pmAvgPrice != null ? r.pmAvgPrice : 0));
+      var cost = r.cost != null ? r.cost : (r.kalCost != null ? r.kalCost : (r.pmCost != null ? r.pmCost : 0));
+      return '<tr style="opacity:0.6">' +
+        '<td>' + ageLabel(r.firstSeenAt) + '</td>' +
+        '<td style="font-size:11px;color:#8b949e">' + esc(r._src || "?") + '</td>' +
+        '<td>' + esc(match) + (kal ? ' <span style="font-size:10px;color:#6e7681">' + esc(kal) + '</span>' : '') + '</td>' +
+        '<td>' + esc(outcome) + '</td>' +
+        '<td>' + shares + '</td>' +
+        '<td>' + (avg || 0) + '</td>' +
+        '<td>$' + (cost || 0).toFixed(2) + '</td>' +
+        '<td>' + unignoreBtn(kal, pm) + '</td>' +
+        '</tr>';
     }).join("");
   } catch (e) {
     $("walletArbsTotals").textContent = "Failed: " + e.message;
