@@ -1578,12 +1578,28 @@ app.get("/api/wallet-arbs", async (_req, res) => {
       };
     }
 
+    // For each paired row we need to flip pair.pmLeg ↔ pair.pmOppLeg when the KAL position
+    // is on the NO side. The watchlist encodes pmLeg as the OPPOSITE outcome from KAL YES —
+    // but if we hold KAL NO, we're effectively betting the OTHER team. The "hedge" PM token
+    // is then the ORIGINAL same-named PM outcome (pmOppLeg), and "same-direction" becomes
+    // the opposite-named PM outcome (pmLeg). Without this flip, a KAL NO position with a
+    // PM-on-the-same-team gets labeled SAME-SIDE when it's actually a real hedge.
+    function resolveLegs(pair: { pmLeg: any; pmOppLeg: any }, kalSide: "yes" | "no") {
+      return kalSide === "yes"
+        ? { hedgeLeg: pair.pmLeg, sameDirLeg: pair.pmOppLeg }
+        : { hedgeLeg: pair.pmOppLeg, sameDirLeg: pair.pmLeg };
+    }
+    function kalSideFor(pos: any): "yes" | "no" {
+      return (pos.yesCount ?? 0) >= (pos.noCount ?? 0) ? "yes" : "no";
+    }
+
     // Pass 1: HEDGED pairings (KAL + opposite-outcome PM). Real arbs get the PM claim.
     for (const [kalTicker, pos] of kalMap.entries()) {
       if ((pos.yesCount ?? 0) + (pos.noCount ?? 0) === 0) continue;
       const pair = pairByKalTicker.get(kalTicker);
       if (!pair) continue;
-      const pmLegHeld = pmByTokenId.get(pair.pmLeg.tokenId);
+      const { hedgeLeg } = resolveLegs(pair, kalSideFor(pos));
+      const pmLegHeld = pmByTokenId.get(hedgeLeg.tokenId);
       if (!pmLegHeld) continue;
       const pmTokenId = String(pmLegHeld.asset);
       if (usedPm.has(pmTokenId)) continue;
@@ -1598,7 +1614,8 @@ app.get("/api/wallet-arbs", async (_req, res) => {
       if ((pos.yesCount ?? 0) + (pos.noCount ?? 0) === 0) continue;
       const pair = pairByKalTicker.get(kalTicker);
       if (!pair) continue;
-      const pmOppLegHeld = pmByTokenId.get(pair.pmOppLeg.tokenId);
+      const { sameDirLeg } = resolveLegs(pair, kalSideFor(pos));
+      const pmOppLegHeld = pmByTokenId.get(sameDirLeg.tokenId);
       if (!pmOppLegHeld) continue;
       const pmTokenId = String(pmOppLegHeld.asset);
       if (usedPm.has(pmTokenId)) continue;
