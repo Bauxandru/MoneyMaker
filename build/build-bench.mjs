@@ -44,7 +44,13 @@ if (existsSync(envPath)) {
   }
 }
 // Override VPS-specific settings for exe builds
-envOverrides["SERVER_ID"] = "toronto-vps";
+// Accept location tag via CLI arg: `node build/build-bench.mjs <location>`
+// Defaults to hostname. The tag gets baked into the exe as BENCH_LOCATION so
+// each built exe is pre-labeled (no need to set env vars on the VPS).
+const LOCATION_TAG = process.argv[2] || "unknown";
+envOverrides["SERVER_ID"] = LOCATION_TAG;
+envOverrides["BENCH_LOCATION"] = LOCATION_TAG;
+console.log(`[BUILD-BENCH] Baking BENCH_LOCATION="${LOCATION_TAG}" into exe`);
 // Push trades to home dashboard (set DASHBOARD_PUSH_URL to your home IP:3456)
 // The TOKEN must match DASHBOARD_INGEST_SECRET on the dashboard
 envOverrides["LICENSE_TOKEN"] = envOverrides["DASHBOARD_INGEST_SECRET"] || "";
@@ -225,7 +231,7 @@ try {
 // ── Step 5: Create executable ──────────────────────────────────────────────
 
 console.log("\n=== Step 5/5: Create executable ===");
-const exePath = join(DIST, "arb-bench.exe");
+const exePath = join(DIST, `arb-bench-${LOCATION_TAG}.exe`);
 try {
   const nodePath = process.execPath;
   copyFileSync(nodePath, exePath);
@@ -272,7 +278,7 @@ try {
   console.log(`\nProtection: esbuild minify + obfuscator + V8 bytecode`);
   console.log(`No JS source in the final executable.\n`);
   console.log(`Distribution package:`);
-  console.log(`  - dist/arb-bench.exe            (the bot)`);
+  console.log(`  - ${exePath}  (tagged as BENCH_LOCATION="${LOCATION_TAG}")`);
   console.log(`  - dist/bench-settings.txt           (edit to adjust runtime settings)`);
   console.log(`  - dist/bench-settings.txt.template  (pristine reference)`);
   console.log(`  - run-bot-exe.bat             (restart loop + log redirect)`);
