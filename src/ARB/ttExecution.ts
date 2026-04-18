@@ -2442,6 +2442,30 @@ export async function monitorLoop(watchlist: WatchEntry[]): Promise<void> {
   }
 
   let hedgeStates: HedgeState[] = loadHedgeStates();
+
+  // Prune stale `arb-backfill-*` stubs with empty kalLeg.ticker. These were
+  // created by a pre-wallet-first runWalletFirstStartup that paired orphan PM
+  // positions to "?" kal tickers it couldn't resolve. They sit in hedge_state.json
+  // forever, never get orders placed (the hedge cycle needs a real kal ticker to
+  // buy opposite outcomes on), and prevent the fresh wallet-first detectors from
+  // re-detecting the same PM shares (because hsTickerSet already contains "").
+  // Wallet-first detectUnhedgedPmPositions will recreate these with correct
+  // kalLeg.ticker on the next pass.
+  {
+    const beforePrune = hedgeStates.length;
+    hedgeStates = hedgeStates.filter(hs => {
+      const kt = hs.position?.kalLeg?.ticker;
+      const isStub = !kt || kt === "";
+      if (isStub) {
+        console.warn(`[HEDGE RESUME] Pruning stale stub hedge state: tradeId=${hs.position?.tradeId ?? "?"} sharesHeld=${hs.position?.sharesHeld ?? "?"} — no kal ticker, cannot place orders. Wallet-first detector will recreate if still unhedged.`);
+      }
+      return !isStub;
+    });
+    if (hedgeStates.length < beforePrune) {
+      console.log(`[HEDGE RESUME] Pruned ${beforePrune - hedgeStates.length} stub(s); ${hedgeStates.length} valid hedge states remain.`);
+    }
+  }
+
   setAllHedgeStates(hedgeStates);
   if (hedgeStates.length > 0) {
     // Re-check actual coverage on each position and clean up resolved ones
