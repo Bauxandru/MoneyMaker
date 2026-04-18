@@ -1716,8 +1716,10 @@ app.get("/api/wallet-arbs", async (_req, res) => {
         hedgeInfo: hedgeInfoForKal(ticker, side),
       });
     }
-    // 4a. Pre-fetch Kalshi market status for every paired KAL ticker we need to classify.
-    // Parallel — one round-trip per unique ticker, bounded by the unpaired-PM count.
+    // 4a. Pre-fetch Kalshi market info (status, result, title) for every ticker we need
+    // to display in the Wallet Arbs tab — both the paired-KAL tickers referenced by
+    // unpaired-PM rows, AND the unpaired-KAL tickers themselves (so we can show the
+    // human-readable market title next to the raw ticker ID).
     const kalTickersToCheck = new Set<string>();
     for (const [tokenId, p] of pmByTokenId.entries()) {
       if (usedPm.has(tokenId)) continue;
@@ -1725,16 +1727,27 @@ app.get("/api/wallet-arbs", async (_req, res) => {
       const pairMeta = pairByPmTokenId.get(tokenId);
       if (pairMeta?.kalTicker) kalTickersToCheck.add(pairMeta.kalTicker);
     }
-    const kalMarketStatus = new Map<string, { status: string; result: string }>();
+    for (const row of unpairedKal) kalTickersToCheck.add(row.ticker);
+    const kalMarketStatus = new Map<string, { status: string; result: string; title: string }>();
     await Promise.all(Array.from(kalTickersToCheck).map(async (ticker) => {
       try {
         const mkt = await fetchKalshiMarket(ticker) as Record<string, unknown>;
         kalMarketStatus.set(ticker, {
           status: String(mkt.status ?? ""),
           result: String(mkt.result ?? ""),
+          title: String(mkt.title ?? ""),
         });
       } catch { /* network error — leave unset, classify as naked */ }
     }));
+    // Backfill matchName + kalStatus on each unpaired-KAL row from the freshly-fetched
+    // kalMarketStatus. Prefers an existing pair_history matchName (which includes "Team A
+    // vs Team B" instead of Kalshi's longer full title) before falling back to the title.
+    for (const row of unpairedKal) {
+      const histEntry = pairHistory.get(row.ticker);
+      const mkt = kalMarketStatus.get(row.ticker);
+      row.matchName = histEntry?.matchName || mkt?.title || "";
+      row.kalStatus = mkt?.status ?? "";
+    }
 
     // 4b. Build unpaired-PM rows with settlement classification.
     // pmStatus values:
@@ -2909,8 +2922,8 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
   </table>
   <div class="section-title" style="font-size:13px;margin-top:24px">Unpaired Kalshi positions</div>
   <table id="walletArbsKalTable">
-    <thead><tr><th>Age</th><th>Ticker</th><th>Side</th><th>Shares</th><th>Avg</th><th>Cost</th><th>Hedge</th><th>Actions</th></tr></thead>
-    <tbody id="walletArbsKalBody"><tr><td colspan="8" class="empty">--</td></tr></tbody>
+    <thead><tr><th>Age</th><th>Match</th><th>Ticker</th><th>Side</th><th>Shares</th><th>Avg</th><th>Cost</th><th>KAL Status</th><th>Hedge</th><th>Actions</th></tr></thead>
+    <tbody id="walletArbsKalBody"><tr><td colspan="10" class="empty">--</td></tr></tbody>
   </table>
   <!-- PM positions split by settlement status. Each bucket renders into its own table. -->
   <div class="section-title" style="font-size:13px;margin-top:24px;color:#f85149">
@@ -4078,18 +4091,21 @@ async function loadWalletArbs() {
           '</tr>';
       }).join("");
     }
-    // Unpaired KAL (now includes hedge-status + ignore button columns)
+    // Unpaired KAL (now includes Match name + KAL status columns from Kalshi API)
     var kb = $("walletArbsKalBody");
     if (!d.unpairedKal || d.unpairedKal.length === 0) {
-      kb.innerHTML = '<tr><td colspan="8" class="empty">No unpaired Kalshi positions</td></tr>';
+      kb.innerHTML = '<tr><td colspan="10" class="empty">No unpaired Kalshi positions</td></tr>';
     } else {
       kb.innerHTML = d.unpairedKal.map(function(r) {
-        return '<tr><td>' + ageLabel(r.firstSeenAt) + '</td>' +
-          '<td style="font-size:11px">' + esc(r.ticker) + hedgeBadge(r.hedgeInfo) + '</td>' +
+        return '<tr>' +
+          '<td>' + ageLabel(r.firstSeenAt) + '</td>' +
+          '<td>' + esc(r.matchName || "—") + hedgeBadge(r.hedgeInfo) + '</td>' +
+          '<td style="font-size:11px;color:#8b949e">' + esc(r.ticker) + '</td>' +
           '<td>' + r.side.toUpperCase() + '</td>' +
           '<td>' + r.shares + '</td>' +
           '<td>' + r.avgPrice + '</td>' +
           '<td>$' + r.cost.toFixed(2) + '</td>' +
+          '<td style="font-size:11px">' + esc(r.kalStatus || "—") + '</td>' +
           '<td>' + (r.hedgeInfo ? '<span style="color:#3fb950;font-size:11px">hedging</span>' : '<span style="color:#8b949e;font-size:11px">—</span>') + '</td>' +
           '<td>' + ignoreBtn(r.ticker, null) + '</td>' +
           '</tr>';
