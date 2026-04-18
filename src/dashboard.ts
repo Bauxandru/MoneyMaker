@@ -2965,12 +2965,11 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
         <th>PM Avg</th>
         <th>PM Cost</th>
         <th>Total Cost</th>
-        <th title="Current mark-to-market P&amp;L (PM data-api currentValue − cost)">Current P&amp;L</th>
-        <th>Net if KAL-side wins</th>
-        <th>Net if OPPOSITE wins</th>
+        <th title="PM-side mark-to-market: current PM market value − PM cost. KAL side held at cost basis (no live KAL lookup per row).">Current P&amp;L</th>
+        <th title="Worst-case locked P&amp;L at settlement. Parens show both outcomes: (KAL-side wins / OPPOSITE wins).">Net P&amp;L (K/O)</th>
       </tr>
     </thead>
-    <tbody id="walletArbsPairedBody"><tr><td colspan="16" class="empty">Click Refresh to load</td></tr></tbody>
+    <tbody id="walletArbsPairedBody"><tr><td colspan="15" class="empty">Click Refresh to load</td></tr></tbody>
   </table>
   <div class="section-title" style="font-size:13px;margin-top:24px">Unpaired Kalshi positions</div>
   <table id="walletArbsKalTable">
@@ -4160,23 +4159,25 @@ async function loadWalletArbs() {
         } else {
           typeBadge = '<span style="color:#3fb950;font-size:10px;padding:1px 4px;border:1px solid #3fb950;border-radius:3px" title="Opposite outcomes, sizes balanced — locked-in min-profit arb">HEDGED</span>';
         }
+        var minNet = Math.min(r.netIfKalWins, r.netIfPmWins);
+        var minColor = minNet >= 0 ? '#3fb950' : '#f85149';
+        var netCell = '<span style="color:' + minColor + '" title="Worst-case locked P&L at settlement. Parens: KAL-side wins → $' + r.netIfKalWins.toFixed(2) + ' | Opposite wins → $' + r.netIfPmWins.toFixed(2) + '">$' + minNet.toFixed(2) + ' <span style="color:#8b949e;font-size:11px">($' + r.netIfKalWins.toFixed(2) + '/$' + r.netIfPmWins.toFixed(2) + ')</span></span>';
         return '<tr>' +
           '<td>' + ageLabel(r.firstSeenAt) + '</td>' +
           '<td>' + kalLink(r.kalTicker, r.match) + '</td>' +
           '<td>' + typeBadge + '</td>' +
-          '<td style="font-size:11px">' + kalLink(r.kalTicker, r.kalTicker) + '</td>' +
+          '<td style="font-size:11px">' + esc(r.kalTicker) + '</td>' +
           '<td><span class="dir dir-' + (r.kalSide === "no" ? "C" : "A") + '">' + r.kalSide.toUpperCase() + '</span></td>' +
           '<td>' + r.kalShares + '</td>' +
           '<td>' + r.kalAvgPrice + '</td>' +
           '<td>$' + r.kalCost.toFixed(2) + '</td>' +
-          '<td>' + pmLink(pmSlugFor(r), r.pmOutcome) + '</td>' +
+          '<td>' + esc(r.pmOutcome) + '</td>' +
           '<td>' + r.pmShares + '</td>' +
           '<td>' + r.pmAvgPrice + '</td>' +
           '<td>$' + r.pmCost.toFixed(2) + '</td>' +
           '<td>$' + r.totalCost.toFixed(2) + '</td>' +
-          '<td style="color:' + curC + '">$' + (r.currentPnl || 0).toFixed(2) + '</td>' +
-          '<td style="color:' + netKalC + '">$' + r.netIfKalWins.toFixed(2) + '</td>' +
-          '<td style="color:' + netPmC + '">$' + r.netIfPmWins.toFixed(2) + '</td>' +
+          '<td style="color:' + curC + '" title="PM-side mark-to-market: current PM value − PM cost. KAL held at cost basis (no live KAL lookup per row).">$' + (r.currentPnl || 0).toFixed(2) + '</td>' +
+          '<td>' + netCell + '</td>' +
           '</tr>';
       }).join("");
     }
@@ -4204,7 +4205,7 @@ async function loadWalletArbs() {
         return '<tr>' +
           '<td>' + ageLabel(r.firstSeenAt) + '</td>' +
           '<td>' + kalLink(r.ticker, r.matchName || "—") + hedgeBadge(r.hedgeInfo) + '</td>' +
-          '<td style="font-size:11px;color:#8b949e">' + kalLink(r.ticker, r.ticker) + '</td>' +
+          '<td style="font-size:11px;color:#8b949e">' + esc(r.ticker) + '</td>' +
           '<td>' + r.side.toUpperCase() + '</td>' +
           '<td>' + r.shares + '</td>' +
           '<td>' + r.avgPrice + '</td>' +
@@ -4269,8 +4270,8 @@ async function loadWalletArbs() {
       return '<tr>' +
         '<td>' + ageLabel(r.firstSeenAt) + '</td>' +
         '<td>' + pmLink(pmSlugFor(r), r.pairedMatchName || "?") + hedgeBadge(r.hedgeInfo) + '</td>' +
-        '<td>' + pmLink(pmSlugFor(r), (r.title || "").slice(0, 48) + " / " + r.outcome) + '</td>' +
-        '<td style="font-size:11px">' + kalLink(r.pairedKalTicker, r.pairedKalTicker || "-") + '</td>' +
+        '<td>' + titleOutcome(r) + '</td>' +
+        '<td style="font-size:11px">' + esc(r.pairedKalTicker || "-") + '</td>' +
         '<td>' + esc(r.kalStatus || "-") + '</td>' +
         '<td>' + r.shares + '</td><td>' + r.avgPrice + '</td><td>' + r.curPrice + '</td>' +
         '<td>$' + r.cost.toFixed(2) + '</td><td>$' + r.currentValue.toFixed(2) + '</td>' +
@@ -4281,8 +4282,8 @@ async function loadWalletArbs() {
       return '<tr>' +
         '<td>' + ageLabel(r.firstSeenAt) + '</td>' +
         '<td>' + pmLink(pmSlugFor(r), r.pairedMatchName || "?") + '</td>' +
-        '<td>' + pmLink(pmSlugFor(r), (r.title || "").slice(0, 48) + " / " + r.outcome) + '</td>' +
-        '<td style="font-size:11px">' + kalLink(r.pairedKalTicker, r.pairedKalTicker || "-") + '</td>' +
+        '<td>' + titleOutcome(r) + '</td>' +
+        '<td style="font-size:11px">' + esc(r.pairedKalTicker || "-") + '</td>' +
         '<td>' + r.shares + '</td>' +
         '<td>' + (r.oppositeShares || 0) + '</td>' +
         '<td>' + r.avgPrice + '</td><td>' + r.curPrice + '</td>' +
@@ -4305,8 +4306,8 @@ async function loadWalletArbs() {
       return '<tr>' +
         '<td>' + ageLabel(r.firstSeenAt) + '</td>' +
         '<td>' + pmLink(pmSlugFor(r), r.pairedMatchName || "?") + '</td>' +
-        '<td>' + pmLink(pmSlugFor(r), (r.title || "").slice(0, 48) + " / " + r.outcome) + '</td>' +
-        '<td style="font-size:11px">' + kalLink(r.pairedKalTicker, r.pairedKalTicker || "-") + '</td>' +
+        '<td>' + titleOutcome(r) + '</td>' +
+        '<td style="font-size:11px">' + esc(r.pairedKalTicker || "-") + '</td>' +
         '<td>' + esc(r.kalResult || "?") + '</td>' +
         '<td>' + r.shares + '</td><td>' + r.avgPrice + '</td><td>' + r.curPrice + '</td>' +
         '<td>$' + r.cost.toFixed(2) + '</td><td>$' + r.currentValue.toFixed(2) + '</td>' +
@@ -4323,8 +4324,8 @@ async function loadWalletArbs() {
       return '<tr>' +
         '<td>' + ageLabel(r.firstSeenAt) + '</td>' +
         '<td>' + pmLink(pmSlugFor(r), r.pairedMatchName || "?") + pendingTag(r) + '</td>' +
-        '<td>' + pmLink(pmSlugFor(r), (r.title || "").slice(0, 48) + " / " + r.outcome) + '</td>' +
-        '<td style="font-size:11px">' + kalLink(r.pairedKalTicker, r.pairedKalTicker || "-") + '</td>' +
+        '<td>' + titleOutcome(r) + '</td>' +
+        '<td style="font-size:11px">' + esc(r.pairedKalTicker || "-") + '</td>' +
         '<td>' + r.shares + '</td><td>' + r.avgPrice + '</td><td>' + r.curPrice + '</td>' +
         '<td style="color:#3fb950">$' + r.shares.toFixed(2) + '</td>' +
         '<td>' + redeemBtn(r) + '</td></tr>';
@@ -4337,7 +4338,7 @@ async function loadWalletArbs() {
       return '<tr>' +
         '<td>' + ageLabel(r.firstSeenAt) + '</td>' +
         '<td>' + pmLink(pmSlugFor(r), r.pairedMatchName || "?") + pendingTag(r) + '</td>' +
-        '<td>' + pmLink(pmSlugFor(r), (r.title || "").slice(0, 48) + " / " + r.outcome) + '</td>' +
+        '<td>' + titleOutcome(r) + '</td>' +
         '<td>' + r.shares + '</td><td>' + r.avgPrice + '</td><td>' + r.curPrice + '</td>' +
         '<td>' + redeemBtn(r) + '</td></tr>';
     }).join("");
@@ -4348,7 +4349,7 @@ async function loadWalletArbs() {
     if (other.length === 0) ob.innerHTML = '<tr><td colspan="7" class="empty">--</td></tr>';
     else ob.innerHTML = other.map(function(r) {
       return '<tr><td>' + ageLabel(r.firstSeenAt) + '</td>' +
-        '<td>' + pmLink(pmSlugFor(r), (r.title || "").slice(0, 48) + " / " + r.outcome) + '</td>' +
+        '<td>' + titleOutcome(r) + '</td>' +
         '<td style="font-size:11px">' + esc(r.tokenId.slice(0, 20)) + '...</td>' +
         '<td>' + esc(r.pmStatus) + '</td>' +
         '<td>' + r.shares + '</td><td>' + r.avgPrice + '</td><td>$' + r.cost.toFixed(2) + '</td></tr>';
