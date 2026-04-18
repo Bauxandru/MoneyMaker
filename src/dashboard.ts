@@ -1429,6 +1429,172 @@ app.get("/api/watchlist", (_req, res) => {
   } catch { res.json([]); }
 });
 
+// -- Wallet-derived arbs view -------------------------------------------------
+// Pairs live KAL positions + live PM positions via the discovery watchlist
+// and returns the arb book as seen from on-chain / exchange truth. Independent
+// of arb_trades.json — runs anywhere, works without the bot running.
+//
+// Data-flow (per CLAUDE.md DATA-FIRST Safety Invariant #9):
+//   - All financial fields (shares, avg price, cost) come from live exchange
+//     queries: Kalshi `/portfolio/positions`, Polymarket data-api `/positions`.
+//   - No estimates, no heuristics, no arb_trades.json dependency.
+//   - Discovery cache is used ONLY for pairing (kalTicker ↔ pmTokenId), not
+//     for any monetary values.
+app.get("/api/wallet-arbs", async (_req, res) => {
+  try {
+    // 1. Load discovery cache → build pairing maps
+    const cachePath = join(ROOT, "discovery_cache.json");
+    let watchlist: any[] = [];
+    if (existsSync(cachePath)) {
+      try { watchlist = JSON.parse(readFileSync(cachePath, "utf8"))?.watchlist ?? []; }
+      catch { watchlist = []; }
+    }
+    // kalTicker → pair metadata (incl both PM outcomes so we know which side pairs with which)
+    const pairByKalTicker = new Map<string, { pmLeg: any; pmOppLeg: any; pmSlug: string; matchName: string; kalSide: "yes" | "no" }>();
+    const pairByPmTokenId = new Map<string, { kalTicker: string; kalSurname: string; pmSlug: string; matchName: string }>();
+    for (const w of watchlist) {
+      if (!w.kal1 || !w.kal2 || !w.pm1 || !w.pm2) continue;
+      const matchName = `${w.kal1.surname ?? ""} vs ${w.kal2.surname ?? ""}`;
+      // Dir A: KAL P1 YES + PM P2 opposite; Dir C: KAL P1 NO + PM P1 same.
+      // We tag kalSide as "yes" here (canonical dir A pairing); PM side is
+      // whichever outcome is actually in the wallet.
+      pairByKalTicker.set(w.kal1.ticker, { pmLeg: w.pm2, pmOppLeg: w.pm1, pmSlug: w.pmSlug, matchName, kalSide: "yes" });
+      pairByKalTicker.set(w.kal2.ticker, { pmLeg: w.pm1, pmOppLeg: w.pm2, pmSlug: w.pmSlug, matchName, kalSide: "yes" });
+      pairByPmTokenId.set(w.pm1.tokenId, { kalTicker: w.kal1.ticker, kalSurname: w.kal1.surname, pmSlug: w.pmSlug, matchName });
+      pairByPmTokenId.set(w.pm2.tokenId, { kalTicker: w.kal2.ticker, kalSurname: w.kal2.surname, pmSlug: w.pmSlug, matchName });
+    }
+
+    // 2. Fetch live KAL + PM positions in parallel
+    const [kalMap, pmPositionsRaw] = await Promise.all([
+      getKalshiPositionMap().catch(() => new Map()),
+      (async () => {
+        const funder = process.env.POLY_FUNDER;
+        if (!funder) return [];
+        try {
+          const r = await fetch(`https://data-api.polymarket.com/positions?user=${funder}&sizeThreshold=0`);
+          const j = await r.json();
+          return Array.isArray(j) ? j : [];
+        } catch { return []; }
+      })(),
+    ]);
+
+    // Build PM positions index by asset_id (tokenId)
+    const pmByTokenId = new Map<string, any>();
+    for (const p of pmPositionsRaw) {
+      if (p?.asset && Number(p.size) > 0) pmByTokenId.set(String(p.asset), p);
+    }
+
+    // 3. Build paired rows (KAL position that has a watchlist pair AND a matching PM position)
+    const paired: any[] = [];
+    const usedKal = new Set<string>();
+    const usedPm = new Set<string>();
+    for (const [kalTicker, pos] of kalMap.entries()) {
+      const kalShares = (pos.yesCount ?? 0) + (pos.noCount ?? 0);
+      if (kalShares === 0) continue;
+      const pair = pairByKalTicker.get(kalTicker);
+      if (!pair) continue;
+      // PM side could be either pmLeg or pmOppLeg — check both, prefer the one we actually hold.
+      const pmLegHeld = pmByTokenId.get(pair.pmLeg.tokenId);
+      const pmOppLegHeld = pmByTokenId.get(pair.pmOppLeg.tokenId);
+      const pmHeld = pmLegHeld || pmOppLegHeld;
+      if (!pmHeld) continue;
+      const pmTokenId = String(pmHeld.asset);
+      const pmOutcome = String(pmHeld.outcome ?? "");
+      const pmShares = Number(pmHeld.size ?? 0);
+      const pmAvgPrice = Number(pmHeld.avgPrice ?? 0);
+      const pmCost = Number(pmHeld.initialValue ?? pmShares * pmAvgPrice);
+
+      const kalYes = pos.yesCount ?? 0;
+      const kalNo = pos.noCount ?? 0;
+      const kalSide: "yes" | "no" = kalYes >= kalNo ? "yes" : "no";
+      const kalHeldShares = kalSide === "yes" ? kalYes : kalNo;
+      const kalAvgPrice = (pos.avgPriceCents ?? 0) / 100;
+      const kalCost = kalHeldShares * kalAvgPrice;
+
+      paired.push({
+        match: pair.matchName || pmHeld.title || "?",
+        kalTicker,
+        kalSide,
+        kalShares: kalHeldShares,
+        kalAvgPrice: Math.round(kalAvgPrice * 10000) / 10000,
+        kalCost: Math.round(kalCost * 100) / 100,
+        pmTokenId,
+        pmOutcome,
+        pmSlug: pair.pmSlug,
+        pmShares: Math.round(pmShares * 100) / 100,
+        pmAvgPrice: Math.round(pmAvgPrice * 10000) / 10000,
+        pmCost: Math.round(pmCost * 100) / 100,
+        totalCost: Math.round((kalCost + pmCost) * 100) / 100,
+        // Projected net P&L per outcome (assumes both legs pay $1 per winning share):
+        //   If KAL side wins:  payout = kalHeldShares, PM loses (pays 0)
+        //   If PM side wins:   payout = pmShares, KAL loses
+        netIfKalWins: Math.round((kalHeldShares - kalCost - pmCost) * 100) / 100,
+        netIfPmWins: Math.round((pmShares - kalCost - pmCost) * 100) / 100,
+      });
+      usedKal.add(kalTicker);
+      usedPm.add(pmTokenId);
+    }
+
+    // 4. Unpaired rows — held on one exchange only or no watchlist pair
+    const unpairedKal: any[] = [];
+    for (const [ticker, pos] of kalMap.entries()) {
+      if (usedKal.has(ticker)) continue;
+      const shares = (pos.yesCount ?? 0) + (pos.noCount ?? 0);
+      if (shares === 0) continue;
+      const yes = pos.yesCount ?? 0;
+      const no = pos.noCount ?? 0;
+      const side: "yes" | "no" = yes >= no ? "yes" : "no";
+      const held = side === "yes" ? yes : no;
+      const avg = (pos.avgPriceCents ?? 0) / 100;
+      unpairedKal.push({
+        exchange: "kalshi",
+        ticker,
+        side,
+        shares: held,
+        avgPrice: Math.round(avg * 10000) / 10000,
+        cost: Math.round(held * avg * 100) / 100,
+      });
+    }
+    const unpairedPm: any[] = [];
+    for (const [tokenId, p] of pmByTokenId.entries()) {
+      if (usedPm.has(tokenId)) continue;
+      const shares = Number(p.size ?? 0);
+      if (shares === 0) continue;
+      unpairedPm.push({
+        exchange: "polymarket",
+        tokenId,
+        outcome: String(p.outcome ?? ""),
+        title: String(p.title ?? ""),
+        shares: Math.round(shares * 100) / 100,
+        avgPrice: Math.round(Number(p.avgPrice ?? 0) * 10000) / 10000,
+        cost: Math.round(Number(p.initialValue ?? 0) * 100) / 100,
+        currentValue: Math.round(Number(p.currentValue ?? 0) * 100) / 100,
+      });
+    }
+
+    const totalKalCost = paired.reduce((s, r) => s + r.kalCost, 0) + unpairedKal.reduce((s, r) => s + r.cost, 0);
+    const totalPmCost = paired.reduce((s, r) => s + r.pmCost, 0) + unpairedPm.reduce((s, r) => s + r.cost, 0);
+
+    res.json({
+      ts: new Date().toISOString(),
+      watchlistEntries: watchlist.length,
+      totals: {
+        pairedArbs: paired.length,
+        unpairedKal: unpairedKal.length,
+        unpairedPm: unpairedPm.length,
+        totalKalCost: Math.round(totalKalCost * 100) / 100,
+        totalPmCost: Math.round(totalPmCost * 100) / 100,
+        totalCapitalAtRisk: Math.round((totalKalCost + totalPmCost) * 100) / 100,
+      },
+      paired,
+      unpairedKal,
+      unpairedPm,
+    });
+  } catch (e) {
+    res.status(500).json({ error: (e as Error).message });
+  }
+});
+
 // -- Exchange-Verified P&L ----------------------------------------------------
 // Queries both exchanges directly for the ground truth, ignoring arb_trades.json
 
@@ -2146,6 +2312,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
 
 <div class="tab-bar">
   <button class="tab-btn active" data-tab="trades">Trades</button>
+  <button class="tab-btn" data-tab="walletarbs">Wallet Arbs</button>
   <button class="tab-btn" data-tab="execution">Execution</button>
   <button class="tab-btn" data-tab="missed">Missed Opps <span class="tab-badge" id="missedBadge" style="display:none">0</span></button>
   <button class="tab-btn" data-tab="orderbook">Orderbooks</button>
@@ -2196,6 +2363,50 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
       </tr>
     </thead>
     <tbody id="tradesBody"></tbody>
+  </table>
+</div>
+
+<!-- TAB: Wallet Arbs -->
+<div class="tab-panel" id="panel-walletarbs">
+  <div class="section-title">
+    Wallet Arbs
+    <span style="font-size:11px;color:#8b949e;font-weight:normal;margin-left:8px">
+      live on-chain + exchange state, paired via the discovery watchlist.
+      Does NOT depend on arb_trades.json.
+    </span>
+    <button class="audit-btn" id="walletArbsRefreshBtn" onclick="loadWalletArbs()" style="margin-left:12px">Refresh</button>
+  </div>
+  <div id="walletArbsTotals" style="margin:0 20px 10px;font-size:13px;color:#c9d1d9"></div>
+  <div class="section-title" style="font-size:13px">Paired arbs</div>
+  <table id="walletArbsPairedTable">
+    <thead>
+      <tr>
+        <th>Match</th>
+        <th>KAL Ticker</th>
+        <th>KAL Side</th>
+        <th>KAL Shares</th>
+        <th>KAL Avg</th>
+        <th>KAL Cost</th>
+        <th>PM Outcome</th>
+        <th>PM Shares</th>
+        <th>PM Avg</th>
+        <th>PM Cost</th>
+        <th>Total Cost</th>
+        <th>Net if KAL wins</th>
+        <th>Net if PM wins</th>
+      </tr>
+    </thead>
+    <tbody id="walletArbsPairedBody"><tr><td colspan="13" class="empty">Click Refresh to load</td></tr></tbody>
+  </table>
+  <div class="section-title" style="font-size:13px;margin-top:24px">Unpaired Kalshi positions</div>
+  <table id="walletArbsKalTable">
+    <thead><tr><th>Ticker</th><th>Side</th><th>Shares</th><th>Avg</th><th>Cost</th></tr></thead>
+    <tbody id="walletArbsKalBody"><tr><td colspan="5" class="empty">--</td></tr></tbody>
+  </table>
+  <div class="section-title" style="font-size:13px;margin-top:24px">Unpaired Polymarket positions</div>
+  <table id="walletArbsPmTable">
+    <thead><tr><th>Title / Outcome</th><th>TokenId</th><th>Shares</th><th>Avg</th><th>Cost</th><th>Current Value</th></tr></thead>
+    <tbody id="walletArbsPmBody"><tr><td colspan="6" class="empty">--</td></tr></tbody>
   </table>
 </div>
 
@@ -3098,6 +3309,80 @@ function renderAudit(data) {
 }
 
 // --- Verified P&L ------------------------------------------------------------
+
+// --- Wallet Arbs ------------------------------------------------------------
+async function loadWalletArbs() {
+  var btn = $("walletArbsRefreshBtn");
+  if (btn) btn.textContent = "Loading...";
+  try {
+    var res = await fetch("/api/wallet-arbs");
+    var d = await res.json();
+    if (d.error) {
+      $("walletArbsTotals").textContent = "Error: " + d.error;
+      return;
+    }
+    var totals = d.totals || {};
+    $("walletArbsTotals").innerHTML =
+      'Paired arbs: <b>' + totals.pairedArbs + '</b>  &bull;  ' +
+      'Unpaired KAL: <b>' + totals.unpairedKal + '</b>  &bull;  ' +
+      'Unpaired PM: <b>' + totals.unpairedPm + '</b>  &bull;  ' +
+      'KAL cost: <b>$' + (totals.totalKalCost || 0).toFixed(2) + '</b>  &bull;  ' +
+      'PM cost: <b>$' + (totals.totalPmCost || 0).toFixed(2) + '</b>  &bull;  ' +
+      'Total at risk: <b>$' + (totals.totalCapitalAtRisk || 0).toFixed(2) + '</b>  &bull;  ' +
+      'Watchlist: ' + d.watchlistEntries + ' entries';
+    // Paired table
+    var tb = $("walletArbsPairedBody");
+    if (!d.paired || d.paired.length === 0) {
+      tb.innerHTML = '<tr><td colspan="13" class="empty">No paired arbs found</td></tr>';
+    } else {
+      tb.innerHTML = d.paired.map(function(r) {
+        var netKalC = r.netIfKalWins >= 0 ? '#3fb950' : '#f85149';
+        var netPmC = r.netIfPmWins >= 0 ? '#3fb950' : '#f85149';
+        return '<tr>' +
+          '<td>' + esc(r.match) + '</td>' +
+          '<td style="font-size:11px">' + esc(r.kalTicker) + '</td>' +
+          '<td><span class="dir dir-' + (r.kalSide === "no" ? "C" : "A") + '">' + r.kalSide.toUpperCase() + '</span></td>' +
+          '<td>' + r.kalShares + '</td>' +
+          '<td>' + r.kalAvgPrice + '</td>' +
+          '<td>$' + r.kalCost.toFixed(2) + '</td>' +
+          '<td>' + esc(r.pmOutcome) + '</td>' +
+          '<td>' + r.pmShares + '</td>' +
+          '<td>' + r.pmAvgPrice + '</td>' +
+          '<td>$' + r.pmCost.toFixed(2) + '</td>' +
+          '<td>$' + r.totalCost.toFixed(2) + '</td>' +
+          '<td style="color:' + netKalC + '">$' + r.netIfKalWins.toFixed(2) + '</td>' +
+          '<td style="color:' + netPmC + '">$' + r.netIfPmWins.toFixed(2) + '</td>' +
+          '</tr>';
+      }).join("");
+    }
+    // Unpaired KAL
+    var kb = $("walletArbsKalBody");
+    if (!d.unpairedKal || d.unpairedKal.length === 0) {
+      kb.innerHTML = '<tr><td colspan="5" class="empty">No unpaired Kalshi positions</td></tr>';
+    } else {
+      kb.innerHTML = d.unpairedKal.map(function(r) {
+        return '<tr><td style="font-size:11px">' + esc(r.ticker) + '</td><td>' + r.side.toUpperCase() + '</td><td>' + r.shares + '</td><td>' + r.avgPrice + '</td><td>$' + r.cost.toFixed(2) + '</td></tr>';
+      }).join("");
+    }
+    // Unpaired PM
+    var pb = $("walletArbsPmBody");
+    if (!d.unpairedPm || d.unpairedPm.length === 0) {
+      pb.innerHTML = '<tr><td colspan="6" class="empty">No unpaired Polymarket positions</td></tr>';
+    } else {
+      pb.innerHTML = d.unpairedPm.map(function(r) {
+        return '<tr><td>' + esc(r.title ? r.title.slice(0, 40) : "") + ' / ' + esc(r.outcome) + '</td>' +
+          '<td style="font-size:11px">' + esc(r.tokenId.slice(0, 20)) + '...</td>' +
+          '<td>' + r.shares + '</td><td>' + r.avgPrice + '</td>' +
+          '<td>$' + r.cost.toFixed(2) + '</td>' +
+          '<td>$' + r.currentValue.toFixed(2) + '</td></tr>';
+      }).join("");
+    }
+  } catch (e) {
+    $("walletArbsTotals").textContent = "Failed: " + e.message;
+  } finally {
+    if (btn) btn.textContent = "Refresh";
+  }
+}
 
 async function runVerifiedPnl() {
   var btn = $("verifiedRunBtn");

@@ -2353,27 +2353,11 @@ export async function monitorLoop(watchlist: WatchEntry[]): Promise<void> {
   const abortCountMap = new Map<string, { count: number; cooldownUntil: number }>();
   // sessionSkipSet: matches already traded — don't trade again this session.
   // Prevents re-arbing the same match in the opposite direction (which nets out to a fee loss).
-  // Seeded at startup from arb_trades.json: includes recent trades (last 3 days) AND any
-  // non-resolved trades (a trade placed days ago on a future game should still block).
+  // Seeded from WALLET STATE (on-chain KAL + PM positions) below, not arb_trades.json.
+  // Rationale: wallet is the source of truth. If we hold shares on either exchange, the match
+  // is already committed to — regardless of what the journal says. This lets the bot be
+  // started/stopped on any VPS without relying on data/arb_trades.json being present or current.
   const sessionSkipSet = new Set<string>();
-  {
-    const recentCutoff = Date.now() - 3 * 86_400_000; // 3 days ago
-    const pastTrades = loadArbTrades();
-    for (const t of pastTrades) {
-      if (!t.kalTicker || !t.ts) continue;
-      const tradeTime = new Date(t.ts).getTime();
-      const isRecent = tradeTime >= recentCutoff;
-      const isActive = t.status === "hedging" || t.status === "filled";
-      // Seed from recent trades OR any still-active trades (placed earlier for future games)
-      if (isRecent || isActive) {
-        const mc = matchCodePrefix(t.kalTicker);
-        if (mc) sessionSkipSet.add(mc);
-      }
-    }
-    if (sessionSkipSet.size > 0) {
-      console.log(`[STARTUP] Seeded sessionSkipSet with ${sessionSkipSet.size} match(es) from recent/active trades: ${Array.from(sessionSkipSet).join(", ")}`);
-    }
-  }
   // Coin-flip warning: PM pricing ~50/50 — only warn once per match
   const coinFlipWarned = new Set<string>();
   // inflight: markets currently executing an arb — prevents concurrent execution on same market
@@ -2399,22 +2383,62 @@ export async function monitorLoop(watchlist: WatchEntry[]): Promise<void> {
   // Fetch all Kalshi positions in ONE API call — reused by resume loop + detectUnhedgedKal.
   const kalPosMap = await getKalshiPositionMap();
 
-  // Seed sessionSkipSet from on-chain Kalshi positions — orphan tickers
-  // (prior-session shares not tracked in arb_trades.json) must also block re-arbing,
-  // otherwise a ticker with leftover shares can double-fire the consolidation reconciler.
+  // Seed sessionSkipSet from on-chain Kalshi positions — primary wallet-derived seeding.
+  // Any ticker with shares on-chain blocks re-arbing its match for the rest of the session.
   {
-    let onchainAdded = 0;
+    let kalAdded = 0;
     for (const [ticker, p] of kalPosMap) {
       if ((p.yesCount || 0) <= 0 && (p.noCount || 0) <= 0) continue;
       const mc = matchCodePrefix(ticker);
       if (mc && !sessionSkipSet.has(mc)) {
         sessionSkipSet.add(mc);
-        onchainAdded += 1;
+        kalAdded += 1;
       }
     }
-    if (onchainAdded > 0) {
-      console.log(`[STARTUP] Added ${onchainAdded} match(es) to sessionSkipSet from on-chain Kalshi positions`);
+    if (kalAdded > 0) {
+      console.log(`[STARTUP] Seeded ${kalAdded} match(es) into sessionSkipSet from on-chain Kalshi positions`);
     }
+  }
+
+  // Seed sessionSkipSet from on-chain PM positions — covers orphan PM shares where the
+  // paired Kalshi leg is zero (e.g. Kalshi side settled but PM didn't). Discovery watchlist
+  // maps tokenId → kalTicker, which then maps to matchCode via the usual prefix helper.
+  try {
+    const pmPositions = await fetchPmPositionsCached(5000);
+    const cache = loadDiscoveryCache();
+    const watchlist = Array.isArray(cache?.watchlist) ? cache.watchlist : [];
+    const pmTokenToKalTicker = new Map<string, string>();
+    for (const w of watchlist) {
+      const tok1 = (w as any)?.pm1?.tokenId;
+      const tok2 = (w as any)?.pm2?.tokenId;
+      const tick1 = (w as any)?.kal1?.ticker;
+      const tick2 = (w as any)?.kal2?.ticker;
+      if (tok1 && tick1) pmTokenToKalTicker.set(String(tok1), String(tick1));
+      if (tok2 && tick2) pmTokenToKalTicker.set(String(tok2), String(tick2));
+    }
+    let pmAdded = 0;
+    for (const p of pmPositions) {
+      const sz = Number((p as any).size ?? (p as any).amount ?? 0);
+      if (sz <= 0) continue;
+      const tid = String((p as any).asset ?? (p as any).tokenId ?? "");
+      if (!tid) continue;
+      const kalTicker = pmTokenToKalTicker.get(tid);
+      if (!kalTicker) continue;
+      const mc = matchCodePrefix(kalTicker);
+      if (mc && !sessionSkipSet.has(mc)) {
+        sessionSkipSet.add(mc);
+        pmAdded += 1;
+      }
+    }
+    if (pmAdded > 0) {
+      console.log(`[STARTUP] Seeded ${pmAdded} additional match(es) into sessionSkipSet from on-chain PM positions`);
+    }
+  } catch (e) {
+    console.warn(`[STARTUP] PM wallet seeding failed (non-fatal): ${(e as Error).message}`);
+  }
+
+  if (sessionSkipSet.size > 0) {
+    console.log(`[STARTUP] sessionSkipSet total: ${sessionSkipSet.size} match(es) — ${Array.from(sessionSkipSet).slice(0, 10).join(", ")}${sessionSkipSet.size > 10 ? ", ..." : ""}`);
   }
 
   let hedgeStates: HedgeState[] = loadHedgeStates();
