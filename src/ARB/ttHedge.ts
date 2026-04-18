@@ -2865,42 +2865,52 @@ export async function detectUnhedgedKalPositions(watchlist: WatchEntry[], kalPos
   //                Holding kal3 YES -> needs PM Draw NO to complete (dir=K logic)
   //   Using opposite-player YES (2-way mapping) in 3-way leaves draw UNCOVERED.
   //   Using same-outcome NO token guarantees $1 payout regardless of result.
-  type KalLegMatch = { entry: WatchEntry; kalLeg: KalshiLeg; pmLeg: PmLeg };
+  // KalLegMatch now carries BOTH the YES-side hedge leg AND the NO-side hedge leg.
+  // For a 2-way pair {kal1, kal2, pm1, pm2}:
+  //   kal1 YES pays $1 if kal1 wins → hedge is pm2 (opposite)
+  //   kal1 NO  pays $1 if kal1 loses (=kal2 wins) → hedge is pm1 (same-named PM)
+  // For 3-way soccer (Dir G/H/I: KAL NO + PM YES; Dir J/K/L: KAL YES + PM NO):
+  //   kal1 YES → hedge pm1 NO token (dir J)
+  //   kal1 NO  → hedge pm1 YES token (dir G)
+  type KalLegMatch = { entry: WatchEntry; kalLeg: KalshiLeg; pmLegYes: PmLeg | null; pmLegNo: PmLeg | null };
   const kalTickerMap = new Map<string, KalLegMatch>();
   for (const entry of watchlist) {
     if (entry.is3Way) {
-      // 3-way: hedge with PM NO token on SAME outcome (KAL YES + PM NO = $1 always)
-      if (entry.pm1.noTokenId) {
-        kalTickerMap.set(entry.kal1.ticker, { entry, kalLeg: entry.kal1, pmLeg: { ...entry.pm1, tokenId: entry.pm1.noTokenId, outcome: `${entry.pm1.outcome} [NO]` } });
-      }
-      if (entry.pm2.noTokenId) {
-        kalTickerMap.set(entry.kal2.ticker, { entry, kalLeg: entry.kal2, pmLeg: { ...entry.pm2, tokenId: entry.pm2.noTokenId, outcome: `${entry.pm2.outcome} [NO]` } });
-      }
-      if (entry.kal3 && entry.pm3?.noTokenId) {
-        kalTickerMap.set(entry.kal3.ticker, { entry, kalLeg: entry.kal3, pmLeg: { ...entry.pm3, tokenId: entry.pm3.noTokenId, outcome: `${entry.pm3.outcome} [NO]` } });
+      const yesHedge = (pm: typeof entry.pm1) => pm.noTokenId ? { ...pm, tokenId: pm.noTokenId, outcome: `${pm.outcome} [NO]` } : null;
+      const noHedge  = (pm: typeof entry.pm1) => ({ ...pm }); // keep original YES token
+      kalTickerMap.set(entry.kal1.ticker, { entry, kalLeg: entry.kal1, pmLegYes: yesHedge(entry.pm1), pmLegNo: noHedge(entry.pm1) });
+      kalTickerMap.set(entry.kal2.ticker, { entry, kalLeg: entry.kal2, pmLegYes: yesHedge(entry.pm2), pmLegNo: noHedge(entry.pm2) });
+      if (entry.kal3 && entry.pm3) {
+        kalTickerMap.set(entry.kal3.ticker, { entry, kalLeg: entry.kal3, pmLegYes: yesHedge(entry.pm3), pmLegNo: noHedge(entry.pm3) });
       }
     } else {
-      // 2-way: opposite player YES (KAL P1 YES + PM P2 YES = $1 always)
-      kalTickerMap.set(entry.kal1.ticker, { entry, kalLeg: entry.kal1, pmLeg: entry.pm2 });
-      kalTickerMap.set(entry.kal2.ticker, { entry, kalLeg: entry.kal2, pmLeg: entry.pm1 });
+      // 2-way: for kal1 → YES hedge is pm2, NO hedge is pm1. For kal2 → YES hedge is pm1, NO hedge is pm2.
+      kalTickerMap.set(entry.kal1.ticker, { entry, kalLeg: entry.kal1, pmLegYes: entry.pm2, pmLegNo: entry.pm1 });
+      // Skip kal2 if tickers collide (total markets: kal1.ticker === kal2.ticker — the kal1 mapping
+      // already has the correct pmLegYes=pm2/pmLegNo=pm1 for that single ticker).
+      if (entry.kal2.ticker !== entry.kal1.ticker) {
+        kalTickerMap.set(entry.kal2.ticker, { entry, kalLeg: entry.kal2, pmLegYes: entry.pm1, pmLegNo: entry.pm2 });
+      }
       if (entry.kal3 && entry.pm3) {
-        kalTickerMap.set(entry.kal3.ticker, { entry, kalLeg: entry.kal3, pmLeg: entry.pm3 });
+        kalTickerMap.set(entry.kal3.ticker, { entry, kalLeg: entry.kal3, pmLegYes: entry.pm3, pmLegNo: entry.pm3 });
       }
     }
   }
 
   // Use pre-fetched position map if provided, otherwise fetch fresh
   const posMap = kalPosMap ?? await getKalshiPositionMap();
-  // Convert map to array format for existing loop
-  const kalYesPositions: Array<{ ticker: string; yesCount: number; avgPriceCents: number }> = [];
+  // Build a list of (ticker, side, count) entries for all non-zero YES and NO positions.
+  type KalSideEntry = { ticker: string; side: "yes" | "no"; count: number; avgPriceCents: number };
+  const kalSidePositions: KalSideEntry[] = [];
   for (const [ticker, p] of posMap) {
-    if (p.yesCount > 0) kalYesPositions.push({ ticker, yesCount: p.yesCount, avgPriceCents: p.avgPriceCents });
+    if (p.yesCount > 0) kalSidePositions.push({ ticker, side: "yes", count: p.yesCount, avgPriceCents: p.avgPriceCents });
+    if (p.noCount > 0)  kalSidePositions.push({ ticker, side: "no",  count: p.noCount,  avgPriceCents: p.avgPriceCents });
   }
-  if (!kalYesPositions.length) {
-    console.log(`[STARTUP] KAL scan: No YES positions found on Kalshi.`);
+  if (!kalSidePositions.length) {
+    console.log(`[STARTUP] KAL scan: No YES/NO positions found on Kalshi.`);
     return [];
   }
-  console.log(`[STARTUP] KAL scan: ${kalYesPositions.length} YES position(s): ${kalYesPositions.map(p => `${p.yesCount}x${p.ticker}`).join(", ")}`);
+  console.log(`[STARTUP] KAL scan: ${kalSidePositions.length} position(s): ${kalSidePositions.map(p => `${p.count}x${p.ticker}:${p.side.toUpperCase()}`).join(", ")}`);
 
   // Use cached PM positions (already fetched by detectUnhedgedPmPositions on same startup)
   let pmPositions: PmPosition[] = [];
@@ -2919,7 +2929,7 @@ export async function detectUnhedgedKalPositions(watchlist: WatchEntry[], kalPos
   // even if the wallet told a different story. Removed — any unhedged KAL share
   // in the wallet now triggers hedge detection, regardless of journal state.
 
-  for (const { ticker, yesCount, avgPriceCents } of kalYesPositions) {
+  for (const { ticker, side, count, avgPriceCents } of kalSidePositions) {
     const m = kalTickerMap.get(ticker);
     if (!m) {
       // Fetch market status so we can tell the user if the event is finished
@@ -2936,7 +2946,7 @@ export async function detectUnhedgedKalPositions(watchlist: WatchEntry[], kalPos
       } catch { /* ignore fetch errors */ }
       const extra = result ? ` result=${result}` : "";
       console.warn(
-        `\n[STARTUP] [!] Orphaned Kalshi position: ${yesCount}x${ticker} YES` +
+        `\n[STARTUP] [!] Orphaned Kalshi position: ${count}x${ticker} ${side.toUpperCase()}` +
         `  status=${status}${extra}` +
         (title ? `\n         ${title}` : "") +
         `\n         Not in today's watchlist -- cannot auto-hedge.` +
@@ -2949,32 +2959,37 @@ export async function detectUnhedgedKalPositions(watchlist: WatchEntry[], kalPos
       continue;
     }
 
-    const totalKalShares = yesCount;
+    // Pick the hedge PM leg appropriate for this side (YES → pmLegYes, NO → pmLegNo).
+    // If the leg isn't wired up (3-way without noTokenId for YES side, etc.), skip.
+    const hedgePmLeg = side === "yes" ? m.pmLegYes : m.pmLegNo;
+    if (!hedgePmLeg) {
+      console.warn(`[STARTUP] ${count}x${ticker} ${side.toUpperCase()} -- no hedge leg defined in watchlist (3-way missing noTokenId?). Skipping.`);
+      continue;
+    }
 
-    // Count how many shares are already covered by the Kalshi NO leg (YES + NO = $1)
-    // Use the pre-fetched position map -- no extra API call per ticker.
-    const kalNoFilled = posMap.get(ticker)?.noCount ?? 0;
-
-    // Count how many shares are already covered by the PM leg (complete-pm path)
+    const totalKalShares = count;
+    const posInfo = posMap.get(ticker);
+    // Coverage: the same-ticker OPPOSITE side on Kalshi always covers (YES+NO=$1) — for a
+    // YES position, noCount is coverage; for a NO position, yesCount is coverage.
+    const kalOppositeSideFilled = side === "yes" ? (posInfo?.noCount ?? 0) : (posInfo?.yesCount ?? 0);
+    // Coverage from the hedge-side PM token held in the wallet.
     const pmHeld = Math.round(pmPositions.reduce((sum, p) => {
       const tid = pickString(p.asset ?? p.tokenId ?? p.conditionId ?? "");
       const sz = Number(p.size ?? p.amount ?? 0);
-      return tid === m.pmLeg.tokenId ? sum + sz : sum;
+      return tid === hedgePmLeg.tokenId ? sum + sz : sum;
     }, 0));
 
-    console.log(`[STARTUP] KAL ${totalKalShares}x${ticker}: kalNO=${kalNoFilled} pmHeld=${pmHeld} inHedgeState=${hedgeStateTickers?.has(ticker) ?? "n/a"}`);
+    console.log(`[STARTUP] KAL ${totalKalShares}x${ticker}:${side.toUpperCase()}: kal-opp=${kalOppositeSideFilled} pmHeld=${pmHeld} inHedgeState=${hedgeStateTickers?.has(ticker) ?? "n/a"}`);
 
-    // Net unhedged = total Kalshi YES minus wallet-derived coverage.
-    // KAL NO (YES+NO=$1) and PM opposite-side tokens both cover one KAL YES share each.
-    const covered = Math.min(totalKalShares, kalNoFilled + pmHeld);
+    const covered = Math.min(totalKalShares, kalOppositeSideFilled + pmHeld);
     const sharesHeld = totalKalShares - covered;
 
     if (sharesHeld <= 0) {
       const parts: string[] = [];
-      if (kalNoFilled > 0) parts.push(`KAL NO ${kalNoFilled}`);
+      if (kalOppositeSideFilled > 0) parts.push(`KAL ${side === "yes" ? "NO" : "YES"} ${kalOppositeSideFilled}`);
       if (pmHeld > 0) parts.push(`PM ${pmHeld}`);
       console.log(
-        `[STARTUP] Kalshi ${totalKalShares}x${ticker} YES -- fully covered by wallet` +
+        `[STARTUP] Kalshi ${totalKalShares}x${ticker} ${side.toUpperCase()} -- fully covered by wallet` +
         ` (${parts.join(" + ") || "—"}). Skipping.\n`
       );
       continue;
@@ -2982,8 +2997,8 @@ export async function detectUnhedgedKalPositions(watchlist: WatchEntry[], kalPos
 
     if (covered > 0) {
       console.log(
-        `[STARTUP] Kalshi ${totalKalShares}x${ticker} YES -- ${covered} covered by wallet` +
-        ` (KAL NO ${kalNoFilled} + PM ${pmHeld}). Net unhedged: ${sharesHeld}.`
+        `[STARTUP] Kalshi ${totalKalShares}x${ticker} ${side.toUpperCase()} -- ${covered} covered by wallet` +
+        ` (KAL ${side === "yes" ? "NO" : "YES"} ${kalOppositeSideFilled} + PM ${pmHeld}). Net unhedged: ${sharesHeld}.`
       );
     }
 
@@ -2993,11 +3008,11 @@ export async function detectUnhedgedKalPositions(watchlist: WatchEntry[], kalPos
       ? avgPriceCents / 100
       : (m.kalLeg.yesAsk > 0 && m.kalLeg.yesAsk < 1) ? m.kalLeg.yesAsk : 0.50;
 
-    // Fetch actual Kalshi fills for this ticker to get real fee data
+    // Fetch actual Kalshi fills for this ticker+side to get real fee data
     let actualKalFees = 0;
     try {
       const allFills = await fetchAllKalshiFills();
-      const tickerFills = allFills.filter(f => f.ticker === ticker && f.action === "buy" && f.side === "yes");
+      const tickerFills = allFills.filter(f => f.ticker === ticker && f.action === "buy" && f.side === side);
       actualKalFees = tickerFills.reduce((s, f) => s + f.feeCost, 0);
     } catch (e) {
       console.warn(`[STARTUP] Failed to fetch Kalshi fills for fee data: ${(e as Error).message}`);
@@ -3005,29 +3020,31 @@ export async function detectUnhedgedKalPositions(watchlist: WatchEntry[], kalPos
     const kalFeePerShare = actualKalFees / Math.max(sharesHeld, 1);
 
     console.warn(
-      `\n[STARTUP] Found unhedged Kalshi position: ${sharesHeld}x${ticker} YES` +
+      `\n[STARTUP] Found unhedged Kalshi position: ${sharesHeld}x${ticker} ${side.toUpperCase()}` +
       ` @~${fmtPct(avgFillPrice)} fee=$${actualKalFees.toFixed(2)} (${fmtPct(kalFeePerShare)}/sh) (${m.entry.pmSlug}). Will hedge automatically.\n`
     );
 
-    // Build arb trade record but DON'T persist yet -- the caller will log it
-    // only for positions that survive the dedup check. This prevents phantom
-    // trade entries when the same ticker is already being hedged.
     const kalCostForTrade = Math.round(sharesHeld * avgFillPrice * 100) / 100;
-    const tidKalDetect = `arb-detect-${Date.now()}`;
+    const tidKalDetect = `arb-detect-${Date.now()}-${side}`;
+    // Direction label: YES-side + PM opposite = dir A (2-way) or J (3-way).
+    // NO-side + PM same = dir C (2-way) or G (3-way). Best-effort for audit trail.
+    const detectedDir: ArbTradeRecord["dir"] = side === "yes"
+      ? (m.entry.is3Way ? "J" : "A")
+      : (m.entry.is3Way ? "G" : "C");
     const pendingRecordKal: ArbTradeRecord = {
       id: tidKalDetect,
       ts: new Date().toISOString(),
       match: `${m.entry.kal1.surname} vs ${m.entry.kal2.surname}`,
-      dir: "A", // startup detection assumes dir A (KAL YES + PM opposite)
+      dir: detectedDir,
       status: "hedging",
       shares: sharesHeld,
       kalTicker: ticker,
       kalFillPrice: avgFillPrice,
       kalCost: kalCostForTrade,
       kalFees: actualKalFees,
-      pmOutcome: m.pmLeg.outcome,
+      pmOutcome: hedgePmLeg.outcome,
       pmSlug: m.entry.pmSlug,
-      pmTokenId: m.pmLeg.tokenId,
+      pmTokenId: hedgePmLeg.tokenId,
       pmFillPrice: 0,
       pmCost: 0,
       totalCost: kalCostForTrade + actualKalFees,
@@ -3040,12 +3057,12 @@ export async function detectUnhedgedKalPositions(watchlist: WatchEntry[], kalPos
       position: {
         tradeId: tidKalDetect,
         heldExchange: "kal",
-        pmLeg: m.pmLeg,
+        pmLeg: hedgePmLeg,
         pmOppLeg: null,
         pmCostBasis: 0,
         kalLeg: m.kalLeg,
-        kalCostBasis: avgFillPrice + kalFeePerShare,  // actual fill price + actual fee per share
-        kalSide: "yes",   // startup detection assumes YES side (legacy dir A/B)
+        kalCostBasis: avgFillPrice + kalFeePerShare,
+        kalSide: side,
         sharesHeld,
         initialShares: sharesHeld,
         initialCost: sharesHeld * avgFillPrice + actualKalFees,
