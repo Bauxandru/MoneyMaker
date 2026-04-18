@@ -3354,14 +3354,15 @@ function pnlClass(val) { return val > 0.001 ? "green" : val < -0.001 ? "red" : "
 // target page from reaching back into this window.
 function kalLink(ticker, text) {
   if (!ticker) return esc(text || "—");
-  // Kalshi market URL: /markets/{EVENT_TICKER}. The event ticker is the market
-  // ticker minus the trailing dash-segment (e.g. for KXMLBGAME-26APR181610DETBOS-BOS,
-  // event = KXMLBGAME-26APR181610DETBOS). Previous attempt used /markets/{SERIES}/#{ticker}
-  // but Kalshi's SPA ignores the hash on direct landing → wrong market opens.
-  var parts = String(ticker).split("-");
-  var eventTicker = parts.length > 1 ? parts.slice(0, -1).join("-") : ticker;
-  var href = "https://kalshi.com/markets/" + encodeURI(eventTicker);
-  return '<a href="' + esc(href) + '" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;border-bottom:1px dotted #58a6ff" title="Open on Kalshi">' + esc(text || ticker) + '</a>';
+  // Kalshi URL is annoying — their category pages have slugs (e.g. "mlb-games") that
+  // aren't derivable from just the series ticker, and /markets/{EVENT_TICKER} 404s.
+  // Best effort: link to the series category with the ticker as a hash anchor. Kalshi's
+  // SPA sometimes ignores the hash on direct land, but this always lands on the right
+  // category page (MLB / CS2 / ATP etc.) — user finds their specific market from there.
+  // Better than a hard 404.
+  var series = String(ticker).split("-")[0].toLowerCase();
+  var href = "https://kalshi.com/markets/" + series + "#" + String(ticker).toLowerCase();
+  return '<a href="' + esc(href) + '" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;border-bottom:1px dotted #58a6ff" title="Open category page on Kalshi (ticker: ' + esc(ticker) + ')">' + esc(text || ticker) + '</a>';
 }
 function pmLink(slug, text) {
   if (!slug) return esc(text || "—");
