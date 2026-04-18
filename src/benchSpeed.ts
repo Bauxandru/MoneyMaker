@@ -330,7 +330,30 @@ async function benchKalOrders(): Promise<Record<string, Record<string, number>>>
   const cs = stats("KAL cancel GTC", cancels);
   printRow("KAL place GTC (roundtrip)", ps);
   printRow("KAL cancel GTC (roundtrip)", cs);
-  return { place: ps, cancel: cs } as any;
+
+  // --- KAL IOC test (taker, self-cancels on non-fill) --------------------
+  // Place IOC BUY YES @ 1¢. Since no real ask is at 1¢, the IOC matches
+  // nothing and auto-cancels server-side. We measure the full round-trip.
+  // No manual cancel needed. This simulates the bot's fast-arb path.
+  const iocs: number[] = [];
+  for (let i = 0; i < SAMPLES; i++) {
+    const iocBody = {
+      ticker: kalTickerForTest,
+      action: "buy", side: "yes",
+      type: "limit",
+      time_in_force: "immediate_or_cancel",
+      count: 1, yes_price: 1,
+      client_order_id: "bench-ioc-" + Date.now() + "-" + i,
+    };
+    const r = await kalReq("POST", "/portfolio/orders", iocBody);
+    if (r.status === 200 || r.status === 201) iocs.push(r.ms);
+    else if (i === 0) console.warn("  [KAL IOC] status=" + r.status + " body=" + JSON.stringify(r.body).slice(0, 200));
+    await new Promise(res => setTimeout(res, 500));
+  }
+  const is = stats("KAL place IOC", iocs);
+  printRow("KAL place IOC (roundtrip)", is);
+
+  return { place: ps, cancel: cs, ioc: is } as any;
 }
 
 // --- Polymarket live order test --------------------------------------------
@@ -385,7 +408,35 @@ async function benchPmOrders(): Promise<Record<string, Record<string, number>>> 
   const cs = stats("PM cancel GTC", cancels);
   printRow("PM place GTC (roundtrip)", ps);
   printRow("PM cancel GTC (roundtrip)", cs);
-  return { place: ps, cancel: cs } as any;
+
+  // --- PM FAK test (taker, self-cancels on non-fill) ---------------------
+  // Place FAK BUY @ 1¢ with size=110 → $1.10 marketable value (clears PM's
+  // $1 minimum). Since best ask ≫ 1¢, the FAK matches nothing and
+  // auto-cancels. No manual cancel. Simulates the bot's fast-arb path.
+  const faks: number[] = [];
+  for (let i = 0; i < SAMPLES; i++) {
+    try {
+      const t0 = performance.now();
+      const order = await (client as any).createOrder(
+        { tokenID: tokenId, price: 0.01, side: Side.BUY, size: 110 },
+        { tickSize: "0.01", negRisk: false }
+      );
+      const r = await (client as any).postOrder(order, OrderType.FAK);
+      const fakMs = Math.round(performance.now() - t0);
+      faks.push(fakMs);
+      if (i === 0) {
+        const status = (r as any)?.status ?? "?";
+        console.log("  [PM FAK] first response status=" + status);
+      }
+    } catch (e: any) {
+      if (i === 0) console.warn("  [PM FAK] " + String(e.message ?? e).slice(0, 120));
+    }
+    await new Promise(r => setTimeout(r, 500));
+  }
+  const fs = stats("PM place FAK", faks);
+  printRow("PM place FAK (roundtrip)", fs);
+
+  return { place: ps, cancel: cs, fak: fs } as any;
 }
 
 // --- Polygon RPC test ------------------------------------------------------
@@ -469,8 +520,10 @@ async function main() {
   console.log("  KAL API total p50=" + (h.p50 || "-") + "ms  PM CLOB total p50=" + (p.p50 || "-") + "ms");
   console.log("  KAL WS p50=" + (kw.p50 || "-") + "ms  PM WS p50=" + (pw.p50 || "-") + "ms");
   console.log("  Polygon RPC p50=" + (rpc.p50 || "-") + "ms");
-  if (report.kal_orders?.place?.p50) console.log("  KAL order place p50=" + report.kal_orders.place.p50 + "ms");
-  if (report.pm_orders?.place?.p50) console.log("  PM order place p50=" + report.pm_orders.place.p50 + "ms");
+  if (report.kal_orders?.place?.p50) console.log("  KAL GTC place p50=" + report.kal_orders.place.p50 + "ms  cancel p50=" + (report.kal_orders.cancel?.p50 || "-") + "ms");
+  if (report.kal_orders?.ioc?.p50) console.log("  KAL IOC place p50=" + report.kal_orders.ioc.p50 + "ms");
+  if (report.pm_orders?.place?.p50) console.log("  PM  GTC place p50=" + report.pm_orders.place.p50 + "ms  cancel p50=" + (report.pm_orders.cancel?.p50 || "-") + "ms");
+  if (report.pm_orders?.fak?.p50) console.log("  PM  FAK place p50=" + report.pm_orders.fak.p50 + "ms");
   console.log("  Total bench time: " + Math.round((Date.now() - start)/1000) + "s");
 
   const outFile = "bench-" + LOCATION.replace(/[^a-zA-Z0-9-]/g, "_") + "-" + new Date().toISOString().replace(/[:.]/g, "-") + ".json";
