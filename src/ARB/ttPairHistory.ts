@@ -43,6 +43,7 @@ type PairHistoryFile = { entries: HistoricalPair[] };
 /**
  * Load the pair history, pruning entries older than the TTL.
  * Returns an empty Map on missing/invalid file (always safe to call).
+ * Entries without a kalTicker (PM-only orphans) key by pm:<tokenId>.
  */
 export function loadPairHistory(): Map<string, HistoricalPair> {
   const map = new Map<string, HistoricalPair>();
@@ -51,13 +52,106 @@ export function loadPairHistory(): Map<string, HistoricalPair> {
     const raw = JSON.parse(fs.readFileSync(PAIR_HISTORY_PATH, "utf8")) as PairHistoryFile;
     const now = Date.now();
     for (const e of raw.entries ?? []) {
-      if (!e?.kalTicker) continue;
       if (typeof e.lastSeenAt !== "number") continue;
       if (now - e.lastSeenAt > PAIR_HISTORY_TTL_MS) continue;
-      map.set(e.kalTicker, e);
+      // Primary key: kalTicker if present, otherwise pm:<pmTokenId> (for orphan PM positions).
+      const key = e.kalTicker && e.kalTicker.length > 0
+        ? e.kalTicker
+        : (e.pmTokenId ? `pm:${e.pmTokenId}` : "");
+      if (!key) continue;
+      map.set(key, e);
     }
   } catch { /* ignore — return empty */ }
   return map;
+}
+
+/**
+ * Build a pmTokenId → HistoricalPair reverse index over a pair-history map.
+ * Useful for dashboard display where we look up timestamps by PM token
+ * (for orphan PM rows that have no kalTicker reference).
+ */
+export function indexPairHistoryByPmTokenId(map: Map<string, HistoricalPair>): Map<string, HistoricalPair> {
+  const byPm = new Map<string, HistoricalPair>();
+  for (const e of map.values()) {
+    if (e.pmTokenId) byPm.set(e.pmTokenId, e);
+    if (e.pairedPmTokenId) byPm.set(e.pairedPmTokenId, e);
+  }
+  return byPm;
+}
+
+/**
+ * Upsert entries for positions currently held in the wallet but not yet in pair_history.
+ * Captures the firstSeenAt timestamp for each KAL ticker and PM tokenId we see, so
+ * the dashboard can sort positions chronologically and show how long you've held them.
+ *
+ * Called from the dashboard `/api/wallet-arbs` endpoint on each refresh — cheap,
+ * atomic-write, no-op for positions already tracked.
+ */
+export function upsertWalletSightings(args: {
+  kalTickers: Iterable<string>;
+  pmTokenIds: Iterable<string>;
+  pmTokenMeta?: Map<string, { matchName?: string; outcome?: string; pmSlug?: string }>;
+}): void {
+  const current = loadPairHistory();
+  const now = Date.now();
+  let touched = 0;
+
+  for (const ticker of args.kalTickers) {
+    if (!ticker) continue;
+    const existing = current.get(ticker);
+    if (existing) {
+      existing.lastSeenAt = now;
+      touched += 1;
+    } else {
+      current.set(ticker, {
+        kalTicker: ticker,
+        pmTokenId: "",
+        pmOutcome: "",
+        pmSlug: "",
+        matchName: "",
+        pairedKalTicker: "",
+        pairedPmTokenId: "",
+        firstSeenAt: now,
+        lastSeenAt: now,
+      });
+      touched += 1;
+    }
+  }
+
+  for (const tokenId of args.pmTokenIds) {
+    if (!tokenId) continue;
+    const key = `pm:${tokenId}`;
+    const existing = current.get(key);
+    const meta = args.pmTokenMeta?.get(tokenId);
+    if (existing) {
+      existing.lastSeenAt = now;
+      if (meta?.matchName && !existing.matchName) existing.matchName = meta.matchName;
+      if (meta?.outcome  && !existing.pmOutcome)  existing.pmOutcome  = meta.outcome;
+      if (meta?.pmSlug   && !existing.pmSlug)     existing.pmSlug     = meta.pmSlug;
+      touched += 1;
+    } else {
+      current.set(key, {
+        kalTicker: "",
+        pmTokenId: tokenId,
+        pmOutcome: meta?.outcome ?? "",
+        pmSlug: meta?.pmSlug ?? "",
+        matchName: meta?.matchName ?? "",
+        pairedKalTicker: "",
+        pairedPmTokenId: "",
+        firstSeenAt: now,
+        lastSeenAt: now,
+      });
+      touched += 1;
+    }
+  }
+
+  if (touched === 0) return;
+  try {
+    const arr = Array.from(current.values());
+    atomicWriteFileSync(PAIR_HISTORY_PATH, JSON.stringify({ entries: arr }, null, 2));
+  } catch (err) {
+    console.warn(`[PAIR-HISTORY] wallet sighting write failed: ${(err as Error).message}`);
+  }
 }
 
 /**

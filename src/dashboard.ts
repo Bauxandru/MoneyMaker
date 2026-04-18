@@ -1469,26 +1469,33 @@ app.get("/api/wallet-arbs", async (_req, res) => {
       pairByPmTokenId.set(w.pm1.tokenId, { kalTicker: w.kal1.ticker, matchName, pmSlug: w.pmSlug });
       pairByPmTokenId.set(w.pm2.tokenId, { kalTicker: w.kal2.ticker, matchName, pmSlug: w.pmSlug });
     }
-    // Fallback: merge 7-day pair-history for markets that have since rolled off
-    // the live watchlist (but where we still hold shares waiting to settle).
-    try {
-      const { loadPairHistory } = await import("./ARB/ttPairHistory.js");
-      const hist = loadPairHistory();
-      for (const [kalTicker, h] of hist) {
-        if (!pairByKalTicker.has(kalTicker)) {
-          pairByKalTicker.set(kalTicker, {
-            pmLeg: { tokenId: h.pmTokenId, outcome: h.pmOutcome },
-            pmOppLeg: { tokenId: h.pairedPmTokenId || "", outcome: "" },
-            pmSlug: h.pmSlug,
-            matchName: h.matchName,
-            historical: true,
-          });
-        }
-        if (h.pmTokenId && !pairByPmTokenId.has(h.pmTokenId)) {
-          pairByPmTokenId.set(h.pmTokenId, { kalTicker: h.kalTicker, matchName: h.matchName, pmSlug: h.pmSlug });
-        }
+    // Fallback + timestamp source: 7-day pair-history. Merged into the pair maps for
+    // expired watchlist entries, AND used to attach firstSeenAt to each row so the UI
+    // can sort chronologically and show position age.
+    const pairHistoryMod = await import("./ARB/ttPairHistory.js");
+    const pairHistory = pairHistoryMod.loadPairHistory();
+    const pairHistoryByPm = pairHistoryMod.indexPairHistoryByPmTokenId(pairHistory);
+    for (const [key, h] of pairHistory) {
+      // keys are kalTicker for normal entries, "pm:<tokenId>" for PM-only stubs
+      if (h.kalTicker && !pairByKalTicker.has(h.kalTicker)) {
+        pairByKalTicker.set(h.kalTicker, {
+          pmLeg: { tokenId: h.pmTokenId, outcome: h.pmOutcome },
+          pmOppLeg: { tokenId: h.pairedPmTokenId || "", outcome: "" },
+          pmSlug: h.pmSlug,
+          matchName: h.matchName,
+          historical: true,
+        });
       }
-    } catch { /* best-effort — history is display-only */ }
+      if (h.pmTokenId && !pairByPmTokenId.has(h.pmTokenId)) {
+        pairByPmTokenId.set(h.pmTokenId, { kalTicker: h.kalTicker, matchName: h.matchName, pmSlug: h.pmSlug });
+      }
+      void key; // unused, key iteration is just for the loop
+    }
+    function getFirstSeenAt(kalTicker?: string, pmTokenId?: string): number | undefined {
+      if (kalTicker) { const e = pairHistory.get(kalTicker); if (e) return e.firstSeenAt; }
+      if (pmTokenId) { const e = pairHistoryByPm.get(pmTokenId); if (e) return e.firstSeenAt; }
+      return undefined;
+    }
 
     // 2. Fetch live KAL + PM positions in parallel
     const [kalMap, pmPositionsRaw] = await Promise.all([
@@ -1575,6 +1582,7 @@ app.get("/api/wallet-arbs", async (_req, res) => {
         netIfKalWins: Math.round(netIfKalWins * 100) / 100,
         netIfPmWins: Math.round(netIfPmWins * 100) / 100,
         currentPnl: Math.round(currentPnl * 100) / 100,
+        firstSeenAt: getFirstSeenAt(kalTicker, pmTokenId),
       };
     }
 
@@ -1643,6 +1651,7 @@ app.get("/api/wallet-arbs", async (_req, res) => {
         shares: held,
         avgPrice: Math.round(avg * 10000) / 10000,
         cost: Math.round(cost * 100) / 100,
+        firstSeenAt: getFirstSeenAt(ticker, undefined),
       });
     }
     // 4a. Pre-fetch Kalshi market status for every paired KAL ticker we need to classify.
@@ -1745,7 +1754,38 @@ app.get("/api/wallet-arbs", async (_req, res) => {
         curPrice: Math.round(curPrice * 10000) / 10000,
         cost: Math.round(Number(p.initialValue ?? 0) * 100) / 100,
         currentValue: Math.round(Number(p.currentValue ?? 0) * 100) / 100,
+        firstSeenAt: getFirstSeenAt(pairMeta?.kalTicker, tokenId),
       });
+    }
+
+    // Upsert current wallet sightings into pair_history so future dashboard renders
+    // have a firstSeenAt for every position. Also timestamps brand-new positions the
+    // first time the dashboard sees them.
+    try {
+      const kalTickersSeen: string[] = [];
+      for (const [ticker, pos] of kalMap.entries()) {
+        if (((pos.yesCount ?? 0) + (pos.noCount ?? 0)) > 0) kalTickersSeen.push(ticker);
+      }
+      const pmTokenIdsSeen: string[] = [];
+      const pmTokenMetaForUpsert = new Map<string, { matchName?: string; outcome?: string; pmSlug?: string }>();
+      for (const p of pmPositionsRaw) {
+        const tid = String(p?.asset ?? "");
+        if (!tid || Number(p.size) <= 0) continue;
+        pmTokenIdsSeen.push(tid);
+        const pairMeta = pairByPmTokenId.get(tid);
+        pmTokenMetaForUpsert.set(tid, {
+          matchName: pairMeta?.matchName,
+          outcome: String(p.outcome ?? ""),
+          pmSlug: pairMeta?.pmSlug ?? String(p.slug ?? ""),
+        });
+      }
+      pairHistoryMod.upsertWalletSightings({
+        kalTickers: kalTickersSeen,
+        pmTokenIds: pmTokenIdsSeen,
+        pmTokenMeta: pmTokenMetaForUpsert,
+      });
+    } catch (e) {
+      console.warn(`[wallet-arbs] upsertWalletSightings failed (non-fatal): ${(e as Error).message}`);
     }
 
     const totalKalCost = paired.reduce((s, r) => s + r.kalCost, 0) + unpairedKal.reduce((s, r) => s + r.cost, 0);
@@ -1763,6 +1803,14 @@ app.get("/api/wallet-arbs", async (_req, res) => {
       void: [],
     };
     for (const r of unpairedPm) (pmByStatus[r.pmStatus] ?? pmByStatus.naked).push(r);
+
+    // Chronological sort: oldest first within each bucket, so the Wallet Arbs tab reads
+    // like a timeline — newer positions appear at the bottom.
+    const byAge = (a: any, b: any) => (a.firstSeenAt ?? 0) - (b.firstSeenAt ?? 0);
+    paired.sort(byAge);
+    unpairedKal.sort(byAge);
+    unpairedPm.sort(byAge);
+    for (const k of Object.keys(pmByStatus)) pmByStatus[k].sort(byAge);
 
     res.json({
       ts: new Date().toISOString(),
@@ -2729,6 +2777,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
   <table id="walletArbsPairedTable">
     <thead>
       <tr>
+        <th title="How long this position has been in the wallet (first time pair_history saw it)">Age</th>
         <th>Match</th>
         <th>Type</th>
         <th>KAL Ticker</th>
@@ -2746,12 +2795,12 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
         <th>Net if OPPOSITE wins</th>
       </tr>
     </thead>
-    <tbody id="walletArbsPairedBody"><tr><td colspan="15" class="empty">Click Refresh to load</td></tr></tbody>
+    <tbody id="walletArbsPairedBody"><tr><td colspan="16" class="empty">Click Refresh to load</td></tr></tbody>
   </table>
   <div class="section-title" style="font-size:13px;margin-top:24px">Unpaired Kalshi positions</div>
   <table id="walletArbsKalTable">
-    <thead><tr><th>Ticker</th><th>Side</th><th>Shares</th><th>Avg</th><th>Cost</th></tr></thead>
-    <tbody id="walletArbsKalBody"><tr><td colspan="5" class="empty">--</td></tr></tbody>
+    <thead><tr><th>Age</th><th>Ticker</th><th>Side</th><th>Shares</th><th>Avg</th><th>Cost</th></tr></thead>
+    <tbody id="walletArbsKalBody"><tr><td colspan="6" class="empty">--</td></tr></tbody>
   </table>
   <!-- PM positions split by settlement status. Each bucket renders into its own table. -->
   <div class="section-title" style="font-size:13px;margin-top:24px;color:#f85149">
@@ -2759,54 +2808,54 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
     <span style="font-size:11px;color:#8b949e;font-weight:normal;margin-left:8px">KAL market still active — take action</span>
   </div>
   <table id="walletArbsPmNakedTable">
-    <thead><tr><th>Match</th><th>Title / Outcome</th><th>Paired KAL</th><th>KAL Status</th><th>Shares</th><th>Avg</th><th>Cur Px</th><th>Cost</th><th>Cur Value</th><th>Actions</th></tr></thead>
-    <tbody id="walletArbsPmNakedBody"><tr><td colspan="10" class="empty">--</td></tr></tbody>
+    <thead><tr><th>Age</th><th>Match</th><th>Title / Outcome</th><th>Paired KAL</th><th>KAL Status</th><th>Shares</th><th>Avg</th><th>Cur Px</th><th>Cost</th><th>Cur Value</th><th>Actions</th></tr></thead>
+    <tbody id="walletArbsPmNakedBody"><tr><td colspan="11" class="empty">--</td></tr></tbody>
   </table>
   <div class="section-title" style="font-size:13px;margin-top:24px;color:#58a6ff">
     PM-only hedges — BALANCED (both sides, matched sizes) <span id="walletArbsPmOnlyCount" style="font-size:11px;color:#8b949e;font-weight:normal"></span>
     <span style="font-size:11px;color:#8b949e;font-weight:normal;margin-left:8px">sizes match within $2 — real $1-combined-payout arb, locked profit</span>
   </div>
   <table id="walletArbsPmOnlyTable">
-    <thead><tr><th>Match</th><th>Title / Outcome</th><th>Paired KAL</th><th>Shares</th><th>Opposite</th><th>Avg</th><th>Cur Px</th><th>Cost</th><th>Cur Value</th><th>Actions</th></tr></thead>
-    <tbody id="walletArbsPmOnlyBody"><tr><td colspan="10" class="empty">--</td></tr></tbody>
+    <thead><tr><th>Age</th><th>Match</th><th>Title / Outcome</th><th>Paired KAL</th><th>Shares</th><th>Opposite</th><th>Avg</th><th>Cur Px</th><th>Cost</th><th>Cur Value</th><th>Actions</th></tr></thead>
+    <tbody id="walletArbsPmOnlyBody"><tr><td colspan="11" class="empty">--</td></tr></tbody>
   </table>
   <div class="section-title" style="font-size:13px;margin-top:24px;color:#ff7b00">
     PM-only hedges — IMBALANCED (both sides, mismatched sizes) <span id="walletArbsPmOnlyImbalCount" style="font-size:11px;color:#8b949e;font-weight:normal"></span>
     <span style="font-size:11px;color:#8b949e;font-weight:normal;margin-left:8px">opposite held but sizes differ &gt; $2 — directional bet with partial PM floor</span>
   </div>
   <table id="walletArbsPmOnlyImbalTable">
-    <thead><tr><th>Match</th><th>Title / Outcome</th><th>Paired KAL</th><th>Shares</th><th>Opposite</th><th>Avg</th><th>Cur Px</th><th>Cost</th><th>Cur Value</th><th>Actions</th></tr></thead>
-    <tbody id="walletArbsPmOnlyImbalBody"><tr><td colspan="10" class="empty">--</td></tr></tbody>
+    <thead><tr><th>Age</th><th>Match</th><th>Title / Outcome</th><th>Paired KAL</th><th>Shares</th><th>Opposite</th><th>Avg</th><th>Cur Px</th><th>Cost</th><th>Cur Value</th><th>Actions</th></tr></thead>
+    <tbody id="walletArbsPmOnlyImbalBody"><tr><td colspan="11" class="empty">--</td></tr></tbody>
   </table>
   <div class="section-title" style="font-size:13px;margin-top:24px;color:#d29922">
     KAL settled/closed, PM still open <span id="walletArbsKalPendingCount" style="font-size:11px;color:#8b949e;font-weight:normal"></span>
     <span style="font-size:11px;color:#8b949e;font-weight:normal;margin-left:8px">KAL no longer tradable — market-sell PM to exit</span>
   </div>
   <table id="walletArbsPmKalPendingTable">
-    <thead><tr><th>Match</th><th>Title / Outcome</th><th>Paired KAL</th><th>KAL Result</th><th>Shares</th><th>Avg</th><th>Cur Px</th><th>Cost</th><th>Cur Value</th><th>Actions</th></tr></thead>
-    <tbody id="walletArbsPmKalPendingBody"><tr><td colspan="10" class="empty">--</td></tr></tbody>
+    <thead><tr><th>Age</th><th>Match</th><th>Title / Outcome</th><th>Paired KAL</th><th>KAL Result</th><th>Shares</th><th>Avg</th><th>Cur Px</th><th>Cost</th><th>Cur Value</th><th>Actions</th></tr></thead>
+    <tbody id="walletArbsPmKalPendingBody"><tr><td colspan="11" class="empty">--</td></tr></tbody>
   </table>
   <div class="section-title" style="font-size:13px;margin-top:24px;color:#3fb950">
     Settled WINNERS (redeemable) <span id="walletArbsWinnersCount" style="font-size:11px;color:#8b949e;font-weight:normal"></span>
     <span style="font-size:11px;color:#8b949e;font-weight:normal;margin-left:8px">PM resolved, claim on-chain</span>
   </div>
   <table id="walletArbsPmWinnersTable">
-    <thead><tr><th>Match</th><th>Title / Outcome</th><th>Paired KAL</th><th>Shares</th><th>Avg</th><th>Cur Px</th><th>Est Payout</th><th>Actions</th></tr></thead>
-    <tbody id="walletArbsPmWinnersBody"><tr><td colspan="8" class="empty">--</td></tr></tbody>
+    <thead><tr><th>Age</th><th>Match</th><th>Title / Outcome</th><th>Paired KAL</th><th>Shares</th><th>Avg</th><th>Cur Px</th><th>Est Payout</th><th>Actions</th></tr></thead>
+    <tbody id="walletArbsPmWinnersBody"><tr><td colspan="9" class="empty">--</td></tr></tbody>
   </table>
   <div class="section-title" style="font-size:13px;margin-top:24px;color:#8b949e">
     Settled LOSERS (redeemable, ~worthless) <span id="walletArbsLosersCount" style="font-size:11px;color:#8b949e;font-weight:normal"></span>
   </div>
   <table id="walletArbsPmLosersTable">
-    <thead><tr><th>Match</th><th>Title / Outcome</th><th>Shares</th><th>Avg</th><th>Cur Px</th><th>Actions</th></tr></thead>
-    <tbody id="walletArbsPmLosersBody"><tr><td colspan="6" class="empty">--</td></tr></tbody>
+    <thead><tr><th>Age</th><th>Match</th><th>Title / Outcome</th><th>Shares</th><th>Avg</th><th>Cur Px</th><th>Actions</th></tr></thead>
+    <tbody id="walletArbsPmLosersBody"><tr><td colspan="7" class="empty">--</td></tr></tbody>
   </table>
   <div class="section-title" style="font-size:13px;margin-top:24px;color:#8b949e">
     No known pair / void <span id="walletArbsOtherCount" style="font-size:11px;color:#8b949e;font-weight:normal"></span>
   </div>
   <table id="walletArbsPmOtherTable">
-    <thead><tr><th>Title / Outcome</th><th>TokenId</th><th>Status</th><th>Shares</th><th>Avg</th><th>Cost</th></tr></thead>
-    <tbody id="walletArbsPmOtherBody"><tr><td colspan="6" class="empty">--</td></tr></tbody>
+    <thead><tr><th>Age</th><th>Title / Outcome</th><th>TokenId</th><th>Status</th><th>Shares</th><th>Avg</th><th>Cost</th></tr></thead>
+    <tbody id="walletArbsPmOtherBody"><tr><td colspan="7" class="empty">--</td></tr></tbody>
   </table>
 </div>
 
@@ -3120,6 +3169,18 @@ function esc(s) {
 }
 
 function pnlClass(val) { return val > 0.001 ? "green" : val < -0.001 ? "red" : "gray"; }
+// Relative-time helper for the "First Seen" column: shows "12m", "3h", "2d" etc.
+// Returns "--" if ts is missing. Purely cosmetic — tooltip shows the full ISO string.
+function ageLabel(ts) {
+  if (!ts) return '<span style="color:#6e7681">--</span>';
+  var secs = Math.max(0, Math.floor((Date.now() - ts) / 1000));
+  var s;
+  if (secs < 60) s = secs + 's';
+  else if (secs < 3600) s = Math.floor(secs / 60) + 'm';
+  else if (secs < 86400) s = Math.floor(secs / 3600) + 'h';
+  else s = Math.floor(secs / 86400) + 'd';
+  return '<span title="' + new Date(ts).toISOString() + '" style="color:#8b949e;font-size:11px">' + s + ' ago</span>';
+}
 function kalFee(t) {
   return t.kalFees != null ? t.kalFees : Math.max(0, t.kalCost - t.shares * t.kalFillPrice);
 }
@@ -3840,7 +3901,7 @@ async function loadWalletArbs() {
     // Paired table
     var tb = $("walletArbsPairedBody");
     if (!d.paired || d.paired.length === 0) {
-      tb.innerHTML = '<tr><td colspan="15" class="empty">No paired arbs found</td></tr>';
+      tb.innerHTML = '<tr><td colspan="16" class="empty">No paired arbs found</td></tr>';
     } else {
       tb.innerHTML = d.paired.map(function(r) {
         var netKalC = r.netIfKalWins >= 0 ? '#3fb950' : '#f85149';
@@ -3855,6 +3916,7 @@ async function loadWalletArbs() {
           typeBadge = '<span style="color:#3fb950;font-size:10px;padding:1px 4px;border:1px solid #3fb950;border-radius:3px" title="Opposite outcomes, sizes balanced — locked-in min-profit arb">HEDGED</span>';
         }
         return '<tr>' +
+          '<td>' + ageLabel(r.firstSeenAt) + '</td>' +
           '<td>' + esc(r.match) + '</td>' +
           '<td>' + typeBadge + '</td>' +
           '<td style="font-size:11px">' + esc(r.kalTicker) + '</td>' +
@@ -3876,10 +3938,10 @@ async function loadWalletArbs() {
     // Unpaired KAL
     var kb = $("walletArbsKalBody");
     if (!d.unpairedKal || d.unpairedKal.length === 0) {
-      kb.innerHTML = '<tr><td colspan="5" class="empty">No unpaired Kalshi positions</td></tr>';
+      kb.innerHTML = '<tr><td colspan="6" class="empty">No unpaired Kalshi positions</td></tr>';
     } else {
       kb.innerHTML = d.unpairedKal.map(function(r) {
-        return '<tr><td style="font-size:11px">' + esc(r.ticker) + '</td><td>' + r.side.toUpperCase() + '</td><td>' + r.shares + '</td><td>' + r.avgPrice + '</td><td>$' + r.cost.toFixed(2) + '</td></tr>';
+        return '<tr><td>' + ageLabel(r.firstSeenAt) + '</td><td style="font-size:11px">' + esc(r.ticker) + '</td><td>' + r.side.toUpperCase() + '</td><td>' + r.shares + '</td><td>' + r.avgPrice + '</td><td>$' + r.cost.toFixed(2) + '</td></tr>';
       }).join("");
     }
     // Unpaired PM — split by status into buckets
@@ -3913,9 +3975,10 @@ async function loadWalletArbs() {
 
     // Naked
     var nb = $("walletArbsPmNakedBody");
-    if (nakedCt === 0) nb.innerHTML = '<tr><td colspan="10" class="empty">No naked PM positions</td></tr>';
+    if (nakedCt === 0) nb.innerHTML = '<tr><td colspan="11" class="empty">No naked PM positions</td></tr>';
     else nb.innerHTML = byStatus.naked.map(function(r) {
       return '<tr>' +
+        '<td>' + ageLabel(r.firstSeenAt) + '</td>' +
         '<td>' + esc(r.pairedMatchName || "?") + '</td>' +
         '<td>' + titleOutcome(r) + '</td>' +
         '<td style="font-size:11px">' + esc(r.pairedKalTicker || "-") + '</td>' +
@@ -3927,6 +3990,7 @@ async function loadWalletArbs() {
 
     function pmOnlyRow(r) {
       return '<tr>' +
+        '<td>' + ageLabel(r.firstSeenAt) + '</td>' +
         '<td>' + esc(r.pairedMatchName || "?") + '</td>' +
         '<td>' + titleOutcome(r) + '</td>' +
         '<td style="font-size:11px">' + esc(r.pairedKalTicker || "-") + '</td>' +
@@ -3938,18 +4002,19 @@ async function loadWalletArbs() {
     }
     // PM-only hedged BALANCED (both sides held, sizes match)
     var pob = $("walletArbsPmOnlyBody");
-    if (pmOnlyCt === 0) pob.innerHTML = '<tr><td colspan="10" class="empty">--</td></tr>';
+    if (pmOnlyCt === 0) pob.innerHTML = '<tr><td colspan="11" class="empty">--</td></tr>';
     else pob.innerHTML = byStatus["pm-only-hedged"].map(pmOnlyRow).join("");
     // PM-only IMBALANCED (both sides held, sizes mismatched → directional exposure)
     var poib = $("walletArbsPmOnlyImbalBody");
-    if (pmOnlyImbalCt === 0) poib.innerHTML = '<tr><td colspan="10" class="empty">--</td></tr>';
+    if (pmOnlyImbalCt === 0) poib.innerHTML = '<tr><td colspan="11" class="empty">--</td></tr>';
     else poib.innerHTML = byStatus["pm-only-imbalanced"].map(pmOnlyRow).join("");
 
     // Kal-settled-pm-pending
     var kpb = $("walletArbsPmKalPendingBody");
-    if (kalPendCt === 0) kpb.innerHTML = '<tr><td colspan="10" class="empty">--</td></tr>';
+    if (kalPendCt === 0) kpb.innerHTML = '<tr><td colspan="11" class="empty">--</td></tr>';
     else kpb.innerHTML = byStatus["kal-settled-pm-pending"].map(function(r) {
       return '<tr>' +
+        '<td>' + ageLabel(r.firstSeenAt) + '</td>' +
         '<td>' + esc(r.pairedMatchName || "?") + '</td>' +
         '<td>' + titleOutcome(r) + '</td>' +
         '<td style="font-size:11px">' + esc(r.pairedKalTicker || "-") + '</td>' +
@@ -3964,9 +4029,10 @@ async function loadWalletArbs() {
     }
     // Winners
     var wb = $("walletArbsPmWinnersBody");
-    if (winCt === 0) wb.innerHTML = '<tr><td colspan="8" class="empty">--</td></tr>';
+    if (winCt === 0) wb.innerHTML = '<tr><td colspan="9" class="empty">--</td></tr>';
     else wb.innerHTML = byStatus["settled-winner"].map(function(r) {
       return '<tr>' +
+        '<td>' + ageLabel(r.firstSeenAt) + '</td>' +
         '<td>' + esc(r.pairedMatchName || "?") + pendingTag(r) + '</td>' +
         '<td>' + titleOutcome(r) + '</td>' +
         '<td style="font-size:11px">' + esc(r.pairedKalTicker || "-") + '</td>' +
@@ -3977,9 +4043,10 @@ async function loadWalletArbs() {
 
     // Losers
     var lb = $("walletArbsPmLosersBody");
-    if (loseCt === 0) lb.innerHTML = '<tr><td colspan="6" class="empty">--</td></tr>';
+    if (loseCt === 0) lb.innerHTML = '<tr><td colspan="7" class="empty">--</td></tr>';
     else lb.innerHTML = byStatus["settled-loser"].map(function(r) {
       return '<tr>' +
+        '<td>' + ageLabel(r.firstSeenAt) + '</td>' +
         '<td>' + esc(r.pairedMatchName || "?") + pendingTag(r) + '</td>' +
         '<td>' + titleOutcome(r) + '</td>' +
         '<td>' + r.shares + '</td><td>' + r.avgPrice + '</td><td>' + r.curPrice + '</td>' +
@@ -3989,9 +4056,10 @@ async function loadWalletArbs() {
     // No-pair / void
     var ob = $("walletArbsPmOtherBody");
     var other = byStatus["no-pair"].concat(byStatus.void);
-    if (other.length === 0) ob.innerHTML = '<tr><td colspan="6" class="empty">--</td></tr>';
+    if (other.length === 0) ob.innerHTML = '<tr><td colspan="7" class="empty">--</td></tr>';
     else ob.innerHTML = other.map(function(r) {
-      return '<tr><td>' + titleOutcome(r) + '</td>' +
+      return '<tr><td>' + ageLabel(r.firstSeenAt) + '</td>' +
+        '<td>' + titleOutcome(r) + '</td>' +
         '<td style="font-size:11px">' + esc(r.tokenId.slice(0, 20)) + '...</td>' +
         '<td>' + esc(r.pmStatus) + '</td>' +
         '<td>' + r.shares + '</td><td>' + r.avgPrice + '</td><td>$' + r.cost.toFixed(2) + '</td></tr>';
