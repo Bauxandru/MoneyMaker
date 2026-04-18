@@ -355,6 +355,18 @@ export async function getUsdcBalance(): Promise<number> {
 // --- Dashboard status ---------------------------------------------------------
 
 export function getChainStatus() {
+  // Resolve wallet address even when chain module isn't initialized (dashboard
+  // calls this before any RPC is set up). Prefer POLY_FUNDER, fall back to
+  // wallet address derived from POLY_WALLET_PRIVATE_KEY. Only shows
+  // "not initialized" when neither env var is present.
+  let walletAddress = _walletAddress;
+  if (!walletAddress) {
+    const funder = process.env.POLY_FUNDER;
+    if (funder) walletAddress = funder;
+    else if (process.env.POLY_WALLET_PRIVATE_KEY) {
+      try { walletAddress = ethers.computeAddress(process.env.POLY_WALLET_PRIVATE_KEY); } catch { /* bad key */ }
+    }
+  }
   return {
     httpProviderConnected: _httpProvider !== null,
     wssProviderConnected: _wssProvider !== null,
@@ -363,6 +375,6 @@ export function getChainStatus() {
     rpcUrl: (process.env.POLY_RPC_URL || process.env.POLYGON_RPC_URL || "not set").replace(/^(https?:\/\/[^/]+).*/, "$1"),
     wssUrl: process.env.POLYGON_WSS_URL ? "configured" : "not set",
     ctfAddress: CTF_ADDRESS,
-    walletAddress: _walletAddress ?? "not initialized",
+    walletAddress: walletAddress ?? "not initialized",
   };
 }

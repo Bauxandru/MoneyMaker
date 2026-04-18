@@ -190,17 +190,25 @@ function validateTrade(t: ArbTrade): string[] {
   //    Only add hedgeCost when it's NOT already baked into the primary cost field.
   const isPmHedged = t.kalCost === 0 && t.initialExchange === "pm" && (t.hedgeCost ?? 0) > 0;
   const isKalHedged = t.pmCost === 0 && t.initialExchange === "kal" && (t.hedgeCost ?? 0) > 0;
-  // Historical inconsistency: some trades have kalFees baked into kalCost,
-  // others track kalFees separately. Accept both patterns.
-  const sumWithFees = t.kalCost + (t.kalFees ?? 0) + t.pmCost;
-  const sumWithoutFees = t.kalCost + t.pmCost;
+  // Historical inconsistency: totalCost has been computed with 4 different
+  // fee-inclusion patterns across the codebase's evolution:
+  //   1. no fees                           (older trades)
+  //   2. + kalFees only                    (mid-era)
+  //   3. + pmFees only                     (brief phase)
+  //   4. + kalFees + pmFees                (current, post-2026-04-17 fix)
+  // Accept any of the 4 patterns within tolerance. Only warn if totalCost
+  // doesn't match ANY plausible formula — then it's a real bug.
+  const k = t.kalCost ?? 0;
+  const kf = t.kalFees ?? 0;
+  const p = t.pmCost ?? 0;
+  const pf = t.pmFees ?? 0;
+  const tc = t.totalCost ?? 0;
   const feeTolerance = 0.05;
-  const matchesWithFees = Math.abs(sumWithFees - t.totalCost) <= feeTolerance;
-  const matchesWithout = Math.abs(sumWithoutFees - t.totalCost) <= feeTolerance;
-  // For pm/kal-hedged: hedgeCost is already in pmCost/kalCost — don't add it
-  if (!isPmHedged && !isKalHedged && !matchesWithFees && !matchesWithout) {
-    w.push("cost-sum-mismatch: kalCost+pmCost != totalCost (off by $" +
-      Math.min(Math.abs(sumWithFees - t.totalCost), Math.abs(sumWithoutFees - t.totalCost)).toFixed(2) + ")");
+  const candidateSums = [k + p, k + kf + p, k + p + pf, k + kf + p + pf];
+  const bestDelta = Math.min(...candidateSums.map(c => Math.abs(c - tc)));
+  if (!isPmHedged && !isKalHedged && bestDelta > feeTolerance) {
+    w.push("cost-sum-mismatch: kalCost+pmCost+fees != totalCost (off by $" +
+      bestDelta.toFixed(2) + ")");
   }
   // 2. Hedge-complete P&L check
   if (t.resolutionMethod === "hedge-complete" && t.realizedPnl != null) {
@@ -2509,6 +2517,7 @@ function fmtDate(iso) {
          d.toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit", hour12: false });
 }
 function shortTicker(ticker) {
+  if (!ticker || typeof ticker !== "string") return "--";
   const parts = ticker.split("-");
   return parts.length >= 3 ? parts[parts.length - 1] : ticker.slice(-10);
 }
@@ -2598,8 +2607,12 @@ function renderPositions(positions) {
       ? h.activeOrders.map(function(o) { return o[1].exchange.toUpperCase() + " " + o[1].role; }).join(", ")
       : "none";
 
+    // Label fallback: kalLeg.surname → pmLeg.outcome → kalTicker → pmTokenId prefix
+    const label = (p.kalLeg && p.kalLeg.surname) || (p.pmLeg && p.pmLeg.outcome) ||
+      (p.kalLeg && p.kalLeg.ticker) ||
+      (p.pmLeg && p.pmLeg.tokenId ? '(pm:' + String(p.pmLeg.tokenId).slice(0, 8) + '...)' : '?');
     return '<tr>' +
-      '<td>' + esc(p.kalLeg ? p.kalLeg.surname : "?") + '</td>' +
+      '<td>' + esc(label) + '</td>' +
       '<td><span class="dir dir-' + (p.kalSide === "no" ? "C" : "A") + '">' + (p.kalSide === "no" ? "NO" : "YES") + '</span></td>' +
       '<td>' + esc(p.heldExchange).toUpperCase() + '</td>' +
       '<td>' + esc(p.kalSide) + '</td>' +

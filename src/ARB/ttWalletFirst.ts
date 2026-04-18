@@ -340,7 +340,7 @@ export async function pairWithLiveKalPositions(): Promise<{ linked: number; skip
 
   if (statesChanged) saveHedgeStates(states);
   if (tradesChanged) saveArbTrades(trades);
-  return { linked, skipped };
+  return { linked, skipped, duplicateClaims };
 }
 
 // ── Phase 4: Purge stale hedge_state entries ────────────────────────────────
