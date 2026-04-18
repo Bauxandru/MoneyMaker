@@ -709,7 +709,6 @@ export async function fetchKalshiCandidates(kalBase: string): Promise<KalCandida
 
 /** Phase 2a: Pre-fetch all active PM sports events by tag (bulk fetch, scan locally). */
 export async function prefetchPmSportsMarkets(gammaBase: string): Promise<GammaMarket[]> {
-  const markets: GammaMarket[] = [];
   // Fetch multiple sport tags -- Gamma API tag_slug works on /events endpoint
   // Soccer is excluded -- handled by separate soccer scanner command.
   const sportTags = [
@@ -723,10 +722,15 @@ export async function prefetchPmSportsMarkets(gammaBase: string): Promise<GammaM
     "soccer",                                      // Soccer spreads & totals (EPL, MLS, La Liga, etc.)
     "euroleague",                                  // EuroLeague basketball
   ];
-  const seenTokenIds = new Set<string>();
-  for (const tag of sportTags) {
+
+  // Fetch each tag in PARALLEL — rate limiter inside polyFetch serializes the
+  // actual HTTP calls at 30/s, but without parallel dispatch there were idle
+  // gaps between tags while we waited sequentially. 2026-04-18 measurement:
+  // sequential prefetch took ~10.5s; parallel reduces to ~2-3s.
+  async function fetchTagPages(tag: string): Promise<GammaMarket[]> {
+    const out: GammaMarket[] = [];
+    let offset = 0;
     try {
-      let offset = 0;
       while (true) {
         const raw = await polyFetch<unknown>(
           `${gammaBase}/events?tag_slug=${tag}&active=true&closed=false&limit=200&offset=${offset}`
@@ -739,12 +743,8 @@ export async function prefetchPmSportsMarkets(gammaBase: string): Promise<GammaM
             const outcomes = parseJsonArray(m.outcomes ?? "");
             const tokenIds = parseJsonArray(m.clobTokenIds ?? "");
             if (outcomes.length !== 2 || tokenIds.length < 2) continue;
-            // Deduplicate across tags (soccer may overlap with specific league tags)
-            const tid = tokenIds[0];
-            if (seenTokenIds.has(tid)) continue;
-            seenTokenIds.add(tid);
             m._eventSlug = pickString(ev.slug ?? "");
-            markets.push(m);
+            out.push(m);
           }
         }
         if (events.length < 200) break;
@@ -752,6 +752,21 @@ export async function prefetchPmSportsMarkets(gammaBase: string): Promise<GammaM
       }
     } catch (err) {
       console.error(`[DISCOVER] PM ${tag} prefetch failed: ${(err as Error).message}`);
+    }
+    return out;
+  }
+
+  const results = await Promise.all(sportTags.map(fetchTagPages));
+  // Deduplicate across tags (soccer may overlap with specific league tags)
+  const seenTokenIds = new Set<string>();
+  const markets: GammaMarket[] = [];
+  for (const batch of results) {
+    for (const m of batch) {
+      const tokenIds = parseJsonArray(m.clobTokenIds ?? "");
+      const tid = tokenIds[0];
+      if (seenTokenIds.has(tid)) continue;
+      seenTokenIds.add(tid);
+      markets.push(m);
     }
   }
   console.log(`[DISCOVER] PM sports prefetch: ${markets.length} 2-outcome markets (tags: ${sportTags.join(", ")})`);
@@ -772,6 +787,11 @@ export async function discoverWatchlist(): Promise<{ watchlist: WatchEntry[]; no
 
   // Build event slug index for fast soccer 3-way lookups (Step E) -- avoids re-fetching events from API
   const pmEventIndex = new Map<string, GammaMarket[]>();
+  // Build market slug index so Phase 2 can resolve slugs from the in-memory
+  // prefetch instead of hitting gamma API. Every hit = saved API call + rate
+  // limit delay. 2026-04-18 measurement: Phase 2 made thousands of gamma
+  // lookups one-at-a-time; using this map eliminates most of them.
+  const pmMarketBySlug = new Map<string, GammaMarket>();
   for (const m of pmEsportsMarkets) {
     const evSlug = pickString(m._eventSlug ?? "");
     if (evSlug) {
@@ -779,8 +799,10 @@ export async function discoverWatchlist(): Promise<{ watchlist: WatchEntry[]; no
       if (!arr) { arr = []; pmEventIndex.set(evSlug, arr); }
       arr.push(m);
     }
+    const mktSlug = pickString(m.slug ?? "");
+    if (mktSlug) pmMarketBySlug.set(mktSlug, m);
   }
-  console.log(`[DISCOVER] PM event index: ${pmEventIndex.size} events cached`);
+  console.log(`[DISCOVER] PM event index: ${pmEventIndex.size} events, ${pmMarketBySlug.size} markets cached`);
 
   // -- Load slug cache from previous discovery (speeds up re-discovery) -------
   // Even with FORCE_DISCOVER, we can reuse known PM slug mappings from last run
@@ -1210,6 +1232,13 @@ export async function discoverWatchlist(): Promise<{ watchlist: WatchEntry[]; no
       let found = false;
       for (const sfx of suffixes) {
         const slug = `${baseSlug}-${sfx}`;
+        // Fast path: check the in-memory pmMarketBySlug index first. Every hit
+        // saves one gamma API call + rate-limit delay (~235ms each).
+        const cached = pmMarketBySlug.get(slug);
+        if (cached && !cached.closed && cached.clobTokenIds) {
+          pmMarket = cached; pmSlug = slug; found = true;
+          break;
+        }
         try {
           const raw = await polyFetch<unknown>(`${gammaBase}/markets?slug=${encodeURIComponent(slug)}`);
           const ml = parseGammaMarkets(raw);
@@ -1251,6 +1280,12 @@ export async function discoverWatchlist(): Promise<{ watchlist: WatchEntry[]; no
       ];
       let found = false;
       for (const slug of [...new Set(slugVariants)]) {
+        // Fast path: in-memory pmMarketBySlug hit bypasses gamma API.
+        const cached = pmMarketBySlug.get(slug);
+        if (cached && !cached.closed && cached.clobTokenIds) {
+          pmMarket = cached; pmSlug = slug; found = true;
+          break;
+        }
         try {
           const raw = await polyFetch<unknown>(`${gammaBase}/markets?slug=${encodeURIComponent(slug)}`);
           const ml = parseGammaMarkets(raw);
