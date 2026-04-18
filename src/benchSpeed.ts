@@ -155,11 +155,102 @@ async function benchWs(url: string, label: string, samples: number = 5): Promise
   return s;
 }
 
+// --- Auto-pick active markets for live order tests -------------------------
+// Queries Kalshi and Polymarket at runtime to pick liquid markets to place
+// 1¢ orders against. Prefers high-volume, tight-spread books so the 1¢ order
+// is guaranteed not to fill (book lowest ask >> 1¢).
+async function pickKalTicker(): Promise<string | null> {
+  if (process.env.BENCH_KAL_TICKER) return process.env.BENCH_KAL_TICKER;
+  try {
+    // Fetch a page of active markets and rank by open_interest (proxy for volume).
+    const res = await new Promise<any>((resolve) => {
+      const url = new URL(KAL_BASE + "/markets?status=open&limit=200");
+      const req = https.request({ method: "GET", hostname: url.hostname, port: 443, path: url.pathname + url.search, headers: { Accept: "application/json" }, timeout: 10000 }, (r) => {
+        let d = ""; r.on("data", c => d += c); r.on("end", () => { try { resolve(JSON.parse(d)); } catch { resolve(null); } });
+      });
+      req.on("error", () => resolve(null)); req.on("timeout", () => { req.destroy(); resolve(null); });
+      req.end();
+    });
+    const markets = res?.markets ?? [];
+    // Pick a market with:
+    //  - yes_ask_dollars > 0.10 (so our 1¢ bid can't fill)
+    //  - highest volume_24h_fp (proxy for liquidity)
+    //  - status "open" or "active"
+    const candidates = markets
+      .filter((m: any) => {
+        const ask = Number(m.yes_ask_dollars ?? 0);
+        const status = String(m.status ?? "").toLowerCase();
+        return (status === "active" || status === "open") && ask > 0.10 && ask < 0.99;
+      })
+      .sort((a: any, b: any) => Number(b.volume_24h_fp ?? 0) - Number(a.volume_24h_fp ?? 0));
+    if (!candidates.length) return null;
+    const picked = candidates[0];
+    console.log(`  [AUTO-PICK-KAL] ${picked.ticker} — yes_ask=$${picked.yes_ask_dollars} volume_24h=${picked.volume_24h_fp ?? "?"} open_interest=${picked.open_interest_fp ?? "?"}`);
+    return picked.ticker;
+  } catch (e: any) {
+    console.warn(`  [AUTO-PICK-KAL] failed: ${e.message}`);
+    return null;
+  }
+}
+
+async function pickPmTokenId(): Promise<string | null> {
+  if (process.env.BENCH_PM_TOKEN_ID) return process.env.BENCH_PM_TOKEN_ID;
+  try {
+    const res = await new Promise<any>((resolve) => {
+      // Query high-volume sports events; pick a liquid 2-outcome market
+      const url = new URL(PM_GAMMA + "/events?tag_slug=nba&active=true&closed=false&limit=50&order=volume24hr&ascending=false");
+      const req = https.request({ method: "GET", hostname: url.hostname, port: 443, path: url.pathname + url.search, headers: { Accept: "application/json" }, timeout: 10000 }, (r) => {
+        let d = ""; r.on("data", c => d += c); r.on("end", () => { try { resolve(JSON.parse(d)); } catch { resolve(null); } });
+      });
+      req.on("error", () => resolve(null)); req.on("timeout", () => { req.destroy(); resolve(null); });
+      req.end();
+    });
+    const events = Array.isArray(res) ? res : (res?.events ?? []);
+    for (const ev of events) {
+      for (const m of (ev.markets ?? [])) {
+        if (m.closed) continue;
+        const tokenIds = JSON.parse(m.clobTokenIds ?? "[]");
+        if (tokenIds.length < 2) continue;
+        // Check bestAsk to verify 1¢ bid won't fill
+        const bestAsk = Number(m.bestAsk ?? m.outcomePrices ? JSON.parse(m.outcomePrices || "[]")[0] : 0);
+        if (bestAsk > 0.10 && bestAsk < 0.99) {
+          console.log(`  [AUTO-PICK-PM] ${ev.slug} — bestAsk=${bestAsk} volume24hr=${ev.volume24hr ?? "?"}`);
+          return tokenIds[0];
+        }
+      }
+    }
+    // Fallback: try esports if NBA returned nothing
+    const res2 = await new Promise<any>((resolve) => {
+      const url = new URL(PM_GAMMA + "/events?tag_slug=esports&active=true&closed=false&limit=50");
+      const req = https.request({ method: "GET", hostname: url.hostname, port: 443, path: url.pathname + url.search, headers: { Accept: "application/json" }, timeout: 10000 }, (r) => {
+        let d = ""; r.on("data", c => d += c); r.on("end", () => { try { resolve(JSON.parse(d)); } catch { resolve(null); } });
+      });
+      req.on("error", () => resolve(null)); req.on("timeout", () => { req.destroy(); resolve(null); });
+      req.end();
+    });
+    const events2 = Array.isArray(res2) ? res2 : (res2?.events ?? []);
+    for (const ev of events2) {
+      for (const m of (ev.markets ?? [])) {
+        if (m.closed) continue;
+        const tokenIds = JSON.parse(m.clobTokenIds ?? "[]");
+        if (tokenIds.length >= 2) {
+          console.log(`  [AUTO-PICK-PM] fallback esports ${ev.slug}`);
+          return tokenIds[0];
+        }
+      }
+    }
+    return null;
+  } catch (e: any) {
+    console.warn(`  [AUTO-PICK-PM] failed: ${e.message}`);
+    return null;
+  }
+}
+
 // --- Kalshi live order test ------------------------------------------------
 async function benchKalOrders(): Promise<Record<string, Record<string, number>>> {
-  const kalTickerForTest = process.env.BENCH_KAL_TICKER;
+  const kalTickerForTest = await pickKalTicker();
   if (!kalTickerForTest) {
-    console.log("  (BENCH_KAL_TICKER not set — skipping KAL live order test)");
+    console.log("  (could not pick an active Kalshi ticker — skipping KAL live order test)");
     return { place: {} as any, cancel: {} as any };
   }
   const apiKeyId = process.env.KALSHI_API_KEY_ID;
@@ -214,16 +305,24 @@ async function benchKalOrders(): Promise<Record<string, Record<string, number>>>
     const placeBody = {
       ticker: kalTickerForTest,
       action: "buy", side: "yes",
-      type: "limit", time_in_force: "gtc",
-      count: 1, yes_price: 1, // 1¢ = won't match
+      type: "limit",
+      // No time_in_force → Kalshi treats as GTC (resting limit). Adding
+      // "gtc" explicitly is rejected — enum only accepts fill_or_kill /
+      // immediate_or_cancel (taker types). Resting is the default.
+      count: 1, yes_price: 1, // 1¢ = won't match any realistic ask
       client_order_id: "bench-" + Date.now() + "-" + i,
     };
     const place = await kalReq("POST", "/portfolio/orders", placeBody);
     places.push(place.ms);
-    const orderId = place.body?.order?.order_id;
-    if (orderId && place.status === 200 || place.status === 201) {
+    const orderId = place.body?.order?.order_id ?? place.body?.order_id ?? place.body?.id;
+    if (!orderId) {
+      if (i === 0) console.warn("  [KAL place] status=" + place.status + " body=" + JSON.stringify(place.body).slice(0, 200));
+      continue;
+    }
+    if (place.status === 200 || place.status === 201) {
       const cancel = await kalReq("DELETE", "/portfolio/orders/" + orderId);
-      cancels.push(cancel.ms);
+      if (cancel.status === 200 || cancel.status === 204) cancels.push(cancel.ms);
+      else if (i === 0) console.warn("  [KAL cancel] status=" + cancel.status + " body=" + JSON.stringify(cancel.body).slice(0, 200));
     }
     await new Promise(r => setTimeout(r, 500));
   }
@@ -236,9 +335,9 @@ async function benchKalOrders(): Promise<Record<string, Record<string, number>>>
 
 // --- Polymarket live order test --------------------------------------------
 async function benchPmOrders(): Promise<Record<string, Record<string, number>>> {
-  const tokenId = process.env.BENCH_PM_TOKEN_ID;
+  const tokenId = await pickPmTokenId();
   if (!tokenId) {
-    console.log("  (BENCH_PM_TOKEN_ID not set — skipping PM live order test)");
+    console.log("  (could not pick an active PM token — skipping PM live order test)");
     return { place: {} as any, cancel: {} as any };
   }
   const pk = process.env.POLY_WALLET_PRIVATE_KEY;
@@ -256,21 +355,29 @@ async function benchPmOrders(): Promise<Record<string, Record<string, number>>> 
   for (let i = 0; i < SAMPLES; i++) {
     try {
       const t0 = performance.now();
+      // Size=110 × 0.01 = $1.10 clears PM's $1 marketable minimum.
+      // Price 0.01 = 1¢ = far below any realistic ask — order rests, cannot fill.
       const order = await (client as any).createOrder(
-        { tokenID: tokenId, price: 0.01, side: Side.BUY, size: 5 },
+        { tokenID: tokenId, price: 0.01, side: Side.BUY, size: 110 },
         { tickSize: "0.01", negRisk: false }
       );
       const r = await (client as any).postOrder(order, OrderType.GTC);
       const placeMs = Math.round(performance.now() - t0);
       places.push(placeMs);
-      const orderId = r?.orderID ?? r?.orderId ?? "";
-      if (orderId) {
+      const orderId = r?.orderID ?? r?.orderId ?? r?.id ?? "";
+      if (!orderId) {
+        if (i === 0) console.warn("  [PM] no orderID in response: " + JSON.stringify(r).slice(0, 200));
+        continue;
+      }
+      try {
         const t1 = performance.now();
         await (client as any).cancelOrder({ orderID: orderId });
         cancels.push(Math.round(performance.now() - t1));
+      } catch (cancelErr: any) {
+        if (i === 0) console.warn("  [PM cancel] " + String(cancelErr.message ?? cancelErr).slice(0, 120));
       }
     } catch (e: any) {
-      console.warn("  [PM] iter " + i + " error: " + e.message?.slice(0, 80));
+      if (i === 0) console.warn("  [PM place] " + String(e.message ?? e).slice(0, 120));
     }
     await new Promise(r => setTimeout(r, 500));
   }
