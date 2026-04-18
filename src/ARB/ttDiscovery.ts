@@ -28,6 +28,7 @@ import {
   SOCCER_SERIES, CBB_SERIES, NON_MONEYLINE_BINARY_SERIES, SET_WINNER_SERIES,
 } from "./ttNameMatch.js";
 import { fetchPmAsk } from "./ttPmOrders.js";
+import { updatePairHistoryFromWatchlist } from "./ttPairHistory.js";
 
 /**
  * Extract the per-market PM taker fee rate from a gamma market response.
@@ -131,6 +132,14 @@ export function saveDiscoveryCache(watchlist: WatchEntry[], noMatchPairs: string
     console.log(`[DISCOVER] Saved cache: ${watchlist.length} pairs, ${noMatchPairs.length} no-match pairs`);
   } catch (err) {
     console.error(`[DISCOVER] Failed to save cache: ${(err as Error).message}`);
+  }
+  // Mirror current pairings into the long-lived pair history (7-day retention).
+  // Dashboard-only read path — the bot's hot loop still uses discovery_cache.json
+  // exclusively, so expired tickers can't accidentally be traded.
+  try {
+    updatePairHistoryFromWatchlist(watchlist);
+  } catch (err) {
+    console.warn(`[DISCOVER] pair history update failed (non-fatal): ${(err as Error).message}`);
   }
 }
 

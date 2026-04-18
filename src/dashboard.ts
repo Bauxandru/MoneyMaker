@@ -1450,7 +1450,7 @@ app.get("/api/wallet-arbs", async (_req, res) => {
       catch { watchlist = []; }
     }
     // kalTicker → both PM legs (we accept whichever side is actually held in the wallet).
-    const pairByKalTicker = new Map<string, { pmLeg: any; pmOppLeg: any; pmSlug: string; matchName: string }>();
+    const pairByKalTicker = new Map<string, { pmLeg: any; pmOppLeg: any; pmSlug: string; matchName: string; historical?: boolean }>();
     // pmTokenId → the paired KAL ticker/match, used to annotate unpaired PM rows when the
     // KAL leg is flat (so we can still show "this PM position belongs to Alcaraz vs Sinner").
     const pairByPmTokenId = new Map<string, { kalTicker: string; matchName: string; pmSlug: string }>();
@@ -1462,6 +1462,26 @@ app.get("/api/wallet-arbs", async (_req, res) => {
       pairByPmTokenId.set(w.pm1.tokenId, { kalTicker: w.kal1.ticker, matchName, pmSlug: w.pmSlug });
       pairByPmTokenId.set(w.pm2.tokenId, { kalTicker: w.kal2.ticker, matchName, pmSlug: w.pmSlug });
     }
+    // Fallback: merge 7-day pair-history for markets that have since rolled off
+    // the live watchlist (but where we still hold shares waiting to settle).
+    try {
+      const { loadPairHistory } = await import("./ARB/ttPairHistory.js");
+      const hist = loadPairHistory();
+      for (const [kalTicker, h] of hist) {
+        if (!pairByKalTicker.has(kalTicker)) {
+          pairByKalTicker.set(kalTicker, {
+            pmLeg: { tokenId: h.pmTokenId, outcome: h.pmOutcome },
+            pmOppLeg: { tokenId: h.pairedPmTokenId || "", outcome: "" },
+            pmSlug: h.pmSlug,
+            matchName: h.matchName,
+            historical: true,
+          });
+        }
+        if (h.pmTokenId && !pairByPmTokenId.has(h.pmTokenId)) {
+          pairByPmTokenId.set(h.pmTokenId, { kalTicker: h.kalTicker, matchName: h.matchName, pmSlug: h.pmSlug });
+        }
+      }
+    } catch { /* best-effort — history is display-only */ }
 
     // 2. Fetch live KAL + PM positions in parallel
     const [kalMap, pmPositionsRaw] = await Promise.all([
@@ -1514,6 +1534,7 @@ app.get("/api/wallet-arbs", async (_req, res) => {
 
       paired.push({
         match: pair.matchName || pmHeld.title || "?",
+        historicalPair: Boolean((pair as any).historical),
         kalTicker,
         kalSide,
         kalShares: kalHeldShares,
