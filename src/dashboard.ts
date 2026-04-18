@@ -2477,8 +2477,8 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
 <div id="chainStatus" style="margin:0 20px 10px;padding:8px 14px;background:#1a1a2e;border-radius:8px;font-size:12px;color:#888;display:none"></div>
 
 <div class="tab-bar">
-  <button class="tab-btn active" data-tab="trades">Trades</button>
-  <button class="tab-btn" data-tab="walletarbs">Wallet Arbs</button>
+  <button class="tab-btn" data-tab="trades">Trades</button>
+  <button class="tab-btn active" data-tab="walletarbs">Wallet Arbs</button>
   <button class="tab-btn" data-tab="execution">Execution</button>
   <button class="tab-btn" data-tab="missed">Missed Opps <span class="tab-badge" id="missedBadge" style="display:none">0</span></button>
   <button class="tab-btn" data-tab="orderbook">Orderbooks</button>
@@ -2487,7 +2487,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
 </div>
 
 <!-- TAB: Trades -->
-<div class="tab-panel active" id="panel-trades">
+<div class="tab-panel" id="panel-trades">
   <div class="section-title">Active Positions</div>
   <table id="positionsTable">
     <thead>
@@ -2533,7 +2533,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
 </div>
 
 <!-- TAB: Wallet Arbs -->
-<div class="tab-panel" id="panel-walletarbs">
+<div class="tab-panel active" id="panel-walletarbs">
   <div class="section-title">
     Wallet Arbs
     <span style="font-size:11px;color:#8b949e;font-weight:normal;margin-left:8px">
@@ -2889,7 +2889,15 @@ function actualPnlCell(t) {
   return '<span class="' + r.cls + '" title="' + esc(title) + '">' + pnlStr(r.actualNet) + '</span>' + r.badge;
 }
 
-// Tab switching
+// Tab switching. On click, lazily fire the loader for tabs whose data isn't
+// included in the auto-refresh loop (wallet-arbs is a heavy endpoint — only
+// fetched on demand + on first view since it's now the default tab).
+var _walletArbsLoaded = false;
+function ensureWalletArbsLoaded() {
+  if (_walletArbsLoaded) return;
+  _walletArbsLoaded = true;
+  try { loadWalletArbs(); } catch (e) { /* swallow — user can click Refresh */ }
+}
 document.querySelectorAll(".tab-btn").forEach(function(btn) {
   btn.addEventListener("click", function() {
     document.querySelectorAll(".tab-btn").forEach(function(b) { b.classList.remove("active"); });
@@ -2897,8 +2905,13 @@ document.querySelectorAll(".tab-btn").forEach(function(btn) {
     btn.classList.add("active");
     var panel = document.getElementById("panel-" + btn.dataset.tab);
     if (panel) panel.classList.add("active");
+    if (btn.dataset.tab === "walletarbs") ensureWalletArbsLoaded();
   });
 });
+// Wallet Arbs is the default tab — kick its loader as soon as the script runs.
+// Deferred slightly so the initial /api/stats call fires first (it populates the
+// header cards, which are visible regardless of active tab).
+setTimeout(ensureWalletArbsLoaded, 300);
 
 function $(id) { return document.getElementById(id); }
 
