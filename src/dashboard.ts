@@ -2965,11 +2965,10 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
         <th>PM Avg</th>
         <th>PM Cost</th>
         <th>Total Cost</th>
-        <th title="PM-side mark-to-market: current PM market value − PM cost. KAL side held at cost basis (no live KAL lookup per row).">Current P&amp;L</th>
         <th title="Worst-case locked P&amp;L at settlement. Parens show both outcomes: (KAL-side wins / OPPOSITE wins).">Net P&amp;L (K/O)</th>
       </tr>
     </thead>
-    <tbody id="walletArbsPairedBody"><tr><td colspan="15" class="empty">Click Refresh to load</td></tr></tbody>
+    <tbody id="walletArbsPairedBody"><tr><td colspan="14" class="empty">Click Refresh to load</td></tr></tbody>
   </table>
   <div class="section-title" style="font-size:13px;margin-top:24px">Unpaired Kalshi positions</div>
   <table id="walletArbsKalTable">
@@ -3355,10 +3354,13 @@ function pnlClass(val) { return val > 0.001 ? "green" : val < -0.001 ? "red" : "
 // target page from reaching back into this window.
 function kalLink(ticker, text) {
   if (!ticker) return esc(text || "—");
-  // Kalshi market URL: /markets/{SERIES_LOWER}/#{full-ticker-lower}. The series
-  // prefix is the first dash-delimited segment of the ticker (e.g. KXMLBGAME).
-  var series = String(ticker).split("-")[0].toLowerCase();
-  var href = "https://kalshi.com/markets/" + series + "/#" + String(ticker).toLowerCase();
+  // Kalshi market URL: /markets/{EVENT_TICKER}. The event ticker is the market
+  // ticker minus the trailing dash-segment (e.g. for KXMLBGAME-26APR181610DETBOS-BOS,
+  // event = KXMLBGAME-26APR181610DETBOS). Previous attempt used /markets/{SERIES}/#{ticker}
+  // but Kalshi's SPA ignores the hash on direct landing → wrong market opens.
+  var parts = String(ticker).split("-");
+  var eventTicker = parts.length > 1 ? parts.slice(0, -1).join("-") : ticker;
+  var href = "https://kalshi.com/markets/" + encodeURI(eventTicker);
   return '<a href="' + esc(href) + '" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;border-bottom:1px dotted #58a6ff" title="Open on Kalshi">' + esc(text || ticker) + '</a>';
 }
 function pmLink(slug, text) {
@@ -4145,12 +4147,9 @@ async function loadWalletArbs() {
     // Paired table
     var tb = $("walletArbsPairedBody");
     if (!d.paired || d.paired.length === 0) {
-      tb.innerHTML = '<tr><td colspan="16" class="empty">No paired arbs found</td></tr>';
+      tb.innerHTML = '<tr><td colspan="14" class="empty">No paired arbs found</td></tr>';
     } else {
       tb.innerHTML = d.paired.map(function(r) {
-        var netKalC = r.netIfKalWins >= 0 ? '#3fb950' : '#f85149';
-        var netPmC = r.netIfPmWins >= 0 ? '#3fb950' : '#f85149';
-        var curC = r.currentPnl >= 0 ? '#3fb950' : '#f85149';
         var typeBadge;
         if (r.pairingType === 'same-direction') {
           typeBadge = '<span style="color:#d29922;font-size:10px;padding:1px 4px;border:1px solid #d29922;border-radius:3px" title="Both legs on the SAME outcome — directional bet, never was an arb">SAME-SIDE</span>';
@@ -4176,7 +4175,6 @@ async function loadWalletArbs() {
           '<td>' + r.pmAvgPrice + '</td>' +
           '<td>$' + r.pmCost.toFixed(2) + '</td>' +
           '<td>$' + r.totalCost.toFixed(2) + '</td>' +
-          '<td style="color:' + curC + '" title="PM-side mark-to-market: current PM value − PM cost. KAL held at cost basis (no live KAL lookup per row).">$' + (r.currentPnl || 0).toFixed(2) + '</td>' +
           '<td>' + netCell + '</td>' +
           '</tr>';
       }).join("");
