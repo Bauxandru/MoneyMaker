@@ -3576,10 +3576,10 @@ async function loadWalletArbs() {
       return esc((r.title || "").slice(0, 48)) + " / " + esc(r.outcome);
     }
     function sellBtn(r) {
-      return '<button class="audit-btn" style="padding:2px 8px;font-size:11px" onclick="pmSellExit(\'' + r.tokenId + '\', ' + r.shares + ', ' + (r.negRisk ? 'true' : 'false') + ')">Sell at mkt</button>';
+      return '<button class="audit-btn" style="padding:2px 8px;font-size:11px" onclick="pmSellExit(\\'' + r.tokenId + '\\', ' + r.shares + ', ' + (r.negRisk ? 'true' : 'false') + ')">Sell at mkt</button>';
     }
     function redeemBtn(r) {
-      return '<button class="audit-btn" style="padding:2px 8px;font-size:11px;background:#238636" onclick="pmRedeem(\'' + r.conditionId + '\', ' + r.outcomeIndex + ', ' + (r.negRisk ? 'true' : 'false') + ')">Redeem</button>';
+      return '<button class="audit-btn" style="padding:2px 8px;font-size:11px;background:#238636" onclick="pmRedeem(\\'' + r.conditionId + '\\', ' + r.outcomeIndex + ', ' + (r.negRisk ? 'true' : 'false') + ')">Redeem</button>';
     }
 
     // Naked
