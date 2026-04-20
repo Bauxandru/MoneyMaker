@@ -508,15 +508,36 @@ type AutoHedgePlan = {
   pmCostBasis?: number;
 };
 
-function _planAutoHedge(wpm: WalletPositionsByMatch, existingStates: HedgeState[]): AutoHedgePlan {
+function _planAutoHedge(
+  wpm: WalletPositionsByMatch,
+  existingStates: HedgeState[],
+  existingTradesByKalTicker: Map<string, string>,
+  existingTradesByPmTokenId: Map<string, string>,
+): AutoHedgePlan {
   if (!wpm.entry) return { eligible: false, reason: "no-watchlist-entry" };
 
   // trust + add: skip if any existing hedge_state already covers this match's legs
   for (const hs of existingStates) {
     const ht = hs.position.kalLeg?.ticker;
     const pt = hs.position.pmLeg?.tokenId;
-    if (ht && wpm.kalByTicker.has(ht)) return { eligible: false, reason: `already tracked by ${hs.position.tradeId.slice(0, 40)}` };
-    if (pt && wpm.pmByTokenId.has(pt)) return { eligible: false, reason: `already tracked by ${hs.position.tradeId.slice(0, 40)}` };
+    if (ht && wpm.kalByTicker.has(ht)) return { eligible: false, reason: `already tracked by hedge_state ${hs.position.tradeId.slice(0, 40)}` };
+    if (pt && wpm.pmByTokenId.has(pt)) return { eligible: false, reason: `already tracked by hedge_state ${hs.position.tradeId.slice(0, 40)}` };
+  }
+
+  // BUGFIX 2026-04-20: also check arb_trades.json for ANY trade (resolved or
+  // hedging) touching this kalTicker or pmTokenId. Resolved trades are purged
+  // from hedge_state (Phase 4), so the old check alone missed them and created
+  // synthetic duplicates for already-paired positions. If wallet shares exceed
+  // what the trade(s) account for (genuine over-fill), the extra exposure
+  // will land in the manual-flag path downstream — NOT auto-hedged, because
+  // we can't tell over-fill from an intentional stacked bet.
+  for (const kt of wpm.kalByTicker.keys()) {
+    const tradeId = existingTradesByKalTicker.get(kt);
+    if (tradeId) return { eligible: false, reason: `already tracked by arb_trades ${tradeId.slice(0, 40)}` };
+  }
+  for (const pt of wpm.pmByTokenId.keys()) {
+    const tradeId = existingTradesByPmTokenId.get(pt);
+    if (tradeId) return { eligible: false, reason: `already tracked by arb_trades ${tradeId.slice(0, 40)}` };
   }
 
   const kalSize = wpm.kalByTicker.size;
@@ -729,6 +750,17 @@ export async function scanWalletAndFlagHedgeTargets(opts: { dryRun?: boolean } =
   const existingFlags = loadManualHedgeFlags();
   const existingById = new Map(existingFlags.map(f => [f.id, f]));
   const existingStates = loadHedgeStates();
+  // Also index arb_trades.json (resolved + hedging) so _planAutoHedge can
+  // skip positions that are already paired via a journaled trade. Without
+  // this, resolved trades — which get purged from hedge_state by Phase 4 —
+  // produce duplicate synthetic entries in Phase 5 (bug observed 2026-04-20).
+  const existingTrades = loadArbTrades();
+  const existingTradesByKalTicker = new Map<string, string>();
+  const existingTradesByPmTokenId = new Map<string, string>();
+  for (const t of existingTrades) {
+    if (t.kalTicker && !existingTradesByKalTicker.has(t.kalTicker)) existingTradesByKalTicker.set(t.kalTicker, t.id);
+    if (t.pmTokenId && !existingTradesByPmTokenId.has(t.pmTokenId)) existingTradesByPmTokenId.set(t.pmTokenId, t.id);
+  }
   const now = Date.now();
   const nextFlags: ManualHedgeFlag[] = [];
   const newTrades: ArbTradeRecord[] = [];
@@ -786,7 +818,7 @@ export async function scanWalletAndFlagHedgeTargets(opts: { dryRun?: boolean } =
     // the regular hedge cycle picks it up and places GTC bids to close the
     // gap. Skip: over-fills, no-watchlist, both-sides-present, pre-ignored.
     if (classification === "imbalance") {
-      const plan = _planAutoHedge(wpm, [...existingStates, ...newStates]);
+      const plan = _planAutoHedge(wpm, [...existingStates, ...newStates], existingTradesByKalTicker, existingTradesByPmTokenId);
       if (plan.eligible) {
         const created = _createSyntheticHedge(wpm, plan, id);
         if (created) {
