@@ -22,7 +22,7 @@
  * behavior preserved).
  */
 
-import type { WatchEntry, HedgeState, PmLeg, KalshiLeg } from "./ttTypes.js";
+import type { WatchEntry, HedgeState, UnhedgedPosition, ArbTradeRecord, PmLeg, KalshiLeg, HedgeOrder } from "./ttTypes.js";
 import { loadDiscoveryCache, discoverWatchlist } from "./ttDiscovery.js";
 import {
   loadArbTrades, saveArbTrades, loadHedgeStates, saveHedgeStates,
@@ -486,6 +486,172 @@ function _computePayouts(
   ];
 }
 
+// Determine whether a match is eligible for AUTO-HEDGE (synthetic arb trade +
+// hedge_state entry creation) based on the wallet holdings and the watchlist
+// pairing. Per user spec 2026-04-20:
+//   - Only one-sided positions (KAL-only OR PM-only, not both) auto-hedge.
+//   - Both-sides-present = MANUAL review (too many ways for auto-action to
+//     misread an intentional stacked bet as an over-fill).
+//   - `trust + add`: if hedge_state already tracks any of these tickers or
+//     tokens, skip creation (existing hedge cycle handles it).
+type AutoHedgePlan = {
+  eligible: boolean;
+  reason: string;
+  heldExchange?: "kal" | "pm";
+  sharesHeld?: number;
+  initialCost?: number;
+  kalLeg?: KalshiLeg;
+  pmLeg?: PmLeg;
+  pmOppLeg?: PmLeg | null;
+  kalSide?: "yes" | "no";
+  kalCostBasis?: number;
+  pmCostBasis?: number;
+};
+
+function _planAutoHedge(wpm: WalletPositionsByMatch, existingStates: HedgeState[]): AutoHedgePlan {
+  if (!wpm.entry) return { eligible: false, reason: "no-watchlist-entry" };
+
+  // trust + add: skip if any existing hedge_state already covers this match's legs
+  for (const hs of existingStates) {
+    const ht = hs.position.kalLeg?.ticker;
+    const pt = hs.position.pmLeg?.tokenId;
+    if (ht && wpm.kalByTicker.has(ht)) return { eligible: false, reason: `already tracked by ${hs.position.tradeId.slice(0, 40)}` };
+    if (pt && wpm.pmByTokenId.has(pt)) return { eligible: false, reason: `already tracked by ${hs.position.tradeId.slice(0, 40)}` };
+  }
+
+  const kalSize = wpm.kalByTicker.size;
+  const pmSize = wpm.pmByTokenId.size;
+  if (kalSize > 0 && pmSize > 0) return { eligible: false, reason: "both-sides-present (manual review)" };
+  if (kalSize === 0 && pmSize === 0) return { eligible: false, reason: "no-wallet-positions" };
+
+  const entry = wpm.entry;
+
+  if (kalSize > 0) {
+    // KAL-only — one ticker, determine which side (yes/no)
+    for (const [ticker, kp] of wpm.kalByTicker) {
+      const side: "yes" | "no" = kp.yesCount > 0 ? "yes" : "no";
+      const shares = side === "yes" ? kp.yesCount : kp.noCount;
+      if (shares <= 0) continue;
+      const avgPrice = kp.avgPriceCents / 100;
+      let kalLeg: KalshiLeg | null = null;
+      let pmLeg: PmLeg | null = null;
+      let pmOppLeg: PmLeg | null = null;
+      // Arb mapping:
+      //   YES on kalN → opposite PM = pm[other]  (pair wins on either outcome)
+      //   NO  on kalN → same-index PM = pmN      (pair wins on either outcome)
+      if (entry.kal1?.ticker === ticker) {
+        kalLeg = entry.kal1;
+        pmLeg = side === "yes" ? entry.pm2 : entry.pm1;
+        pmOppLeg = side === "yes" ? entry.pm1 : entry.pm2;
+      } else if (entry.kal2?.ticker === ticker) {
+        kalLeg = entry.kal2;
+        pmLeg = side === "yes" ? entry.pm1 : entry.pm2;
+        pmOppLeg = side === "yes" ? entry.pm2 : entry.pm1;
+      } else if (entry.kal3?.ticker === ticker && entry.pm3) {
+        kalLeg = entry.kal3;
+        // 3-way: NO on draw ~ 1st-or-2nd wins (not draw); best PM hedge is pm3 (draw token)
+        // YES on draw = draw wins; hedge with pm1+pm2 (either non-draw). Simplified: use pm1.
+        pmLeg = side === "yes" ? entry.pm1 : entry.pm3;
+        pmOppLeg = side === "yes" ? entry.pm3 : entry.pm1;
+      }
+      if (!kalLeg || !pmLeg) continue;
+      return {
+        eligible: true, reason: `KAL-only ${shares}×${side} on ${ticker} — auto-create PM hedge`,
+        heldExchange: "kal", sharesHeld: shares, initialCost: shares * avgPrice,
+        kalLeg, pmLeg, pmOppLeg, kalSide: side, kalCostBasis: avgPrice,
+      };
+    }
+    return { eligible: false, reason: "kal-only but no usable ticker mapping" };
+  }
+
+  // PM-only
+  for (const [tid, p] of wpm.pmByTokenId) {
+    let pmLeg: PmLeg | null = null;
+    let pmOppLeg: PmLeg | null = null;
+    let kalLeg: KalshiLeg | null = null;
+    const kalSide: "yes" | "no" = "no"; // PM pmN ↔ KAL kalN NO side (opposite outcomes)
+    if (entry.pm1?.tokenId === tid) { pmLeg = entry.pm1; pmOppLeg = entry.pm2; kalLeg = entry.kal1; }
+    else if (entry.pm2?.tokenId === tid) { pmLeg = entry.pm2; pmOppLeg = entry.pm1; kalLeg = entry.kal2; }
+    else if (entry.pm3?.tokenId === tid) { pmLeg = entry.pm3; pmOppLeg = entry.pm1; kalLeg = entry.kal3 ?? entry.kal1; }
+    if (!pmLeg || !kalLeg) continue;
+    return {
+      eligible: true, reason: `PM-only ${p.shares}×${p.outcome} on ${tid.slice(0, 20)}… — auto-create KAL hedge`,
+      heldExchange: "pm", sharesHeld: p.shares, initialCost: p.shares * p.avgPrice,
+      kalLeg, pmLeg, pmOppLeg, kalSide, pmCostBasis: p.avgPrice,
+    };
+  }
+  return { eligible: false, reason: "pm-only but no usable token mapping" };
+}
+
+// Create a synthetic arb_trade + hedge_state entry for an auto-hedge-eligible
+// match. The hedge cycle will then run against this entry normally and place
+// GTC bids to close the gap on the next cycle.
+function _createSyntheticHedge(wpm: WalletPositionsByMatch, plan: AutoHedgePlan, flagId: string):
+  { trade: ArbTradeRecord; state: HedgeState } | null
+{
+  if (!plan.eligible || !plan.kalLeg || !plan.pmLeg || !plan.heldExchange || plan.sharesHeld == null) return null;
+
+  const tradeId = `arb-wallet-scan-${flagId}-${Date.now()}`;
+  const ts = new Date().toISOString();
+  const shares = Math.round(plan.sharesHeld); // integer shares (KAL constraint)
+  const kalCost = plan.heldExchange === "kal" ? (plan.initialCost ?? 0) : 0;
+  const pmCost = plan.heldExchange === "pm" ? (plan.initialCost ?? 0) : 0;
+
+  const trade: ArbTradeRecord = {
+    id: tradeId,
+    ts,
+    match: wpm.matchName,
+    dir: plan.heldExchange === "kal"
+      ? (plan.kalSide === "yes" ? "A" : "C")
+      : (plan.kalSide === "yes" ? "A" : "C"),
+    edge: 0,
+    shares,
+    cost: plan.initialCost ?? 0,
+    fees: 0,
+    kalTicker: plan.kalLeg.ticker,
+    kalFillPrice: plan.kalCostBasis ?? 0,
+    kalCost,
+    kalFees: 0,
+    pmTokenId: plan.pmLeg.tokenId,
+    pmOutcome: plan.pmLeg.outcome,
+    pmSlug: wpm.entry?.pmSlug ?? "",
+    pmFillPrice: plan.pmCostBasis ?? 0,
+    pmCost,
+    pmFees: 0,
+    totalCost: plan.initialCost ?? 0,
+    status: "hedging",
+    initialExchange: plan.heldExchange,
+    projectedEdge: 0,
+    projectedProfit: 0,
+  } as ArbTradeRecord;
+
+  const position: UnhedgedPosition = {
+    tradeId,
+    heldExchange: plan.heldExchange,
+    pmLeg: plan.pmLeg,
+    pmOppLeg: plan.pmOppLeg ?? null,
+    pmCostBasis: plan.pmCostBasis ?? 0,
+    kalLeg: plan.kalLeg,
+    kalCostBasis: plan.kalCostBasis ?? 0,
+    kalSide: plan.kalSide ?? "yes",
+    sharesHeld: shares,
+    initialShares: shares,
+    initialCost: plan.initialCost ?? 0,
+    hedgeFillCost: 0,
+    hedgeFillCostKal: 0,
+    hedgeFillCostPm: 0,
+    kalFees: 0,
+    initialKalFees: 0,
+  };
+  const state: HedgeState = {
+    position,
+    activeOrders: new Map<string, HedgeOrder>(),
+    kalNextRetryAt: 0,
+    pmOnlyCycles: 0,
+  };
+  return { trade, state };
+}
+
 // Total $ cost across all wallet legs in the match.
 function _computeCost(wpm: WalletPositionsByMatch): number {
   let c = 0;
@@ -501,7 +667,8 @@ function _computeCost(wpm: WalletPositionsByMatch): number {
 export async function scanWalletAndFlagHedgeTargets(opts: { dryRun?: boolean } = {}): Promise<{
   scanned: number;                 // matches examined
   balanced: number;                // matches within gap tolerance
-  flagged: number;                 // new or updated flags
+  flagged: number;                 // new or updated flags (manual review needed)
+  autoHedged: number;              // synthetic trades + hedge_state created
   skippedIgnored: number;          // pre-ignored flags
   flags: ManualHedgeFlag[];        // the flag set (full, including ignored)
 }> {
@@ -561,11 +728,15 @@ export async function scanWalletAndFlagHedgeTargets(opts: { dryRun?: boolean } =
   // 4. For each match, compute payouts + classify
   const existingFlags = loadManualHedgeFlags();
   const existingById = new Map(existingFlags.map(f => [f.id, f]));
+  const existingStates = loadHedgeStates();
   const now = Date.now();
   const nextFlags: ManualHedgeFlag[] = [];
+  const newTrades: ArbTradeRecord[] = [];
+  const newStates: HedgeState[] = [];
 
   let balanced = 0;
   let flagged = 0;
+  let autoHedged = 0;
   let skippedIgnored = 0;
 
   for (const wpm of matches.values()) {
@@ -610,6 +781,40 @@ export async function scanWalletAndFlagHedgeTargets(opts: { dryRun?: boolean } =
       }
     }
 
+    // AUTO-HEDGE path: for clean one-sided imbalances (KAL-only or PM-only)
+    // with a watchlist entry, create a synthetic arb_trade + hedge_state so
+    // the regular hedge cycle picks it up and places GTC bids to close the
+    // gap. Skip: over-fills, no-watchlist, both-sides-present, pre-ignored.
+    if (classification === "imbalance") {
+      const plan = _planAutoHedge(wpm, [...existingStates, ...newStates]);
+      if (plan.eligible) {
+        const created = _createSyntheticHedge(wpm, plan, id);
+        if (created) {
+          // Don't auto-hedge positions that are already flagged as ignored by the user.
+          const prior = existingById.get(id);
+          if (prior?.ignored) {
+            skippedIgnored++;
+            nextFlags.push({ ...prior, lastSeenAt: now, gap, costExposure: cost, payouts });
+            continue;
+          }
+          autoHedged++;
+          newTrades.push(created.trade);
+          newStates.push(created.state);
+          console.log(
+            `[WALLET-FIRST] AUTO-HEDGE ${wpm.matchName}: ${plan.reason} → tradeId=${created.trade.id.slice(0, 50)}`,
+          );
+          audit({
+            module: "persist", fn: "scanWalletAndFlagHedgeTargets", action: "auto-hedge-created",
+            tradeId: created.trade.id, kalTicker: created.trade.kalTicker ?? "",
+            shares: created.state.position.sharesHeld,
+            trigger: "wallet-first-startup",
+            context: { matchName: wpm.matchName, heldExchange: plan.heldExchange, gap, cost },
+          });
+          continue; // auto-hedged → don't also emit a manual flag
+        }
+      }
+    }
+
     const prior = existingById.get(id);
     if (prior?.ignored) {
       skippedIgnored++;
@@ -648,17 +853,30 @@ export async function scanWalletAndFlagHedgeTargets(opts: { dryRun?: boolean } =
   }
   nextFlags.sort((a, b) => b.costExposure - a.costExposure);
 
-  if (!dryRun) saveManualHedgeFlags(nextFlags);
+  if (!dryRun) {
+    saveManualHedgeFlags(nextFlags);
+    // Persist auto-hedge synthetics. Merge with existing state — don't clobber.
+    if (newTrades.length > 0) {
+      const allTrades = loadArbTrades();
+      allTrades.push(...newTrades);
+      saveArbTrades(allTrades);
+    }
+    if (newStates.length > 0) {
+      const allStates = loadHedgeStates();
+      allStates.push(...newStates);
+      saveHedgeStates(allStates);
+    }
+  }
 
   console.log(
     `[WALLET-FIRST] Scan complete. matches=${matches.size} balanced=${balanced} ` +
-    `flagged=${flagged} pre-ignored=${skippedIgnored}${dryRun ? " (DRY RUN, not persisted)" : ""}`,
+    `auto-hedged=${autoHedged} flagged=${flagged} pre-ignored=${skippedIgnored}${dryRun ? " (DRY RUN, not persisted)" : ""}`,
   );
   for (const f of nextFlags.filter(ff => !ff.ignored).slice(0, 10)) {
     console.log(`  [FLAG] ${f.matchName} — ${f.classification}: ${f.reason} (cost=$${f.costExposure.toFixed(2)} gap=$${f.gap.toFixed(2)})`);
   }
 
-  return { scanned: matches.size, balanced, flagged, skippedIgnored, flags: nextFlags };
+  return { scanned: matches.size, balanced, flagged, autoHedged, skippedIgnored, flags: nextFlags };
 }
 
 // ── Main entry point ────────────────────────────────────────────────────────
@@ -671,6 +889,7 @@ export async function runWalletFirstStartup(opts: { forceDiscovery?: boolean } =
   stalePurged: number;
   walletScanFlagged: number;
   walletScanBalanced: number;
+  walletScanAutoHedged: number;
 }> {
   console.log(`[WALLET-FIRST] Starting wallet-first hedge state reconstruction...`);
 
@@ -704,13 +923,13 @@ export async function runWalletFirstStartup(opts: { forceDiscovery?: boolean } =
   // Phase 5: Wallet-first hedge scan — surface imbalances and orphan exposures
   // for manual review. Does NOT auto-create hedge orders. Writes to
   // data/hedge_manual_flags.json; dashboard displays with an Ignore action.
-  const { flagged: walletScanFlagged, balanced: walletScanBalanced } = await scanWalletAndFlagHedgeTargets();
+  const { flagged: walletScanFlagged, balanced: walletScanBalanced, autoHedged: walletScanAutoHedged } = await scanWalletAndFlagHedgeTargets();
 
   console.log(
     `[WALLET-FIRST] Complete. paired=${paired} unmatched=${unmatched} ` +
     `recovered=${recovered.length} kalLinked=${kalPositionsLinked} ` +
     `enriched=${positionsEnriched} stalePurged=${purged} ` +
-    `scanFlagged=${walletScanFlagged} scanBalanced=${walletScanBalanced}`
+    `scanAutoHedged=${walletScanAutoHedged} scanFlagged=${walletScanFlagged} scanBalanced=${walletScanBalanced}`
   );
 
   return {
@@ -722,5 +941,6 @@ export async function runWalletFirstStartup(opts: { forceDiscovery?: boolean } =
     stalePurged: purged,
     walletScanFlagged,
     walletScanBalanced,
+    walletScanAutoHedged,
   };
 }

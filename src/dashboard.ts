@@ -2461,7 +2461,7 @@ app.post("/api/manual-hedge-flags/rescan", async (_req, res) => {
   try {
     const { scanWalletAndFlagHedgeTargets } = await import("./ARB/ttWalletFirst.js");
     const out = await scanWalletAndFlagHedgeTargets();
-    res.json({ ok: true, scanned: out.scanned, balanced: out.balanced, flagged: out.flagged });
+    res.json({ ok: true, scanned: out.scanned, balanced: out.balanced, autoHedged: out.autoHedged, flagged: out.flagged });
   } catch (err) {
     res.status(500).json({ error: (err as Error).message });
   }
