@@ -731,11 +731,29 @@ export async function scanWalletAndFlagHedgeTargets(opts: { dryRun?: boolean } =
     m.kalByTicker.set(ticker, { yesCount: kalPos.yesCount, noCount: kalPos.noCount, avgPriceCents: kalPos.avgPriceCents });
   }
 
+  // Skip PM positions that have already settled (awaiting redemption). A PM
+  // winner stays in the wallet until the user redeems it, and a PM loser
+  // stays as a zero-value position. Either way, these shares don't need
+  // hedging — they're post-resolution. Including them caused the scan to
+  // mis-classify "resolved arb with PM winner pending redemption" as
+  // "PM-only needs KAL hedge" and create bogus synthetic trades (the
+  // 2026-04-20 21-duplicate incident). Filtering them here makes the scan
+  // correct WITHOUT requiring arb_trades.json — the bot can operate
+  // journal-free for this decision.
+  const nowMsForSettled = Date.now();
   for (const p of pmPositions) {
     const tid = String(p.asset ?? p.tokenId ?? "");
     if (!tid) continue;
     const shares = Number(p.size ?? 0);
     if (!(shares > 0)) continue;
+    // Settled = market ended OR currentValue/size ratio near 0 or 1.
+    const curVal = Number((p as { currentValue?: number | string }).currentValue ?? 0);
+    const ratio = shares > 0 ? curVal / shares : 0;
+    const endStr = (p as { endDate?: string }).endDate;
+    const endMs = endStr ? new Date(endStr).getTime() : NaN;
+    const endPast = Number.isFinite(endMs) && endMs < nowMsForSettled;
+    const settled = endPast || ratio > 0.95 || ratio < 0.05;
+    if (settled) continue;  // post-resolution; not an unhedged exposure
     const avgPrice = Number(p.avgPrice ?? 0);
     const outcome = String(p.outcome ?? "");
     const title = p.title != null ? String(p.title) : undefined;
