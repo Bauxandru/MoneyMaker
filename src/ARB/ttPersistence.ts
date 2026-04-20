@@ -31,6 +31,50 @@ export const PENDING_FILLS_PATH = path.join("data", "pending_fills.json");
 export const METRICS_PATH = path.join("data", "execution_metrics.json");
 export const DEPTH_OPP_PATH = path.join("data", "depth_opportunities.json");
 export const BOOK_SNAPSHOTS_PATH = path.join("data", "book_snapshots.json");
+export const HEDGE_MANUAL_FLAGS_PATH = path.join("data", "hedge_manual_flags.json");
+
+// --- Manual hedge flags: wallet-first scan output ----------------------------
+// Written by scanWalletAndFlagHedgeTargets() in ttWalletFirst.ts. Surfaces
+// wallet positions the bot cannot auto-hedge safely (over-fills, no watchlist
+// counterpart, unclear side). The dashboard reads these and exposes an
+// "Ignore" action so the user can dismiss flags they've accepted as intended.
+export type ManualHedgeFlag = {
+  id: string;                                              // stable across rescans — hash of identifiers
+  matchKey: string;
+  matchName: string;
+  classification: "imbalance" | "no-watchlist-match" | "over-fill" | "unknown-side";
+  reason: string;
+  kalTickers: string[];
+  pmTokenIds: string[];
+  gap: number;                                             // $ payout-imbalance across outcomes
+  costExposure: number;                                    // total $ at risk
+  payouts: Array<{ outcome: string; payout: number }>;     // payout per scenario
+  firstSeenAt: number;
+  lastSeenAt: number;
+  ignored?: boolean;
+  ignoredAt?: number;
+};
+
+export function loadManualHedgeFlags(): ManualHedgeFlag[] {
+  try {
+    if (!fs.existsSync(HEDGE_MANUAL_FLAGS_PATH)) return [];
+    const raw = JSON.parse(fs.readFileSync(HEDGE_MANUAL_FLAGS_PATH, "utf8"));
+    return Array.isArray(raw) ? raw : [];
+  } catch (err) {
+    console.error(`[PERSIST] Failed to load manual hedge flags: ${(err as Error).message}`);
+    return [];
+  }
+}
+
+export function saveManualHedgeFlags(flags: ManualHedgeFlag[]): void {
+  try {
+    const dir = path.dirname(HEDGE_MANUAL_FLAGS_PATH);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    atomicWriteFileSync(HEDGE_MANUAL_FLAGS_PATH, JSON.stringify(flags, null, 2));
+  } catch (err) {
+    console.error(`[PERSIST] Failed to save manual hedge flags: ${(err as Error).message}`);
+  }
+}
 
 const DEPTH_OPP_MAX = 500;
 const BOOK_TRACK_MAX = 200;

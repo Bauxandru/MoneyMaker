@@ -2423,6 +2423,50 @@ app.get("/api/live-trades", async (req, res) => {
   }
 });
 
+// --- Manual hedge flags (wallet-first scan output) -------------------------
+// Read from data/hedge_manual_flags.json — written by scanWalletAndFlagHedgeTargets()
+// in ttWalletFirst.ts when the bot runs the wallet-first startup phase.
+app.get("/api/manual-hedge-flags", async (_req, res) => {
+  try {
+    const { loadManualHedgeFlags } = await import("./ARB/ttPersistence.js");
+    const flags = loadManualHedgeFlags();
+    res.json({ flags, ts: new Date().toISOString() });
+  } catch (err) {
+    res.status(500).json({ error: (err as Error).message });
+  }
+});
+
+// POST /api/manual-hedge-flags/:id/ignore  { ignored: true | false }
+// User dismisses (or restores) a flag. Ignored flags persist for 30 days
+// (see STALE_IGNORE_TTL_MS in ttWalletFirst.ts scan).
+app.post("/api/manual-hedge-flags/:id/ignore", async (req, res) => {
+  try {
+    const { loadManualHedgeFlags, saveManualHedgeFlags } = await import("./ARB/ttPersistence.js");
+    const id = String(req.params.id);
+    const ignored = req.body?.ignored !== false;
+    const flags = loadManualHedgeFlags();
+    const idx = flags.findIndex(f => f.id === id);
+    if (idx < 0) return res.status(404).json({ error: "flag not found" });
+    flags[idx] = { ...flags[idx], ignored, ignoredAt: ignored ? Date.now() : undefined };
+    saveManualHedgeFlags(flags);
+    res.json({ ok: true, flag: flags[idx] });
+  } catch (err) {
+    res.status(500).json({ error: (err as Error).message });
+  }
+});
+
+// POST /api/manual-hedge-flags/rescan — trigger a fresh wallet scan without
+// restarting the bot. Calls scanWalletAndFlagHedgeTargets() directly.
+app.post("/api/manual-hedge-flags/rescan", async (_req, res) => {
+  try {
+    const { scanWalletAndFlagHedgeTargets } = await import("./ARB/ttWalletFirst.js");
+    const out = await scanWalletAndFlagHedgeTargets();
+    res.json({ ok: true, scanned: out.scanned, balanced: out.balanced, flagged: out.flagged });
+  } catch (err) {
+    res.status(500).json({ error: (err as Error).message });
+  }
+});
+
 app.get("/api/wallet-arbs", async (_req, res) => {
   try {
     // 1. Load discovery cache → build pairing maps
@@ -3916,8 +3960,35 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
     <button class="audit-btn" id="walletArbsRefreshBtn" onclick="loadWalletArbs()" style="margin-left:12px">Refresh</button>
   </div>
   <div id="walletArbsTotals" style="margin:0 20px 10px;font-size:13px;color:#c9d1d9"></div>
+
+  <!-- Manual hedge review — wallet-first scan flags -->
+  <div class="section-title" style="font-size:13px;margin-top:18px">
+    Manual hedge review
+    <span id="manualFlagsCount" style="font-size:11px;color:#8b949e;font-weight:normal"></span>
+    <button class="audit-btn" onclick="rescanManualFlags()" style="margin-left:8px">Rescan wallets</button>
+    <label style="font-size:11px;color:#8b949e;font-weight:normal;margin-left:12px">
+      <input type="checkbox" id="manualFlagsShowIgnored" onchange="loadManualFlags()" style="vertical-align:middle"> show ignored
+    </label>
+  </div>
+  <div id="manualFlagsTotals" style="margin:0 20px 10px;font-size:11px;color:#8b949e"></div>
+  <table id="manualFlagsTable">
+    <thead>
+      <tr>
+        <th>First seen</th>
+        <th>Match</th>
+        <th>Type</th>
+        <th>Reason</th>
+        <th style="text-align:right">Gap $</th>
+        <th style="text-align:right">Cost $</th>
+        <th>Payouts</th>
+        <th>Action</th>
+      </tr>
+    </thead>
+    <tbody id="manualFlagsBody"><tr><td colspan="8" class="empty">Loading…</td></tr></tbody>
+  </table>
+
   <!-- Live open/resting orders from both exchanges — hedge-cycle GTC bids typically appear here -->
-  <div class="section-title" style="font-size:13px">Open orders <span id="walletArbsOpenOrdersCount" style="font-size:11px;color:#8b949e;font-weight:normal"></span></div>
+  <div class="section-title" style="font-size:13px;margin-top:18px">Open orders <span id="walletArbsOpenOrdersCount" style="font-size:11px;color:#8b949e;font-weight:normal"></span></div>
   <table id="walletArbsOpenOrdersTable">
     <thead>
       <tr>
@@ -5151,6 +5222,73 @@ async function pmRedeem(conditionId, outcomeIndex, negRisk) {
   } catch (e) { alert("REDEEM request failed: " + e.message); }
 }
 
+async function loadManualFlags() {
+  var body = $("manualFlagsBody");
+  var countEl = $("manualFlagsCount");
+  var totalsEl = $("manualFlagsTotals");
+  try {
+    var r = await fetch("/api/manual-hedge-flags");
+    var d = await r.json();
+    var flags = d.flags || [];
+    var showIgnored = $("manualFlagsShowIgnored") && $("manualFlagsShowIgnored").checked;
+    var visible = flags.filter(function(f) { return showIgnored ? true : !f.ignored; });
+    var ignoredCount = flags.filter(function(f) { return f.ignored; }).length;
+    countEl.textContent = "(" + visible.length + " flagged" + (ignoredCount ? ", " + ignoredCount + " ignored" : "") + ")";
+    var totalCost = visible.reduce(function(s, f) { return s + (f.costExposure || 0); }, 0);
+    var totalGap = visible.reduce(function(s, f) { return s + (f.gap || 0); }, 0);
+    totalsEl.textContent = visible.length ? ("Total at-risk cost: $" + totalCost.toFixed(2) + "  •  combined payout-gap: $" + totalGap.toFixed(2)) : "";
+    if (visible.length === 0) {
+      body.innerHTML = '<tr><td colspan="8" class="empty">No unhedged positions flagged for review</td></tr>';
+      return;
+    }
+    body.innerHTML = visible.map(function(f) {
+      var since = new Date(f.firstSeenAt || Date.now()).toLocaleString();
+      var typeColor = f.classification === 'over-fill' ? '#f85149' : f.classification === 'imbalance' ? '#d29922' : '#a371f7';
+      var typeBadge = '<span style="color:' + typeColor + ';font-size:10px;padding:1px 4px;border:1px solid ' + typeColor + ';border-radius:3px">' + esc(f.classification) + '</span>';
+      var payStr = (f.payouts || []).map(function(p) { return esc(p.outcome) + '=$' + (p.payout||0).toFixed(1); }).join(" · ");
+      var actionBtn;
+      if (f.ignored) {
+        actionBtn = '<button class="audit-btn" onclick="toggleIgnoreFlag(\'' + esc(f.id) + '\', false)" style="background:#21262d">Restore</button>';
+      } else {
+        actionBtn = '<button class="audit-btn" onclick="toggleIgnoreFlag(\'' + esc(f.id) + '\', true)">Ignore</button>';
+      }
+      return '<tr' + (f.ignored ? ' style="opacity:0.5"' : '') + '>' +
+        '<td style="font-size:11px;color:#8b949e">' + since + '</td>' +
+        '<td>' + esc(f.matchName || "-") + '</td>' +
+        '<td>' + typeBadge + '</td>' +
+        '<td style="font-size:11px;color:#8b949e">' + esc(f.reason || "") + '</td>' +
+        '<td style="text-align:right">$' + (f.gap || 0).toFixed(2) + '</td>' +
+        '<td style="text-align:right">$' + (f.costExposure || 0).toFixed(2) + '</td>' +
+        '<td style="font-size:11px">' + payStr + '</td>' +
+        '<td>' + actionBtn + '</td>' +
+        '</tr>';
+    }).join("");
+  } catch (e) {
+    body.innerHTML = '<tr><td colspan="8" class="empty">Failed: ' + esc(e.message) + '</td></tr>';
+  }
+}
+
+async function toggleIgnoreFlag(id, ignored) {
+  try {
+    var r = await fetch("/api/manual-hedge-flags/" + encodeURIComponent(id) + "/ignore", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ignored: ignored }),
+    });
+    if (!r.ok) { alert("Ignore failed: " + r.status); return; }
+    loadManualFlags();
+  } catch (e) { alert("Ignore failed: " + e.message); }
+}
+
+async function rescanManualFlags() {
+  try {
+    var r = await fetch("/api/manual-hedge-flags/rescan", { method: "POST" });
+    var d = await r.json();
+    if (!r.ok || d.error) { alert("Rescan failed: " + (d.error || r.status)); return; }
+    loadManualFlags();
+  } catch (e) { alert("Rescan failed: " + e.message); }
+}
+
 async function loadOpenOrders() {
   try {
     var r = await fetch("/api/open-orders");
@@ -5196,8 +5334,9 @@ async function loadOpenOrders() {
 async function loadWalletArbs() {
   var btn = $("walletArbsRefreshBtn");
   if (btn) btn.textContent = "Loading...";
-  // Kick the open-orders fetch in parallel — separate endpoint, don't block the main view.
+  // Kick the open-orders + manual-flag fetches in parallel — separate endpoints, don't block the main view.
   loadOpenOrders();
+  loadManualFlags();
   try {
     var res = await fetch("/api/wallet-arbs");
     var d = await res.json();

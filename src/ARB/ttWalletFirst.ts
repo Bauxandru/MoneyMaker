@@ -27,9 +27,12 @@ import { loadDiscoveryCache, discoverWatchlist } from "./ttDiscovery.js";
 import {
   loadArbTrades, saveArbTrades, loadHedgeStates, saveHedgeStates,
   recoverOrphanedHedgeTrades,
+  loadManualHedgeFlags, saveManualHedgeFlags, type ManualHedgeFlag,
 } from "./ttPersistence.js";
+import { fetchPmPositionsCached } from "./ttReconcile.js";
 import { audit } from "./ttAuditLog.js";
 import { getKalshiPositionMap } from "../kalshiTrade.js";
+import crypto from "crypto";
 
 console.log("[WALLET-FIRST] Module loaded");
 
@@ -379,6 +382,285 @@ export function purgeStaleHedgeStates(): { purged: number; purgedIds: string[] }
   return { purged: purgedIds.length, purgedIds };
 }
 
+// ── Phase 5: wallet-first hedge scan ────────────────────────────────────────
+// Walks the live Kalshi + Polymarket wallets, groups holdings by match (via
+// watchlist + pair_history), and computes per-outcome payout exposure.
+// Surfaces positions that are imbalanced (gap in $ payout across outcomes)
+// or lack a watchlist counterpart for manual review via the dashboard.
+//
+// Per user spec (2026-04-20): does NOT auto-create synthetic trades or hedge
+// orders. Detection + flagging only. Every flag is persisted to
+// data/hedge_manual_flags.json with a stable id; rescans preserve `ignored`
+// markers so dismissed flags stay dismissed.
+//
+// Flag is raised when max_payout - min_payout >= GAP_TOLERANCE_USD (default
+// $1 — equivalent to 1 share imbalance). Costs are summed from both sides.
+const GAP_TOLERANCE_USD = 1.0;
+
+type WalletPositionsByMatch = {
+  matchKey: string;                // pmSlug when watchlisted, else orphan-*
+  matchName: string;
+  entry: WatchEntry | null;
+  kalByTicker: Map<string, { yesCount: number; noCount: number; avgPriceCents: number }>;
+  pmByTokenId: Map<string, { shares: number; avgPrice: number; outcome: string; title?: string }>;
+};
+
+function _flagId(kalTickers: string[], pmTokenIds: string[]): string {
+  const key = [...kalTickers].sort().join(",") + "|" + [...pmTokenIds].sort().join(",");
+  return crypto.createHash("sha1").update(key).digest("hex").slice(0, 16);
+}
+
+// Find the WatchEntry object containing a given kalTicker / pmTokenId.
+function _findEntryFor(kalTicker: string | null, pmTokenId: string | null, watchlist: WatchEntry[]): WatchEntry | null {
+  for (const w of watchlist) {
+    if (kalTicker) {
+      if (w.kal1?.ticker === kalTicker || w.kal2?.ticker === kalTicker || w.kal3?.ticker === kalTicker) return w;
+    }
+    if (pmTokenId) {
+      if (w.pm1?.tokenId === pmTokenId || w.pm2?.tokenId === pmTokenId || w.pm3?.tokenId === pmTokenId) return w;
+      if (w.pm1?.noTokenId === pmTokenId || w.pm2?.noTokenId === pmTokenId || w.pm3?.noTokenId === pmTokenId) return w;
+    }
+  }
+  return null;
+}
+
+// Compute $-payout per outcome for a match given wallet positions. Returns one
+// payout entry per outcome (2 for binary, 3 for soccer 3-way). Each entry
+// is the total $ the user would receive (shares × $1) if that outcome wins.
+//
+// Kalshi YES on ticker X = pays $1 if ticker X settles YES.
+// Kalshi NO on ticker X = pays $1 if ticker X settles NO.
+// PM token T = pays $1 if that outcome wins.
+//
+// For 2-way moneyline (kal1=TeamA, kal2=TeamB, pm1=TeamA, pm2=TeamB):
+//   payout(A wins) = kal1.yes + kal2.no + pm1
+//   payout(B wins) = kal1.no + kal2.yes + pm2
+// For 3-way soccer (kal1=Home, kal2=Away, kal3=Draw):
+//   payout(Home) = kal1.yes + kal2.no + kal3.no + pm1
+//   payout(Away) = kal1.no + kal2.yes + kal3.no + pm2
+//   payout(Draw) = kal1.no + kal2.no + kal3.yes + pm3
+// For isBinary (single-ticker totals/spreads): kal1===kal2, 2 outcomes labeled
+// by pm1.outcome / pm2.outcome.
+function _computePayouts(
+  wpm: WalletPositionsByMatch,
+): Array<{ outcome: string; payout: number }> {
+  const entry = wpm.entry;
+  if (!entry) {
+    // No watchlist info — flatten raw positions. Outcome labels from PM position data.
+    const out: Array<{ outcome: string; payout: number }> = [];
+    for (const [ticker, k] of wpm.kalByTicker) {
+      if (k.yesCount > 0) out.push({ outcome: `${ticker}:yes`, payout: k.yesCount });
+      if (k.noCount > 0) out.push({ outcome: `${ticker}:no`, payout: k.noCount });
+    }
+    for (const [tid, p] of wpm.pmByTokenId) {
+      out.push({ outcome: p.outcome || `pm:${tid.slice(0, 8)}`, payout: p.shares });
+    }
+    return out;
+  }
+
+  const kal1 = wpm.kalByTicker.get(entry.kal1?.ticker) ?? { yesCount: 0, noCount: 0, avgPriceCents: 0 };
+  const kal2 = wpm.kalByTicker.get(entry.kal2?.ticker) ?? { yesCount: 0, noCount: 0, avgPriceCents: 0 };
+  const kal3 = entry.kal3 ? (wpm.kalByTicker.get(entry.kal3.ticker) ?? { yesCount: 0, noCount: 0, avgPriceCents: 0 }) : null;
+  const pm1 = (wpm.pmByTokenId.get(entry.pm1?.tokenId)?.shares) ?? 0;
+  const pm2 = (wpm.pmByTokenId.get(entry.pm2?.tokenId)?.shares) ?? 0;
+  const pm3 = entry.pm3 ? ((wpm.pmByTokenId.get(entry.pm3.tokenId)?.shares) ?? 0) : 0;
+
+  if (entry.is3Way && entry.kal3 && entry.pm3) {
+    return [
+      { outcome: entry.pm1?.outcome || "Home", payout: kal1.yesCount + kal2.noCount + (kal3?.noCount ?? 0) + pm1 },
+      { outcome: entry.pm2?.outcome || "Away", payout: kal1.noCount + kal2.yesCount + (kal3?.noCount ?? 0) + pm2 },
+      { outcome: entry.pm3?.outcome || "Draw", payout: kal1.noCount + kal2.noCount + (kal3?.yesCount ?? 0) + pm3 },
+    ];
+  }
+  if (entry.isBinary) {
+    // Single-ticker totals/spreads (kal1 === kal2). YES/NO on kal1 pair with pm1/pm2.
+    return [
+      { outcome: entry.pm1?.outcome || "YES", payout: kal1.yesCount + pm1 },
+      { outcome: entry.pm2?.outcome || "NO",  payout: kal1.noCount  + pm2 },
+    ];
+  }
+  // 2-way moneyline
+  return [
+    { outcome: entry.pm1?.outcome || "Team1", payout: kal1.yesCount + kal2.noCount + pm1 },
+    { outcome: entry.pm2?.outcome || "Team2", payout: kal1.noCount + kal2.yesCount + pm2 },
+  ];
+}
+
+// Total $ cost across all wallet legs in the match.
+function _computeCost(wpm: WalletPositionsByMatch): number {
+  let c = 0;
+  for (const k of wpm.kalByTicker.values()) {
+    c += ((k.yesCount + k.noCount) * k.avgPriceCents) / 100;
+  }
+  for (const p of wpm.pmByTokenId.values()) {
+    c += p.shares * p.avgPrice;
+  }
+  return c;
+}
+
+export async function scanWalletAndFlagHedgeTargets(opts: { dryRun?: boolean } = {}): Promise<{
+  scanned: number;                 // matches examined
+  balanced: number;                // matches within gap tolerance
+  flagged: number;                 // new or updated flags
+  skippedIgnored: number;          // pre-ignored flags
+  flags: ManualHedgeFlag[];        // the flag set (full, including ignored)
+}> {
+  const { dryRun = false } = opts;
+
+  // 1. Fetch live wallets
+  let kalMap: Map<string, { yesCount: number; noCount: number; avgPriceCents: number; marketExposureCents: number; feesPaidCents: number }>;
+  try { kalMap = await getKalshiPositionMap(); }
+  catch (e) {
+    console.warn(`[WALLET-FIRST] KAL wallet fetch failed: ${(e as Error).message}`);
+    kalMap = new Map();
+  }
+  let pmPositions: Array<{ asset?: string; tokenId?: string; size?: number | string; avgPrice?: number | string; outcome?: string; title?: string; }>;
+  try { pmPositions = await fetchPmPositionsCached(0); }
+  catch (e) {
+    console.warn(`[WALLET-FIRST] PM wallet fetch failed: ${(e as Error).message}`);
+    pmPositions = [];
+  }
+
+  // 2. Load watchlist + indexes
+  const cache = loadDiscoveryCache();
+  const watchlist = (cache && cache.watchlist) || [];
+  const { byKalTicker, byPmTokenId } = buildWatchlistIndexes(watchlist);
+
+  // 3. Group wallet holdings by match (pmSlug) — orphan entries get their own bucket.
+  const matches = new Map<string, WalletPositionsByMatch>();
+  const getOrCreate = (key: string, entry: WatchEntry | null, name: string): WalletPositionsByMatch => {
+    let m = matches.get(key);
+    if (!m) { m = { matchKey: key, matchName: name, entry, kalByTicker: new Map(), pmByTokenId: new Map() }; matches.set(key, m); }
+    return m;
+  };
+
+  for (const [ticker, kalPos] of kalMap) {
+    if (kalPos.yesCount === 0 && kalPos.noCount === 0) continue;
+    const w = _findEntryFor(ticker, null, watchlist);
+    const key = w ? w.pmSlug : `orphan-kal:${ticker}`;
+    const name = w ? `${w.kal1?.surname ?? ""} vs ${w.kal2?.surname ?? ""}`.trim() || ticker : ticker;
+    const m = getOrCreate(key, w, name);
+    m.kalByTicker.set(ticker, { yesCount: kalPos.yesCount, noCount: kalPos.noCount, avgPriceCents: kalPos.avgPriceCents });
+  }
+
+  for (const p of pmPositions) {
+    const tid = String(p.asset ?? p.tokenId ?? "");
+    if (!tid) continue;
+    const shares = Number(p.size ?? 0);
+    if (!(shares > 0)) continue;
+    const avgPrice = Number(p.avgPrice ?? 0);
+    const outcome = String(p.outcome ?? "");
+    const title = p.title != null ? String(p.title) : undefined;
+    const w = _findEntryFor(null, tid, watchlist);
+    const key = w ? w.pmSlug : `orphan-pm:${tid}`;
+    const name = w ? `${w.kal1?.surname ?? ""} vs ${w.kal2?.surname ?? ""}`.trim() || (title ?? tid) : (title ?? `pm:${tid.slice(0, 12)}…`);
+    const m = getOrCreate(key, w, name);
+    m.pmByTokenId.set(tid, { shares, avgPrice, outcome, title });
+  }
+
+  // 4. For each match, compute payouts + classify
+  const existingFlags = loadManualHedgeFlags();
+  const existingById = new Map(existingFlags.map(f => [f.id, f]));
+  const now = Date.now();
+  const nextFlags: ManualHedgeFlag[] = [];
+
+  let balanced = 0;
+  let flagged = 0;
+  let skippedIgnored = 0;
+
+  for (const wpm of matches.values()) {
+    const payouts = _computePayouts(wpm);
+    const cost = _computeCost(wpm);
+    const kalTickers = [...wpm.kalByTicker.keys()].sort();
+    const pmTokenIds = [...wpm.pmByTokenId.keys()].sort();
+    const id = _flagId(kalTickers, pmTokenIds);
+
+    const max = payouts.reduce((s, p) => p.payout > s ? p.payout : s, 0);
+    const min = payouts.reduce((s, p) => p.payout < s ? p.payout : s, Infinity);
+    const gap = Number.isFinite(min) ? max - min : 0;
+
+    let classification: ManualHedgeFlag["classification"];
+    let reason: string;
+
+    if (!wpm.entry) {
+      classification = "no-watchlist-match";
+      reason = wpm.kalByTicker.size > 0 && wpm.pmByTokenId.size === 0
+        ? `KAL-only position on ${kalTickers[0]} — no watchlist entry, no PM counterpart to hedge with`
+        : wpm.pmByTokenId.size > 0 && wpm.kalByTicker.size === 0
+        ? `PM-only position on ${pmTokenIds[0]?.slice(0, 12)}… — no watchlist entry`
+        : `Holdings in both wallets but no shared watchlist entry`;
+    } else if (gap < GAP_TOLERANCE_USD) {
+      balanced++;
+      continue;
+    } else {
+      // Imbalanced with watchlist entry → re-check (user directive #1: verify before flagging)
+      const hasBothSides = wpm.kalByTicker.size > 0 && wpm.pmByTokenId.size > 0;
+      if (hasBothSides && max >= min * 2) {
+        classification = "over-fill";
+        reason = `One side has ≥2x the payout of the other — likely PM over-fill or duplicate arb attempt. max=$${max.toFixed(2)} min=$${min.toFixed(2)}`;
+      } else if (wpm.kalByTicker.size === 0) {
+        classification = "imbalance";
+        reason = `PM-only exposure of $${max.toFixed(2)} with no KAL counterpart — KAL leg likely failed to fill`;
+      } else if (wpm.pmByTokenId.size === 0) {
+        classification = "imbalance";
+        reason = `KAL-only exposure of $${max.toFixed(2)} with no PM counterpart — PM leg likely failed to fill`;
+      } else {
+        classification = "imbalance";
+        reason = `Gap of $${gap.toFixed(2)} between outcome payouts`;
+      }
+    }
+
+    const prior = existingById.get(id);
+    if (prior?.ignored) {
+      skippedIgnored++;
+      // Keep the ignored flag in the file but refresh lastSeenAt.
+      nextFlags.push({ ...prior, lastSeenAt: now, gap, costExposure: cost, payouts });
+      continue;
+    }
+    flagged++;
+    nextFlags.push({
+      id,
+      matchKey: wpm.matchKey,
+      matchName: wpm.matchName,
+      classification,
+      reason,
+      kalTickers,
+      pmTokenIds,
+      gap,
+      costExposure: cost,
+      payouts,
+      firstSeenAt: prior?.firstSeenAt ?? now,
+      lastSeenAt: now,
+      ignored: false,
+    });
+  }
+
+  // 5. Persist (unless dry-run). Stale flags (not re-seen this scan) drop out
+  //    UNLESS they're ignored — we keep ignored flags for ~30 days so the user
+  //    doesn't have to re-dismiss the same situation repeatedly.
+  const STALE_IGNORE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+  const nextIds = new Set(nextFlags.map(f => f.id));
+  for (const f of existingFlags) {
+    if (nextIds.has(f.id)) continue;
+    if (f.ignored && f.ignoredAt && (now - f.ignoredAt) < STALE_IGNORE_TTL_MS) {
+      nextFlags.push(f);
+    }
+  }
+  nextFlags.sort((a, b) => b.costExposure - a.costExposure);
+
+  if (!dryRun) saveManualHedgeFlags(nextFlags);
+
+  console.log(
+    `[WALLET-FIRST] Scan complete. matches=${matches.size} balanced=${balanced} ` +
+    `flagged=${flagged} pre-ignored=${skippedIgnored}${dryRun ? " (DRY RUN, not persisted)" : ""}`,
+  );
+  for (const f of nextFlags.filter(ff => !ff.ignored).slice(0, 10)) {
+    console.log(`  [FLAG] ${f.matchName} — ${f.classification}: ${f.reason} (cost=$${f.costExposure.toFixed(2)} gap=$${f.gap.toFixed(2)})`);
+  }
+
+  return { scanned: matches.size, balanced, flagged, skippedIgnored, flags: nextFlags };
+}
+
 // ── Main entry point ────────────────────────────────────────────────────────
 export async function runWalletFirstStartup(opts: { forceDiscovery?: boolean } = {}): Promise<{
   orphansPaired: number;
@@ -387,6 +669,8 @@ export async function runWalletFirstStartup(opts: { forceDiscovery?: boolean } =
   positionsEnriched: number;
   kalPositionsLinked: number;
   stalePurged: number;
+  walletScanFlagged: number;
+  walletScanBalanced: number;
 }> {
   console.log(`[WALLET-FIRST] Starting wallet-first hedge state reconstruction...`);
 
@@ -417,10 +701,16 @@ export async function runWalletFirstStartup(opts: { forceDiscovery?: boolean } =
   // Phase 4: Purge stale hedge_state entries
   const { purged } = purgeStaleHedgeStates();
 
+  // Phase 5: Wallet-first hedge scan — surface imbalances and orphan exposures
+  // for manual review. Does NOT auto-create hedge orders. Writes to
+  // data/hedge_manual_flags.json; dashboard displays with an Ignore action.
+  const { flagged: walletScanFlagged, balanced: walletScanBalanced } = await scanWalletAndFlagHedgeTargets();
+
   console.log(
     `[WALLET-FIRST] Complete. paired=${paired} unmatched=${unmatched} ` +
     `recovered=${recovered.length} kalLinked=${kalPositionsLinked} ` +
-    `enriched=${positionsEnriched} stalePurged=${purged}`
+    `enriched=${positionsEnriched} stalePurged=${purged} ` +
+    `scanFlagged=${walletScanFlagged} scanBalanced=${walletScanBalanced}`
   );
 
   return {
@@ -430,5 +720,7 @@ export async function runWalletFirstStartup(opts: { forceDiscovery?: boolean } =
     positionsEnriched,
     kalPositionsLinked,
     stalePurged: purged,
+    walletScanFlagged,
+    walletScanBalanced,
   };
 }
