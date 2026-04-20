@@ -41,7 +41,7 @@ import {
 import {
   connectKalshiWs, connectPmWs, subscribeWatchlist,
   wsKalBooks, wsPmBooks,
-  getWsKalBook, getWsPmAsks, getWsPmBids,
+  getWsKalBook, getWsKalBookTs, getWsPmAsks, getWsPmBids,
   getWsKalBestAsk, getWsPmBestAsk, getWsPmBestBid,
   recordPrice, getMomentum,
   isPmServiceDown, markPmDown, markPmUp, isPm425,
@@ -1486,6 +1486,24 @@ export async function executeArb(
                 // Store for later status check
                 (globalThis as Record<string, unknown>)._parallelPmResult = pmRes.value;
                 console.log(`  [PARALLEL] PM FAK status=${earlyFokMeta.status}`);
+
+                // When status=delayed, the CLOB has queued the order but matching
+                // is async. Wait up to 3s for it to resolve before the downstream
+                // 3-layer post-fill verification runs. Without this wait,
+                // verification races the async matcher and reports 0 shares ~76%
+                // of the time, falsely forcing hedge-mode entry (log history
+                // 2026-04-14 → 04-18, 38 delayed FAKs, 29 "post-all-failed").
+                if (earlyFokMeta.status === "delayed" && earlyFokMeta.orderId) {
+                  const _tPoll0 = performance.now();
+                  const pollResult = await waitForPmOrderFill(
+                    String(earlyFokMeta.orderId),
+                    3000,
+                    pmLeg.tokenId,
+                    pmPreBalance,
+                  );
+                  const pollMs = performance.now() - _tPoll0;
+                  console.log(`  [PARALLEL] PM FAK delayed → ${pollResult} after ${pollMs.toFixed(0)}ms`);
+                }
               } else {
                 console.log(`  [PARALLEL] PM FAK did not match (status=${earlyFokMeta.status}) — will retry sequentially after KAL fill check`);
               }
@@ -3219,7 +3237,8 @@ export async function monitorLoop(watchlist: WatchEntry[]): Promise<void> {
     const kalWsCoverage = wsKalHits / (watchlist.length * 4);
     const kalRefreshDue = Date.now() - _lastKalRestRefreshMs > KAL_REST_REFRESH_INTERVAL_MS;
     if (kalWsCoverage < 0.5 || kalRefreshDue) {
-      _lastKalRestRefreshMs = Date.now();
+      const restStartedAt = Date.now();
+      _lastKalRestRefreshMs = restStartedAt;
       try {
         await Promise.race([
           refreshKalshiPrices(watchlist),
@@ -3228,16 +3247,25 @@ export async function monitorLoop(watchlist: WatchEntry[]): Promise<void> {
       } catch (e) {
         console.warn(`[KAL-PRICES] refresh timed out: ${(e as Error).message} — using WS data only`);
       }
-      // Re-overlay WS on top of REST (WS is more current)
+      // Re-overlay WS only if the book was updated DURING or AFTER the REST fetch —
+      // in that case WS is genuinely more current. A cached WS value from before REST
+      // started is older than the REST result we just got, and overwriting REST with
+      // it would defeat the fallback (REST runs, its result is immediately clobbered
+      // by stale WS). The ts-freshness check in getWsKalBestAsk isn't sufficient here
+      // because a book can be <120s old (fresh by ts) yet older than our fresh REST.
       for (const e of watchlist) {
-        const ws1Yes = getWsKalBestAsk(e.kal1.ticker, "yes");
-        const ws1No  = getWsKalBestAsk(e.kal1.ticker, "no");
-        const ws2Yes = getWsKalBestAsk(e.kal2.ticker, "yes");
-        const ws2No  = getWsKalBestAsk(e.kal2.ticker, "no");
-        if (ws1Yes !== null) e.kal1.yesAsk = ws1Yes;
-        if (ws1No  !== null) e.kal1.noAsk  = ws1No;
-        if (ws2Yes !== null) e.kal2.yesAsk = ws2Yes;
-        if (ws2No  !== null) e.kal2.noAsk  = ws2No;
+        if (getWsKalBookTs(e.kal1.ticker) > restStartedAt) {
+          const ws1Yes = getWsKalBestAsk(e.kal1.ticker, "yes");
+          const ws1No  = getWsKalBestAsk(e.kal1.ticker, "no");
+          if (ws1Yes !== null) e.kal1.yesAsk = ws1Yes;
+          if (ws1No  !== null) e.kal1.noAsk  = ws1No;
+        }
+        if (getWsKalBookTs(e.kal2.ticker) > restStartedAt) {
+          const ws2Yes = getWsKalBestAsk(e.kal2.ticker, "yes");
+          const ws2No  = getWsKalBestAsk(e.kal2.ticker, "no");
+          if (ws2Yes !== null) e.kal2.yesAsk = ws2Yes;
+          if (ws2No  !== null) e.kal2.noAsk  = ws2No;
+        }
       }
     }
 

@@ -8,6 +8,22 @@
 - When asked "why did X happen", the answer must reference concrete evidence (file contents, log lines, timestamps), not code-path speculation.
 - If you can't find the data to confirm a theory, say so. Don't present guesses as findings.
 
+### Hard gate — before ANY root-cause claim
+
+**Before your first written hypothesis about why something happened, you must have already quoted a log line, data record, or file content that supports it.** Code-path reasoning is not evidence. "The code at line X does Y, therefore the failure is probably Y" is speculation.
+
+If the user asks "why does X happen" and you don't have data in hand, your first action is to `ls data/`, `grep` the relevant logs, or read the trade record — NOT to write a response. Writing first is the failure mode.
+
+Banned opening moves when answering root-cause questions:
+- A confidence-graded table of hypotheses (`Solid / Medium / Weak`). That is speculation dressed up as analysis.
+- A paragraph of reasoning ending in "so it's probably X" with no data quoted.
+- "Likely", "probably", "my hypothesis is", "plausible" — these words in a root-cause answer mean you skipped the data step. Delete the sentence and go find evidence.
+- Proposing a fix before quoting the data that proves the cause. You will guess wrong, and the fix will address the wrong thing.
+
+If the user has to ask "based on what?" or "did you check the data?" — that is a process failure, not a clarifying question. You should have led with the quoted data. When you catch yourself about to speculate, stop and run a query instead.
+
+**Exception:** the user explicitly asks for a hypothesis or brainstorm ("what *could* cause this?"). Then speculation is the deliverable — but label it clearly as speculation, and still prefer data when it's cheap to get.
+
 ## Code Changes
 
 - Read the code you're about to change. Don't modify code based on assumptions about what it does.

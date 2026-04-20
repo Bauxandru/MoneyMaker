@@ -4,6 +4,8 @@ import { describe, it, expect, beforeEach, vi } from "vitest";
 vi.mock("./ttConfig.js", () => ({
   KAL_WS_STALE_MS: 600_000,
   PM_WS_STALE_MS: 30_000,
+  PM_WS_POOL_SIZE: 1,
+  PM_WS_TOKENS_PER_CONN: 150,
 }));
 
 const {

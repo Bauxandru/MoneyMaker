@@ -6,12 +6,13 @@
  *   _pmClientCache -- cached ClobClient instance (30min TTL)
  */
 
+import fs from "fs";
 import { ClobClient, OrderType, Side } from "@polymarket/clob-client";
 import { Wallet } from "@ethersproject/wallet";
 import { resolvePolyApiCreds } from "../polyAuth.js";
 import { sleep, normCents, normDollarsOrCents, bestAskFromSide, bestBidFromSide, pickString } from "../utils.js";
 import { getOnChainBalance, getUsdcBalance } from "../polyChain.js";
-import { waitForPmFillWs, isPmUserWsReady } from "./ttWebSocket.js";
+import { waitForPmFillWs, isPmUserWsReady, getWsPmBestAsk, getWsPmAsks, getPmWsReady, getPmServiceDownUntil } from "./ttWebSocket.js";
 import {
   kalFetch, polyClobFetch, polyClobFetchHot, hotRetryOpts,
   PM_MARKETABLE_MIN_VALUE,
@@ -68,6 +69,111 @@ function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise
   });
 }
 
+// --- PM FAK/GTC diagnostic log ------------------------------------------------
+// Writes one JSONL entry per PM order attempt to data/pm_fak_raw.jsonl with full
+// request + response + book state + timing + WS status. Used to diagnose why
+// PM FAK orders fail to match (status != "matched"). Rotates at 50MB, keeps 2
+// rotated files. Zero impact on execution — wraps existing order calls and
+// preserves their return values / error throws verbatim.
+const PM_FAK_LOG_PATH = "data/pm_fak_raw.jsonl";
+const PM_FAK_LOG_MAX_BYTES = 50 * 1024 * 1024;
+let _pmFakLogSize = -1;
+
+function _appendPmFakLog(entry: Record<string, unknown>): void {
+  try {
+    if (_pmFakLogSize < 0) {
+      try { _pmFakLogSize = fs.existsSync(PM_FAK_LOG_PATH) ? fs.statSync(PM_FAK_LOG_PATH).size : 0; }
+      catch { _pmFakLogSize = 0; }
+    }
+    if (_pmFakLogSize > PM_FAK_LOG_MAX_BYTES) {
+      try {
+        if (fs.existsSync(PM_FAK_LOG_PATH + ".1")) fs.renameSync(PM_FAK_LOG_PATH + ".1", PM_FAK_LOG_PATH + ".2");
+        fs.renameSync(PM_FAK_LOG_PATH, PM_FAK_LOG_PATH + ".1");
+      } catch { /* best-effort rotation */ }
+      _pmFakLogSize = 0;
+    }
+    const line = JSON.stringify(entry) + "\n";
+    fs.appendFileSync(PM_FAK_LOG_PATH, line);
+    _pmFakLogSize += line.length;
+  } catch { /* never let logging break an order */ }
+}
+
+/** Wrap a PM order placement call with diagnostic logging. Captures book state
+ *  before + after, latency, full response (truncated), parsed status, WS health.
+ *  Preserves return / throw behaviour of the wrapped call. */
+async function _tracePmOrder<T>(
+  op: string,
+  side: "BUY" | "SELL",
+  orderType: string,
+  tokenId: string,
+  price: number,
+  shares: number,
+  tickSize: number,
+  negRisk: boolean,
+  doPlace: () => Promise<T>,
+): Promise<T> {
+  const ts = new Date().toISOString();
+  const t0 = performance.now();
+  const bestAskBefore = getWsPmBestAsk(tokenId);
+  const asksBefore = (getWsPmAsks(tokenId) || []).slice(0, 5);
+  const wsReady = getPmWsReady();
+  const serviceDownUntil = getPmServiceDownUntil();
+  const serviceDown = Date.now() < serviceDownUntil;
+
+  let resp: unknown = undefined;
+  let errMsg: string | null = null;
+  let threw = false;
+  try {
+    resp = await doPlace();
+  } catch (e) {
+    threw = true;
+    errMsg = (e as Error)?.message ?? String(e);
+  }
+  const latencyMs = Math.round(performance.now() - t0);
+
+  // Snapshot book AFTER response (lets us see if our order moved the book)
+  const bestAskAfter = getWsPmBestAsk(tokenId);
+  const asksAfter = (getWsPmAsks(tokenId) || []).slice(0, 5);
+
+  // Extract known response fields safely
+  let respSummary: Record<string, unknown> | null = null;
+  if (resp && typeof resp === "object") {
+    const r = resp as Record<string, unknown>;
+    respSummary = {
+      success: r.success,
+      status: r.status,
+      orderId: r.orderID ?? r.orderId ?? r.orderHash,
+      makingAmount: r.makingAmount,
+      takingAmount: r.takingAmount,
+      transactionsHashes: Array.isArray(r.transactionsHashes) ? (r.transactionsHashes as unknown[]).length : undefined,
+      errorMsg: r.errorMsg,
+    };
+  }
+
+  let rawRespTrunc: string | null = null;
+  try { rawRespTrunc = resp != null ? JSON.stringify(resp).slice(0, 4096) : null; }
+  catch { rawRespTrunc = "(unserialisable)"; }
+
+  _appendPmFakLog({
+    ts,
+    op,
+    side,
+    orderType,
+    req: { tokenId: tokenId.slice(0, 12) + "...", fullTokenId: tokenId, price, shares, tickSize, negRisk },
+    pmWs: { ready: wsReady, serviceDown, serviceDownUntil: serviceDownUntil ? new Date(serviceDownUntil).toISOString() : null },
+    bookBefore: { bestAsk: bestAskBefore, top5: asksBefore },
+    bookAfter:  { bestAsk: bestAskAfter,  top5: asksAfter  },
+    latencyMs,
+    threw,
+    errMsg,
+    respSummary,
+    rawResp: rawRespTrunc,
+  });
+
+  if (threw) throw new Error(errMsg ?? "unknown error");
+  return resp as T;
+}
+
 // --- PM order functions ------------------------------------------------------
 
 export async function placePmOrder(
@@ -79,12 +185,12 @@ export async function placePmOrder(
   // Use FAK (Fill And Kill): fills as much as possible, cancels remainder.
   // FOK rejects the entire order if the book can't fill 100% — causes unnecessary failures
   // when the book has slight shortfall (e.g., 10.75 of 11 shares available).
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  return withTimeout((client.createAndPostOrder as any)(
-    { tokenID: tokenId, price: pmSafePrice(price, shares), size: shares, side: Side.BUY },
-    { tickSize: tickSize.toString(), negRisk },
-    OrderType.FAK
-  ), PM_ORDER_TIMEOUT_MS, "placePmOrder");
+  return _tracePmOrder("placePmOrder", "BUY", "FAK", tokenId, price, shares, tickSize, negRisk,
+    () => withTimeout((client.createAndPostOrder as unknown as (o: unknown, opt: unknown, t: unknown) => Promise<unknown>)(
+      { tokenID: tokenId, price: pmSafePrice(price, shares), size: shares, side: Side.BUY },
+      { tickSize: tickSize.toString(), negRisk },
+      OrderType.FAK
+    ), PM_ORDER_TIMEOUT_MS, "placePmOrder"));
 }
 
 export async function placePmGTCAsk(
@@ -93,12 +199,12 @@ export async function placePmGTCAsk(
 ): Promise<unknown> {
   if (dryRun) return { dryRun: true, tokenId: tokenId.slice(0, 12) + "...", price, shares, side: "SELL", type: "GTC" };
   const { client } = await createPmClient();
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  return withTimeout((client.createAndPostOrder as any)(
-    { tokenID: tokenId, price: pmSafePrice(price, shares), size: shares, side: Side.SELL },
-    { tickSize: tickSize.toString(), negRisk },
-    OrderType.GTC
-  ), PM_ORDER_TIMEOUT_MS, "placePmGTCAsk");
+  return _tracePmOrder("placePmGTCAsk", "SELL", "GTC", tokenId, price, shares, tickSize, negRisk,
+    () => withTimeout((client.createAndPostOrder as unknown as (o: unknown, opt: unknown, t: unknown) => Promise<unknown>)(
+      { tokenID: tokenId, price: pmSafePrice(price, shares), size: shares, side: Side.SELL },
+      { tickSize: tickSize.toString(), negRisk },
+      OrderType.GTC
+    ), PM_ORDER_TIMEOUT_MS, "placePmGTCAsk"));
 }
 
 export async function placePmGTCBid(
@@ -107,12 +213,12 @@ export async function placePmGTCBid(
 ): Promise<unknown> {
   if (dryRun) return { dryRun: true, tokenId: tokenId.slice(0, 12) + "...", price, shares, side: "BUY", type: "GTC" };
   const { client } = await createPmClient();
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  return withTimeout((client.createAndPostOrder as any)(
-    { tokenID: tokenId, price: pmSafePrice(price, shares), size: shares, side: Side.BUY },
-    { tickSize: tickSize.toString(), negRisk },
-    OrderType.GTC
-  ), PM_ORDER_TIMEOUT_MS, "placePmGTCBid");
+  return _tracePmOrder("placePmGTCBid", "BUY", "GTC", tokenId, price, shares, tickSize, negRisk,
+    () => withTimeout((client.createAndPostOrder as unknown as (o: unknown, opt: unknown, t: unknown) => Promise<unknown>)(
+      { tokenID: tokenId, price: pmSafePrice(price, shares), size: shares, side: Side.BUY },
+      { tickSize: tickSize.toString(), negRisk },
+      OrderType.GTC
+    ), PM_ORDER_TIMEOUT_MS, "placePmGTCBid"));
 }
 
 /** Place a PM taker BUY as FAK (Fill-And-Kill).
@@ -127,12 +233,12 @@ export async function placePmFAK(
 ): Promise<unknown> {
   if (dryRun) return { dryRun: true, tokenId: tokenId.slice(0, 12) + "...", price, shares, type: "FAK" };
   const { client } = await createPmClient();
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  return withTimeout((client.createAndPostOrder as any)(
-    { tokenID: tokenId, price: pmSafePrice(price, shares), size: shares, side: Side.BUY },
-    { tickSize: tickSize.toString(), negRisk },
-    OrderType.FAK  // HARDCODED — PM_ORDER_TYPE config is ignored on purpose
-  ), PM_ORDER_TIMEOUT_MS, "placePmFAK");
+  return _tracePmOrder("placePmFAK", "BUY", "FAK", tokenId, price, shares, tickSize, negRisk,
+    () => withTimeout((client.createAndPostOrder as unknown as (o: unknown, opt: unknown, t: unknown) => Promise<unknown>)(
+      { tokenID: tokenId, price: pmSafePrice(price, shares), size: shares, side: Side.BUY },
+      { tickSize: tickSize.toString(), negRisk },
+      OrderType.FAK  // HARDCODED — PM_ORDER_TYPE config is ignored on purpose
+    ), PM_ORDER_TIMEOUT_MS, "placePmFAK"));
 }
 
 /** Place a PM taker SELL as FAK (Fill-And-Kill). See `placePmFAK` for rationale. */
@@ -142,12 +248,12 @@ export async function placePmFAKSell(
 ): Promise<unknown> {
   if (dryRun) return { dryRun: true, tokenId: tokenId.slice(0, 12) + "...", price, shares, side: "SELL", type: "FAK" };
   const { client } = await createPmClient();
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  return withTimeout((client.createAndPostOrder as any)(
-    { tokenID: tokenId, price: pmSafePrice(price, shares), size: shares, side: Side.SELL },
-    { tickSize: tickSize.toString(), negRisk },
-    OrderType.FAK  // HARDCODED — see placePmFAK
-  ), PM_ORDER_TIMEOUT_MS, "placePmFAKSell");
+  return _tracePmOrder("placePmFAKSell", "SELL", "FAK", tokenId, price, shares, tickSize, negRisk,
+    () => withTimeout((client.createAndPostOrder as unknown as (o: unknown, opt: unknown, t: unknown) => Promise<unknown>)(
+      { tokenID: tokenId, price: pmSafePrice(price, shares), size: shares, side: Side.SELL },
+      { tickSize: tickSize.toString(), negRisk },
+      OrderType.FAK  // HARDCODED — see placePmFAK
+    ), PM_ORDER_TIMEOUT_MS, "placePmFAKSell"));
 }
 
 export async function cancelPmOrder(orderId: string, dryRun: boolean): Promise<void> {
@@ -355,8 +461,14 @@ export async function preSignPmOrder(
  *  fractional-shortfall books and break PARALLEL_MODE's speed assumption). */
 export async function postPreSignedPmOrder(signedOrder: unknown): Promise<unknown> {
   const { client } = await createPmClient();
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  return (client as any).postOrder(signedOrder, OrderType.FAK);
+  // Extract token/price/shares from signed order for logging
+  const o = (signedOrder as Record<string, unknown>) || {};
+  const orderInfo = (o.order as Record<string, unknown>) || o;
+  const tokenId = String(orderInfo.tokenID ?? orderInfo.asset_id ?? "");
+  const price = Number(orderInfo.price ?? 0);
+  const shares = Number(orderInfo.makerAmount ?? orderInfo.size ?? 0);
+  return _tracePmOrder("postPreSignedPmOrder", "BUY", "FAK", tokenId, price, shares, 0.01, false,
+    () => (client as unknown as { postOrder(o: unknown, t: unknown): Promise<unknown> }).postOrder(signedOrder, OrderType.FAK));
 }
 
 // --- PM order status polling --------------------------------------------------

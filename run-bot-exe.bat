@@ -21,6 +21,12 @@ REM ═════════════════════════�
 cd /d "%~dp0"
 if not exist data mkdir data
 
+REM Raise Node/V8 old-space limit to 2 GB. Default is ~1 GB which OOMs after
+REM many hours of uptime (observed 2026-04-17: FATAL heap-limit crash at
+REM 1027 MB during cycle ~382). Honored by the SEA-packaged arb-bot.exe via
+REM NODE_OPTIONS. Raise further (4096) if 2 GB still proves too tight.
+set NODE_OPTIONS=--max-old-space-size=2048
+
 REM Resolve exe path: prefer dist\arb-bot.exe, fall back to arb-bot.exe in cwd
 set BOT_EXE=
 if exist "dist\arb-bot.exe" set BOT_EXE=dist\arb-bot.exe

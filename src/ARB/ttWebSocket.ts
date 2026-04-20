@@ -12,7 +12,7 @@
 import crypto from "crypto";
 import fs from "fs";
 import WebSocket from "ws";
-import { KAL_WS_STALE_MS, PM_WS_STALE_MS } from "./ttConfig.js";
+import { KAL_WS_STALE_MS, PM_WS_STALE_MS, PM_WS_POOL_SIZE, PM_WS_TOKENS_PER_CONN } from "./ttConfig.js";
 import type { WsBookSide, WsLiveBook, WsPmBook } from "./ttTypes.js";
 import { audit } from "./ttAuditLog.js";
 import { readPolyApiCredsFromEnv } from "../polyAuth.js";
@@ -218,10 +218,23 @@ export function isKalMarketSettled(ticker: string): boolean {
   return _kalSettledMarkets.has(ticker);
 }
 
-let _pmWs: WebSocket | null = null;
-let _pmWsReady = false;
-let _pmPingInterval: ReturnType<typeof setInterval> | null = null;
-const _pmWsSubs = new Set<string>();
+// --- PM WebSocket pool --------------------------------------------------------
+// One logical feed, N physical connections. Each connection holds at most
+// PM_WS_TOKENS_PER_CONN tokens to stay under PM's per-connection delivery cap.
+// A token is assigned to one slot for its entire lifetime (sticky) so the book
+// state survives reconnects.
+//
+// Legacy single-connection globals (_pmWs / _pmWsReady / _pmWsSubs / _pmPingInterval)
+// remain exported via the getter helpers below for backward compat with any
+// external code — they now summarise the pool state.
+const _pmWsPool: (WebSocket | null)[] = Array(PM_WS_POOL_SIZE).fill(null);
+const _pmWsPoolReady: boolean[] = Array(PM_WS_POOL_SIZE).fill(false);
+const _pmWsSubsByConn: Set<string>[] = Array.from({ length: PM_WS_POOL_SIZE }, () => new Set<string>());
+const _pmPingIntervals: (ReturnType<typeof setInterval> | null)[] = Array(PM_WS_POOL_SIZE).fill(null);
+// tokenId → slot index, so repeated _pmWsSubscribe calls find the same slot.
+const _pmWsTokenSlot = new Map<string, number>();
+// Union of all subs across slots. Materialised lazily by getPmWsSubs().
+const _pmWsSubs = new Set<string>();   // kept in sync with _pmWsSubsByConn
 
 // --- Book accessor helpers ---------------------------------------------------
 
@@ -239,6 +252,12 @@ export function getWsKalBook(ticker: string): { yes: [number, number][]; no: [nu
   const book = wsKalBooks.get(ticker);
   if (!book || Date.now() - book.ts > KAL_WS_STALE_MS) return null;
   return { yes: wsBookToArray(book.yes), no: wsBookToArray(book.no) };
+}
+
+/** Last-update timestamp for a Kalshi WS book (0 if never received). Used by
+ *  callers that need to decide "is this WS value newer than some reference". */
+export function getWsKalBookTs(ticker: string): number {
+  return wsKalBooks.get(ticker)?.ts ?? 0;
 }
 
 /** Get PM ask depth from WS cache (null if stale/missing). Cents -> decimal. */
@@ -404,7 +423,10 @@ export function connectKalshiWs(): void {
         const side = msg.msg.side === "no" ? book.no : book.yes;
         const cents = Math.round(Number(msg.msg.price_dollars || msg.msg.price || 0) * 100);
         const delta = Number(msg.msg.delta_fp || msg.msg.delta || 0);
-        if (!Number.isFinite(cents) || cents <= 0 || cents >= 100 || !Number.isFinite(delta)) { book.ts = Date.now(); return; }
+        // Invalid delta: skip without bumping book.ts. Bumping ts on rejection would
+        // mask WS content staleness — consumers' KAL_WS_STALE_MS check would keep
+        // returning the cached (now-wrong) book, defeating the REST fallback.
+        if (!Number.isFinite(cents) || cents <= 0 || cents >= 100 || !Number.isFinite(delta)) return;
         const cur = side.get(cents) || 0;
         const newSize = cur + delta;
         if (newSize <= 0) side.delete(cents); else side.set(cents, newSize);
@@ -483,80 +505,118 @@ export function _kalWsSubscribe(ticker: string): void {
   _kalWs.send(JSON.stringify({ id: _kalWsSubId, cmd: "subscribe", params: { channels: ["orderbook_delta", "market_lifecycle_v2"], market_ticker: ticker } }));
 }
 
-// --- Polymarket WebSocket ----------------------------------------------------
-
-export function connectPmWs(): void {
-  _pmWs = new WebSocket("wss://ws-subscriptions-clob.polymarket.com/ws/market");
-
-  _pmWs.on("open", () => {
-    console.log("[WS] Polymarket connected");
-    _pmWsReady = true;
-    if (_pmWsSubs.size > 0) {
-      _pmWs!.send(JSON.stringify({ assets_ids: [..._pmWsSubs], type: "market" }));
+// --- Polymarket WebSocket (pooled) -------------------------------------------
+// Shared book-update handler. Called for every message from every pool slot.
+// Writes to the shared `wsPmBooks` map so callers can't tell which slot owns
+// which token — they just look up by tokenId.
+function _pmWsHandleMessage(raw: WebSocket.RawData): void {
+  try {
+    const str = raw.toString();
+    if (str === "PONG") return;
+    const msgs = JSON.parse(str);
+    const events = Array.isArray(msgs) ? msgs : [msgs];
+    for (const evt of events) {
+      if (evt.event_type === "book") {
+        const tokenId = evt.asset_id;
+        if (!tokenId) continue;
+        let book = wsPmBooks.get(tokenId);
+        if (!book) { book = { bids: new Map(), asks: new Map(), ts: Date.now() }; wsPmBooks.set(tokenId, book); }
+        book.bids.clear(); book.asks.clear();
+        for (const l of (evt.bids || [])) {
+          const p = Math.round(Number(l.price) * 100), s = Number(l.size);
+          if (p > 0 && s > 0) book.bids.set(p, s);
+        }
+        for (const l of (evt.asks || [])) {
+          const p = Math.round(Number(l.price) * 100), s = Number(l.size);
+          if (p > 0 && s > 0) book.asks.set(p, s);
+        }
+        book.ts = Date.now();
+        { const ba = getWsPmBestAsk(tokenId); if (ba !== null) recordPrice(`pm:${tokenId}`, ba); }
+      } else if (evt.event_type === "price_change") {
+        for (const ch of (evt.price_changes || [])) {
+          const aid = ch.asset_id || evt.asset_id;
+          if (!aid) continue;
+          let book = wsPmBooks.get(aid);
+          if (!book) { book = { bids: new Map(), asks: new Map(), ts: Date.now() }; wsPmBooks.set(aid, book); }
+          const side = ch.side === "BUY" ? book.bids : book.asks;
+          const p = Math.round(Number(ch.price) * 100), s = Number(ch.size);
+          if (s <= 0) side.delete(p); else side.set(p, s);
+          book.ts = Date.now();
+          if (ch.side !== "BUY") { const ba = getWsPmBestAsk(aid); if (ba !== null) recordPrice(`pm:${aid}`, ba); }
+        }
+      }
     }
-    if (_pmPingInterval) clearInterval(_pmPingInterval);
-    _pmPingInterval = setInterval(() => {
-      if (_pmWs?.readyState === WebSocket.OPEN) _pmWs.send("PING");
+  } catch (err) { console.error("[WS] Polymarket message parse error:", (err as Error).message); }
+}
+
+/** Open a single PM WS slot. Called from connectPmWs() for each pool slot, and
+ *  re-called on close for per-slot reconnect. Each slot owns _pmWsSubsByConn[slot]. */
+function _pmWsConnectSlot(slot: number): void {
+  const ws = new WebSocket("wss://ws-subscriptions-clob.polymarket.com/ws/market");
+  _pmWsPool[slot] = ws;
+  _pmWsPoolReady[slot] = false;
+
+  ws.on("open", () => {
+    _pmWsPoolReady[slot] = true;
+    const mine = _pmWsSubsByConn[slot];
+    console.log(`[WS] Polymarket slot ${slot + 1}/${PM_WS_POOL_SIZE} connected (${mine.size} subs)`);
+    if (mine.size > 0) {
+      ws.send(JSON.stringify({ assets_ids: [...mine], type: "market" }));
+    }
+    if (_pmPingIntervals[slot]) clearInterval(_pmPingIntervals[slot]!);
+    _pmPingIntervals[slot] = setInterval(() => {
+      if (ws.readyState === WebSocket.OPEN) ws.send("PING");
     }, 10000);
   });
 
-  _pmWs.on("message", (raw) => {
-    try {
-      const str = raw.toString();
-      if (str === "PONG") return;
-      const msgs = JSON.parse(str);
-      const events = Array.isArray(msgs) ? msgs : [msgs];
-      for (const evt of events) {
-        if (evt.event_type === "book") {
-          const tokenId = evt.asset_id;
-          if (!tokenId) continue;
-          let book = wsPmBooks.get(tokenId);
-          if (!book) { book = { bids: new Map(), asks: new Map(), ts: Date.now() }; wsPmBooks.set(tokenId, book); }
-          book.bids.clear(); book.asks.clear();
-          for (const l of (evt.bids || [])) {
-            const p = Math.round(Number(l.price) * 100), s = Number(l.size);
-            if (p > 0 && s > 0) book.bids.set(p, s);
-          }
-          for (const l of (evt.asks || [])) {
-            const p = Math.round(Number(l.price) * 100), s = Number(l.size);
-            if (p > 0 && s > 0) book.asks.set(p, s);
-          }
-          book.ts = Date.now();
-          { const ba = getWsPmBestAsk(tokenId); if (ba !== null) recordPrice(`pm:${tokenId}`, ba); }
-        } else if (evt.event_type === "price_change") {
-          for (const ch of (evt.price_changes || [])) {
-            const aid = ch.asset_id || evt.asset_id;
-            if (!aid) continue;
-            let book = wsPmBooks.get(aid);
-            if (!book) { book = { bids: new Map(), asks: new Map(), ts: Date.now() }; wsPmBooks.set(aid, book); }
-            const side = ch.side === "BUY" ? book.bids : book.asks;
-            const p = Math.round(Number(ch.price) * 100), s = Number(ch.size);
-            if (s <= 0) side.delete(p); else side.set(p, s);
-            book.ts = Date.now();
-            if (ch.side !== "BUY") { const ba = getWsPmBestAsk(aid); if (ba !== null) recordPrice(`pm:${aid}`, ba); }
-          }
-        }
-      }
-    } catch (err) { console.error("[WS] Polymarket message parse error:", (err as Error).message); }
-  });
+  ws.on("message", _pmWsHandleMessage);
 
-  _pmWs.on("close", () => {
-    console.log("[WS] Polymarket disconnected, clearing books, reconnecting in 1s...");
-    _pmWsReady = false;
-    wsPmBooks.clear(); // Prevent stale PM prices from being used during reconnect gap
-    setTimeout(connectPmWs, 1000);
+  ws.on("close", () => {
+    console.log(`[WS] Polymarket slot ${slot + 1} disconnected, reconnecting in 1s...`);
+    _pmWsPoolReady[slot] = false;
+    // Clear books for tokens owned by this slot only — other slots' tokens stay fresh.
+    for (const tid of _pmWsSubsByConn[slot]) wsPmBooks.delete(tid);
+    if (_pmPingIntervals[slot]) { clearInterval(_pmPingIntervals[slot]!); _pmPingIntervals[slot] = null; }
+    setTimeout(() => _pmWsConnectSlot(slot), 1000);
   });
-  _pmWs.on("error", (err) => { console.error("[WS] Polymarket error:", (err as Error).message); });
+  ws.on("error", (err) => { console.error(`[WS] Polymarket slot ${slot + 1} error:`, (err as Error).message); });
+}
+
+export function connectPmWs(): void {
+  for (let slot = 0; slot < PM_WS_POOL_SIZE; slot++) {
+    _pmWsConnectSlot(slot);
+  }
+}
+
+/** Pick the slot that should own `tokenId`:
+ *   - If already assigned (sticky), return that slot.
+ *   - Else pick the least-loaded slot not yet at PM_WS_TOKENS_PER_CONN.
+ *   - Fallback to slot with fewest subs if all are full. */
+function _pmWsPickSlot(tokenId: string): number {
+  const existing = _pmWsTokenSlot.get(tokenId);
+  if (existing !== undefined) return existing;
+  let bestSlot = 0;
+  let bestLoad = _pmWsSubsByConn[0].size;
+  for (let s = 1; s < PM_WS_POOL_SIZE; s++) {
+    const load = _pmWsSubsByConn[s].size;
+    if (load < bestLoad) { bestSlot = s; bestLoad = load; }
+  }
+  if (bestLoad >= PM_WS_TOKENS_PER_CONN) {
+    console.warn(`[WS] All PM pool slots at cap (${PM_WS_TOKENS_PER_CONN}) — pool size ${PM_WS_POOL_SIZE} too small for watchlist. Raising PM_WS_POOL_SIZE recommended.`);
+  }
+  return bestSlot;
 }
 
 export function _pmWsSubscribe(tokenId: string): void {
-  const isNew = !_pmWsSubs.has(tokenId);
+  if (_pmWsTokenSlot.has(tokenId)) return;   // already assigned
+  const slot = _pmWsPickSlot(tokenId);
+  _pmWsTokenSlot.set(tokenId, slot);
+  _pmWsSubsByConn[slot].add(tokenId);
   _pmWsSubs.add(tokenId);
-  // Send subscription message immediately if WS is connected and this is a new token.
-  // Previously, tokens added after initial subscribeWatchlist() were never subscribed
-  // until the next WS reconnect, causing stale/missing book data.
-  if (isNew && _pmWsReady && _pmWs?.readyState === WebSocket.OPEN) {
-    _pmWs.send(JSON.stringify({ assets_ids: [tokenId], type: "market" }));
+  // Send subscription immediately if the target slot is connected
+  const ws = _pmWsPool[slot];
+  if (_pmWsPoolReady[slot] && ws?.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ assets_ids: [tokenId], type: "market" }));
   }
 }
 
@@ -811,17 +871,17 @@ export function subscribeWatchlist(watchlist: { kal1: { ticker: string }; kal2: 
     _kalWsSubscribe(e.kal1.ticker);
     _kalWsSubscribe(e.kal2.ticker);
     if (e.kal3) _kalWsSubscribe(e.kal3.ticker);
-    _pmWsSubs.add(e.pm1.tokenId);
-    _pmWsSubs.add(e.pm2.tokenId);
-    if (e.pm3) _pmWsSubs.add(e.pm3.tokenId);
-    if (e.pm1.noTokenId) _pmWsSubs.add(e.pm1.noTokenId);
-    if (e.pm2.noTokenId) _pmWsSubs.add(e.pm2.noTokenId);
-    if (e.pm3?.noTokenId) _pmWsSubs.add(e.pm3.noTokenId);
+    // Route each PM token through _pmWsSubscribe so it picks a pool slot.
+    _pmWsSubscribe(e.pm1.tokenId);
+    _pmWsSubscribe(e.pm2.tokenId);
+    if (e.pm3) _pmWsSubscribe(e.pm3.tokenId);
+    if (e.pm1.noTokenId) _pmWsSubscribe(e.pm1.noTokenId);
+    if (e.pm2.noTokenId) _pmWsSubscribe(e.pm2.noTokenId);
+    if (e.pm3?.noTokenId) _pmWsSubscribe(e.pm3.noTokenId);
   }
-  if (_pmWsReady && _pmWs && _pmWsSubs.size > 0) {
-    _pmWs.send(JSON.stringify({ assets_ids: [..._pmWsSubs], type: "market" }));
-  }
-  console.log(`[WS] Subscribed to ${_kalWsSubs.size} Kalshi tickers + ${_pmWsSubs.size} PM tokens`);
+  // Emit per-slot summary so operators can see the pool fill.
+  const slotLoads = _pmWsSubsByConn.map(s => s.size);
+  console.log(`[WS] Subscribed to ${_kalWsSubs.size} Kalshi tickers + ${_pmWsSubs.size} PM tokens across ${PM_WS_POOL_SIZE} PM slots [${slotLoads.join(",")}]`);
 }
 
 // --- PM service-down backoff -------------------------------------------------
@@ -852,8 +912,18 @@ export function markPmUp(): void {
 
 /** Returns true if the PM response is a 425 / "service not ready" error. */
 export function getPmServiceDownUntil(): number { return pmServiceDownUntil; }
-export function getPmWsReady(): boolean { return _pmWsReady; }
+// Pool-aware readiness: true if ANY slot is ready. Callers wanting full readiness
+// should inspect _pmWsPoolReady via getPmWsPoolState() below.
+export function getPmWsReady(): boolean { return _pmWsPoolReady.some(Boolean); }
 export function getPmWsSubs(): Set<string> { return _pmWsSubs; }
+/** Per-slot pool diagnostics: ready flag + sub count per slot. */
+export function getPmWsPoolState(): { size: number; ready: boolean[]; subCounts: number[] } {
+  return {
+    size: PM_WS_POOL_SIZE,
+    ready: [..._pmWsPoolReady],
+    subCounts: _pmWsSubsByConn.map(s => s.size),
+  };
+}
 
 export function isPm425(res: unknown): boolean {
   if (!res || typeof res !== "object") return false;

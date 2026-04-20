@@ -97,6 +97,18 @@ export const MAX_HEDGE_POSITIONS = numEnv("MAX_HEDGE_POSITIONS", 8);
 export const KAL_WS_STALE_MS = numEnv("KAL_WS_STALE_MS", 120_000);   // 2 min (was 10 min)
 export const PM_WS_STALE_MS  = numEnv("PM_WS_STALE_MS",   300_000);   // 5 min (illiquid books may not update for minutes)
 
+// --- PM WS connection pool ---------------------------------------------------
+// Polymarket's WS server has a per-connection delivery ceiling around 200-300
+// subscribed tokens. Past that, subscribed tokens are silently not delivered
+// (their book events never reach us). Empirically verified by
+// tmp_pm_ws_cap_probe.ts on 2026-04-20: at 600 subs only 212 tokens responded.
+//
+// Fix: split the PM WS into a pool of connections, each holding <= MAX tokens.
+// 6 connections × 150 tokens per conn = full coverage for ~900-token watchlists
+// with headroom below the observed ~212 cap.
+export const PM_WS_POOL_SIZE        = Math.max(1, numEnv("PM_WS_POOL_SIZE", 6));
+export const PM_WS_TOKENS_PER_CONN  = Math.max(10, numEnv("PM_WS_TOKENS_PER_CONN", 150));
+
 // Discovery cache TTL (ms). 0 = date-based (stale at midnight UTC).
 export const DISCOVERY_CACHE_TTL_MS = numEnv("DISCOVERY_CACHE_TTL_MS", 21_600_000); // 6 hours
 
