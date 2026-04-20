@@ -1471,6 +1471,11 @@ app.get("/api/daily-pnl", async (req, res) => {
       const { loadPairHistory } = await import("./ARB/ttPairHistory.js");
       const hist = loadPairHistory();
       for (const [kt, h] of hist) {
+        // Skip stub entries (empty matchName from upsertWalletSightings before
+        // enrichment). Leaving them in the map blocks the data-api title
+        // enrichment below and causes the Match column to fall through to
+        // the raw KAL ticker.
+        if (!h.matchName) continue;
         if (!kalToPair.has(kt)) kalToPair.set(kt, { matchName: h.matchName, pmTokenIds: h.pmTokenId ? [h.pmTokenId] : [] });
         if (h.pmTokenId && !pmTokenToMatch.has(h.pmTokenId)) pmTokenToMatch.set(h.pmTokenId, h.matchName);
       }
@@ -1936,74 +1941,31 @@ app.get("/api/daily-pnl", async (req, res) => {
       pmBuyTotalByToken.set(t.asset_id, (pmBuyTotalByToken.get(t.asset_id) ?? 0) + Number(t.size));
     }
 
-    // ── Pair wallet fills using the bot's own event log (exchange_events.jsonl) ──
-    // The bot stamps every arb execution with a `tradeId` and writes two
-    // `order-placed` events under it (one KAL, one PM). That pairing is
-    // authoritative — it's what the bot actually executed as a pair, no
-    // name-matching heuristics required. We use events ONLY for the
-    // kalTicker↔pmTokenId dictionary and timestamps; all financial values
-    // (shares, cost, fees, revenue) still come from wallet data.
-    //
-    // Edge case: trades older than the event log retention (~2-3 weeks per
-    // CLAUDE.md) lose their pairing entry → they fall through to the orphan
-    // pass below as kal-only / pm-only rows.
-    type EventPair = { tradeId: string; kalTicker?: string; pmTokenId?: string; kalSide?: "yes" | "no"; earliestTs: number };
-    const eventTrades = new Map<string, EventPair>();
-    for (const e of getAllEvents()) {
-      if (e.type !== "order-placed") continue;
-      const tsMs = new Date(e.ts).getTime();
-      if (!Number.isFinite(tsMs) || tsMs < sinceMs) continue;
-      let tp = eventTrades.get(e.tradeId);
-      if (!tp) {
-        tp = { tradeId: e.tradeId, earliestTs: tsMs };
-        eventTrades.set(e.tradeId, tp);
-      }
-      tp.earliestTs = Math.min(tp.earliestTs, tsMs);
-      if (e.exchange === "kal" && e.ticker && !tp.kalTicker) {
-        tp.kalTicker = e.ticker;
-        if (e.side === "yes" || e.side === "no") tp.kalSide = e.side;
-      }
-      if (e.exchange === "pm" && e.tokenId && !tp.pmTokenId) {
-        tp.pmTokenId = e.tokenId;
-      }
-    }
-
-    // Wallet fills arrive within seconds of order placement; ±2 min window is
-    // safely wide and prevents mis-attribution when the same ticker was
-    // re-arbed later in the day.
-    const PAIR_WALLET_WINDOW_MS = 2 * 60 * 1000;
+    // ── Three-pass pairing: events → name-match → time-proximity ──────────
+    // Pass 1 (highest confidence): bot's own tradeId-linked `order-placed`
+    //   events in exchange_events.jsonl — definitive pairing.
+    // Pass 2 (fallback): shared `matchName` from discovery_cache + pair_history
+    //   (when both sides have a non-empty matchName) — catches trades whose
+    //   events aren't yet on disk but whose watchlist pairing is intact.
+    // Pass 3 (last resort): tight ±30s time-proximity — catches trades where
+    //   pair_history has stub entries (empty matchName) but KAL + PM fired
+    //   together within the same second (typical parallel-mode behaviour).
+    // Pass 4: orphans → kal-only / pm-only rows.
     const kalUsed = new Set<number>();
     const pmUsed = new Set<number>();
 
-    for (const tp of eventTrades.values()) {
-      const kalMatched: number[] = [];
-      if (tp.kalTicker) {
-        for (let i = 0; i < kalBuys.length; i++) {
-          if (kalUsed.has(i)) continue;
-          const f = kalBuys[i];
-          if (f.ticker !== tp.kalTicker) continue;
-          if (Math.abs(f.tsMs - tp.earliestTs) > PAIR_WALLET_WINDOW_MS) continue;
-          kalMatched.push(i);
-        }
-      }
-      const pmMatchedIdx: number[] = [];
-      if (tp.pmTokenId) {
-        for (let i = 0; i < pmBuys.length; i++) {
-          if (pmUsed.has(i)) continue;
-          const b = pmBuys[i];
-          if (b.asset_id !== tp.pmTokenId) continue;
-          if (Math.abs(b.mtMs - tp.earliestTs) > PAIR_WALLET_WINDOW_MS) continue;
-          pmMatchedIdx.push(i);
-        }
-      }
-      if (kalMatched.length === 0 && pmMatchedIdx.length === 0) continue;
-      kalMatched.forEach(i => kalUsed.add(i));
-      pmMatchedIdx.forEach(i => pmUsed.add(i));
+    // Helper: aggregate a set of wallet fills into a TradeOut and push.
+    const emitTradeRow = (
+      kalFillIdxs: number[],
+      pmFillIdxs: number[],
+      opts: { kalTickerHint?: string; kalSideHint?: "yes" | "no"; tsHintMs?: number },
+    ): void => {
+      const kfills = kalFillIdxs.map(i => kalBuys[i]);
+      const pMatched = pmFillIdxs.map(i => pmBuys[i]);
+      const kalTicker = opts.kalTickerHint ?? kfills[0]?.ticker ?? "";
+      const kalSide: "yes" | "no" | null =
+        opts.kalSideHint ?? (kfills[0]?.side as "yes" | "no" | undefined) ?? null;
 
-      const kfills = kalMatched.map(i => kalBuys[i]);
-      const pMatched = pmMatchedIdx.map(i => pmBuys[i]);
-
-      const kalSide: "yes" | "no" | null = tp.kalSide ?? (kfills[0]?.side as "yes" | "no" | undefined) ?? null;
       const kalShares = kfills.reduce((s, f) => s + f.count, 0);
       const kalCost = kfills.reduce((s, f) => s + f.count * ((f.side === "yes" ? f.yesPrice : f.noPrice) / 100), 0);
       const kalFees = kfills.reduce((s, f) => s + f.feeCost, 0);
@@ -2016,16 +1978,10 @@ app.get("/api/daily-pnl", async (req, res) => {
       }, 0);
       const pmTokenIds = [...new Set(pMatched.map(t => t.asset_id))];
 
-      // kalRevenue: $1/share if this side won, 0 otherwise. (side, shares) math —
-      // not ticker-wide pro-rata; that mis-allocates when both YES and NO legs
-      // exist on the same ticker.
-      const winSide = tp.kalTicker ? tickerWinSide.get(tp.kalTicker) : undefined;
+      const winSide = kalTicker ? tickerWinSide.get(kalTicker) : undefined;
       const kalRevenue = (winSide && kalSide && winSide === kalSide) ? kalShares : 0;
-      const kalSettled = tp.kalTicker ? settledTickerSet.has(tp.kalTicker) : false;
+      const kalSettled = kalTicker ? settledTickerSet.has(kalTicker) : false;
 
-      // pmRevenue: allocate each paired token's currentValue by this trade's
-      // share of the token's total BUY pool in window (handles over-fills
-      // correctly — the extra PM shares boost this trade's Actual P&L).
       let pmRevenue = 0;
       let pmAllSettled = pmTokenIds.length > 0;
       let pmOutcome: string | null = null;
@@ -2043,35 +1999,164 @@ app.get("/api/daily-pnl", async (req, res) => {
       }
 
       const state: TradeOut["state"] = (kalSettled && pmAllSettled) ? "resolved" : (kalSettled || pmAllSettled) ? "partially-resolved" : "open";
-
       const paired = Math.min(kalShares, pmShares);
       const avgKalPx = kalShares > 0 ? kalCost / kalShares : 0;
       const avgPmPx = pmShares > 0 ? pmCost / pmShares : 0;
       const pairedKalFee = kalShares > 0 ? kalFees * (paired / kalShares) : 0;
       const pairedPmFee = pmShares > 0 ? pmFees * (paired / pmShares) : 0;
       const projectedPnl = paired * 1 - paired * (avgKalPx + avgPmPx) - pairedKalFee - pairedPmFee;
-
       const actualPnl = (kalRevenue + pmRevenue) - (kalCost + pmCost + kalFees + pmFees);
       const legType: TradeOut["legType"] = (kalShares > 0 && pmShares > 0) ? "2-leg" : kalShares > 0 ? "kal-only" : "pm-only";
 
-      // Display-only match name. Prefer watchlist/pair_history matchName (when
-      // populated), fall back to data-api title, then raw KAL ticker. None of
-      // this affects pairing — pairing already happened via tradeId above.
-      let matchName = tp.kalTicker ? (kalToPair.get(tp.kalTicker)?.matchName || "") : "";
+      // Display-only match name. Fallback chain: KAL watchlist matchName →
+      // PM watchlist/title → raw KAL ticker → truncated pmTokenId. For the
+      // orphan cases the PM title usually lands here via data-api enrichment.
+      let matchName = kalTicker ? (kalToPair.get(kalTicker)?.matchName || "") : "";
       if (!matchName) {
         for (const tid of pmTokenIds) {
           const mn = pmTokenToMatch.get(tid);
           if (mn) { matchName = mn; break; }
         }
       }
-      if (!matchName) matchName = tp.kalTicker || (pmTokenIds[0] ? `pm:${pmTokenIds[0].slice(0, 12)}…` : "unknown");
+      if (!matchName) matchName = kalTicker || (pmTokenIds[0] ? `pm:${String(pmTokenIds[0]).slice(0, 12)}…` : "unknown");
 
-      const ts = new Date(tp.earliestTs).toISOString();
+      const tsMs = opts.tsHintMs
+        ?? kfills[0]?.tsMs
+        ?? pMatched[0]?.mtMs
+        ?? Date.now();
+      const ts = new Date(tsMs).toISOString();
+
+      kalFillIdxs.forEach(i => kalUsed.add(i));
+      pmFillIdxs.forEach(i => pmUsed.add(i));
+
       trades.push({
         ts, day: ts.slice(0, 10), matchName,
-        kalTicker: tp.kalTicker ?? "", kalSide, kalShares, kalCost, kalFees, kalRevenue,
+        kalTicker, kalSide, kalShares, kalCost, kalFees, kalRevenue,
         pmTokenIds, pmOutcome, pmShares, pmCost, pmFees, pmRevenue,
         legType, state, projectedPnl, actualPnl,
+      });
+    };
+
+    // ── Pass 1: event-based pairing (most authoritative) ─────────────────────
+    type EventPair = { tradeId: string; kalTicker?: string; pmTokenId?: string; kalSide?: "yes" | "no"; earliestTs: number };
+    const eventTrades = new Map<string, EventPair>();
+    for (const e of getAllEvents()) {
+      if (e.type !== "order-placed") continue;
+      const tsMs = new Date(e.ts).getTime();
+      if (!Number.isFinite(tsMs) || tsMs < sinceMs) continue;
+      let tp = eventTrades.get(e.tradeId);
+      if (!tp) { tp = { tradeId: e.tradeId, earliestTs: tsMs }; eventTrades.set(e.tradeId, tp); }
+      tp.earliestTs = Math.min(tp.earliestTs, tsMs);
+      if (e.exchange === "kal" && e.ticker && !tp.kalTicker) {
+        tp.kalTicker = e.ticker;
+        if (e.side === "yes" || e.side === "no") tp.kalSide = e.side;
+      }
+      if (e.exchange === "pm" && e.tokenId && !tp.pmTokenId) tp.pmTokenId = e.tokenId;
+    }
+
+    const PAIR_WALLET_WINDOW_MS = 2 * 60 * 1000;
+    for (const tp of eventTrades.values()) {
+      const kalMatched: number[] = [];
+      if (tp.kalTicker) {
+        for (let i = 0; i < kalBuys.length; i++) {
+          if (kalUsed.has(i)) continue;
+          const f = kalBuys[i];
+          if (f.ticker !== tp.kalTicker) continue;
+          if (Math.abs(f.tsMs - tp.earliestTs) > PAIR_WALLET_WINDOW_MS) continue;
+          kalMatched.push(i);
+        }
+      }
+      const pmMatched: number[] = [];
+      if (tp.pmTokenId) {
+        for (let i = 0; i < pmBuys.length; i++) {
+          if (pmUsed.has(i)) continue;
+          const b = pmBuys[i];
+          if (b.asset_id !== tp.pmTokenId) continue;
+          if (Math.abs(b.mtMs - tp.earliestTs) > PAIR_WALLET_WINDOW_MS) continue;
+          pmMatched.push(i);
+        }
+      }
+      if (kalMatched.length === 0 && pmMatched.length === 0) continue;
+      emitTradeRow(kalMatched, pmMatched, {
+        kalTickerHint: tp.kalTicker,
+        kalSideHint: tp.kalSide,
+        tsHintMs: tp.earliestTs,
+      });
+    }
+
+    // ── Pass 2: name-based pairing (shared non-empty matchName) ──────────────
+    // Build KAL clusters of still-unused fills; for each, find unused PM
+    // clusters on the same match within ±2 min. matchName must be non-empty
+    // on BOTH sides to avoid pairing two stub pair_history entries (each
+    // with matchName="") as if they belonged together.
+    type IdxCluster = { ticker: string; side: "yes" | "no"; firstMs: number; fillIdxs: number[] };
+    const kalClustersP2: IdxCluster[] = [];
+    for (let i = 0; i < kalBuys.length; i++) {
+      if (kalUsed.has(i)) continue;
+      const f = kalBuys[i];
+      const side = (f.side as "yes" | "no") ?? "yes";
+      const existing = kalClustersP2.find(c => c.ticker === f.ticker && c.side === side && Math.abs(c.firstMs - f.tsMs) < KAL_CLUSTER_MS);
+      if (existing) existing.fillIdxs.push(i);
+      else kalClustersP2.push({ ticker: f.ticker, side, firstMs: f.tsMs, fillIdxs: [i] });
+    }
+    type PmIdxCluster = { tokenId: string; firstMs: number; fillIdxs: number[] };
+    const pmClustersP2: PmIdxCluster[] = [];
+    for (let i = 0; i < pmBuys.length; i++) {
+      if (pmUsed.has(i)) continue;
+      const b = pmBuys[i];
+      const existing = pmClustersP2.find(c => c.tokenId === b.asset_id && Math.abs(c.firstMs - b.mtMs) < KAL_CLUSTER_MS);
+      if (existing) existing.fillIdxs.push(i);
+      else pmClustersP2.push({ tokenId: b.asset_id, firstMs: b.mtMs, fillIdxs: [i] });
+    }
+    const PAIR_NAME_WINDOW_MS = 2 * 60 * 1000;
+    for (const kc of kalClustersP2) {
+      if (kc.fillIdxs.every(i => kalUsed.has(i))) continue;
+      const kalMatchName = kalToPair.get(kc.ticker)?.matchName || "";
+      if (!kalMatchName) continue;
+      const matchedPmIdxs: number[] = [];
+      for (const pc of pmClustersP2) {
+        if (pc.fillIdxs.every(i => pmUsed.has(i))) continue;
+        const pmMatchName = pmTokenToMatch.get(pc.tokenId) || "";
+        if (!pmMatchName || pmMatchName !== kalMatchName) continue;
+        if (Math.abs(pc.firstMs - kc.firstMs) > PAIR_NAME_WINDOW_MS) continue;
+        for (const i of pc.fillIdxs) if (!pmUsed.has(i)) matchedPmIdxs.push(i);
+      }
+      if (matchedPmIdxs.length === 0) {
+        // still emit a kal-only row so the name-matched KAL cluster is shown
+        // — but only if no PM side can be found at all. Let pass 3 try first.
+        continue;
+      }
+      const kalIdxs = kc.fillIdxs.filter(i => !kalUsed.has(i));
+      emitTradeRow(kalIdxs, matchedPmIdxs, {
+        kalTickerHint: kc.ticker,
+        kalSideHint: kc.side,
+        tsHintMs: kc.firstMs,
+      });
+    }
+
+    // ── Pass 3: time-proximity pairing (tight ±30s window) ──────────────────
+    // For still-unused KAL clusters, find the nearest unused PM cluster within
+    // ±30s. Requires exactly one candidate (≥2 = ambiguous, skip). This
+    // catches trades where pair_history has stub entries (empty matchName on
+    // both sides) but KAL + PM actually fired together at the same moment.
+    const PAIR_TIME_WINDOW_MS = 30 * 1000;
+    for (const kc of kalClustersP2) {
+      if (kc.fillIdxs.every(i => kalUsed.has(i))) continue;
+      const candidates: PmIdxCluster[] = [];
+      for (const pc of pmClustersP2) {
+        if (pc.fillIdxs.every(i => pmUsed.has(i))) continue;
+        if (Math.abs(pc.firstMs - kc.firstMs) > PAIR_TIME_WINDOW_MS) continue;
+        candidates.push(pc);
+      }
+      if (candidates.length !== 1) continue;
+      const pc = candidates[0];
+      const kalIdxs = kc.fillIdxs.filter(i => !kalUsed.has(i));
+      const pmIdxs = pc.fillIdxs.filter(i => !pmUsed.has(i));
+      if (kalIdxs.length === 0 || pmIdxs.length === 0) continue;
+      emitTradeRow(kalIdxs, pmIdxs, {
+        kalTickerHint: kc.ticker,
+        kalSideHint: kc.side,
+        tsHintMs: Math.min(kc.firstMs, pc.firstMs),
       });
     }
 
