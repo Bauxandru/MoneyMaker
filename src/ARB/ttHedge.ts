@@ -2591,27 +2591,40 @@ export async function runHedgeCycle(state: HedgeState, clobBase: string): Promis
         }
       }
 
-      // KAL fallback: when PM balance insufficient, hedge on KAL opposite side
-      if (!placed && sharesNeeded > 0 && pmBalanceFailedKH) {
+      // KAL hedge path: triggers when
+      //   (a) PM balance insufficient (legacy fallback), OR
+      //   (b) sharesNeeded < 5 — below PM's per-market minimum (5 shares /
+      //       $1 marketable). Per user spec 2026-04-20: small hedges MUST
+      //       go to Kalshi because PM rejects them. Without this branch,
+      //       a KAL-held position of 2 shares never gets hedged (PM FAK +
+      //       GTC paths are both gated on sharesNeeded >= 5 earlier).
+      // Hedge uses same ticker + opposite side (YES ↔ NO) — economically
+      // equivalent to buying YES on the paired kal2/kal1 ticker, simpler
+      // to execute. pos.kalOppLeg is available on synthetic positions for
+      // future use (e.g. if price is better on the paired market).
+      const isSmallGapForPm = sharesNeeded > 0 && sharesNeeded < 5;
+      const hasActiveKalComplete = [...activeOrders.values()].some(o => o.role === "complete" && o.exchange === "kal");
+      if (!placed && sharesNeeded > 0 && !hasActiveKalComplete && (pmBalanceFailedKH || isSmallGapForPm)) {
         const hedgeKalSide: "yes" | "no" = pos.kalSide === "yes" ? "no" : "yes";
         // KAL GTC fills as maker — use maker fee rate (1.75%)
         const kalOppFeeReserve = KALSHI_MAKER_FEE_RATE * (1 - pos.kalCostBasis) * pos.kalCostBasis;
         const maxKalOppPrice = 1 - pos.kalCostBasis - kalOppFeeReserve;
         const kalOppCents = Math.max(1, Math.min(99, Math.floor(maxKalOppPrice * 100 + 1e-9)));
         const order = buildKalshiGTCOrder(pos.kalLeg.ticker, "buy", hedgeKalSide, kalOppCents, sharesNeeded);
+        const reason = pmBalanceFailedKH ? "pm-balance-insufficient" : "small-gap-below-pm-min";
         try {
-          console.log(`[HEDGE] PM balance insufficient. Falling back to KAL GTC ${hedgeKalSide.toUpperCase()} @ ${kalOppCents}c`);
+          console.log(`[HEDGE] KAL hedge (${reason}): ${hedgeKalSide.toUpperCase()} ${sharesNeeded}x on ${pos.kalLeg.ticker.slice(0, 40)} @ ${kalOppCents}c`);
           const res = await placeKalshiOrder(order, DRY_RUN);
           const meta = extractKalMeta(res);
           const oid = DRY_RUN ? `dry-kal-bal-${Date.now()}` : String(meta.orderId ?? "");
           if (oid) {
             activeOrders.set(oid, { role: "complete", exchange: "kal", orderId: oid, price: kalOppCents / 100, shares: sharesNeeded, filledSoFar: 0, fetchFailures: 0, placedAt: Date.now() });
             saveHedgeState(state);
-            console.log(`[HEDGE] Placed KAL GTC fallback ${sharesNeeded}x${hedgeKalSide.toUpperCase()}@${fmtPct(kalOppCents / 100)}. orderId=${oid}`);
-            audit({ module: "hedge", fn: "runHedgeCycle", action: "hedge-gtc-kal-placed", tradeId: pos.tradeId, kalTicker: pos.kalLeg.ticker, shares: sharesNeeded, price: kalOppCents / 100, context: { orderId: oid, side: hedgeKalSide, role: "complete", reason: "pm-balance-insufficient" } });
+            console.log(`[HEDGE] Placed KAL GTC (${reason}) ${sharesNeeded}x${hedgeKalSide.toUpperCase()}@${fmtPct(kalOppCents / 100)}. orderId=${oid}`);
+            audit({ module: "hedge", fn: "runHedgeCycle", action: "hedge-gtc-kal-placed", tradeId: pos.tradeId, kalTicker: pos.kalLeg.ticker, shares: sharesNeeded, price: kalOppCents / 100, context: { orderId: oid, side: hedgeKalSide, role: "complete", reason } });
           }
         } catch (e) {
-          console.error(`[HEDGE] KAL balance fallback failed: ${(e as Error).message}`);
+          console.error(`[HEDGE] KAL hedge (${reason}) failed: ${(e as Error).message}`);
         }
       }
     }

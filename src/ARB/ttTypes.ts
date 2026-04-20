@@ -195,6 +195,11 @@ export type UnhedgedPosition = {
   pmOppLeg: PmLeg | null;       // the OTHER PM outcome token
   pmCostBasis: number;          // price paid per PM share (0 if not held yet)
   kalLeg: KalshiLeg;
+  kalOppLeg?: KalshiLeg | null; // the OTHER Kalshi ticker for the same match — used for
+                                // small-share hedges that would fall below PM's min-size
+                                // threshold. Populated by _planAutoHedge / watchlist enrich.
+                                // Null for markets where no paired Kalshi ticker exists
+                                // (e.g. isBinary totals where kal1.ticker === kal2.ticker).
   kalCostBasis: number;         // price paid per Kalshi contract (0 if not held yet)
   kalSide: "yes" | "no";       // which KAL side was bought (dirs A/B=yes, C/D=no)
   sharesHeld: number;           // unhedged shares/contracts remaining

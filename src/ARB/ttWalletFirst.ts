@@ -501,6 +501,7 @@ type AutoHedgePlan = {
   sharesHeld?: number;
   initialCost?: number;
   kalLeg?: KalshiLeg;
+  kalOppLeg?: KalshiLeg | null;  // opposite Kalshi ticker for cross-KAL hedge (2-way moneyline only)
   pmLeg?: PmLeg;
   pmOppLeg?: PmLeg | null;
   kalSide?: "yes" | "no";
@@ -555,31 +556,37 @@ function _planAutoHedge(
       if (shares <= 0) continue;
       const avgPrice = kp.avgPriceCents / 100;
       let kalLeg: KalshiLeg | null = null;
+      let kalOppLeg: KalshiLeg | null = null;
       let pmLeg: PmLeg | null = null;
       let pmOppLeg: PmLeg | null = null;
       // Arb mapping:
       //   YES on kalN → opposite PM = pm[other]  (pair wins on either outcome)
       //   NO  on kalN → same-index PM = pmN      (pair wins on either outcome)
+      // kalOppLeg = the OTHER Kalshi ticker on the same match. Only meaningful for
+      // 2-way moneyline where kal1.ticker !== kal2.ticker (distinct markets per
+      // player). For isBinary totals/spreads, kal1 === kal2 so no paired ticker.
+      const hasSeparateKalMarkets = entry.kal1?.ticker && entry.kal2?.ticker && entry.kal1.ticker !== entry.kal2.ticker;
       if (entry.kal1?.ticker === ticker) {
         kalLeg = entry.kal1;
+        if (hasSeparateKalMarkets) kalOppLeg = entry.kal2;
         pmLeg = side === "yes" ? entry.pm2 : entry.pm1;
         pmOppLeg = side === "yes" ? entry.pm1 : entry.pm2;
       } else if (entry.kal2?.ticker === ticker) {
         kalLeg = entry.kal2;
+        if (hasSeparateKalMarkets) kalOppLeg = entry.kal1;
         pmLeg = side === "yes" ? entry.pm1 : entry.pm2;
         pmOppLeg = side === "yes" ? entry.pm2 : entry.pm1;
       } else if (entry.kal3?.ticker === ticker && entry.pm3) {
         kalLeg = entry.kal3;
-        // 3-way: NO on draw ~ 1st-or-2nd wins (not draw); best PM hedge is pm3 (draw token)
-        // YES on draw = draw wins; hedge with pm1+pm2 (either non-draw). Simplified: use pm1.
+        // 3-way draw market — no single "opposite" Kalshi ticker, so no kalOppLeg
         pmLeg = side === "yes" ? entry.pm1 : entry.pm3;
         pmOppLeg = side === "yes" ? entry.pm3 : entry.pm1;
       }
       if (!kalLeg || !pmLeg) continue;
       return {
-        eligible: true, reason: `KAL-only ${shares}×${side} on ${ticker} — auto-create PM hedge`,
+        eligible: true, reason: `KAL-only ${shares}×${side} on ${ticker} — auto-create hedge (gap=${shares}, venue=${shares < 5 ? "KAL-vs-KAL" : "PM"})`,
         heldExchange: "kal", sharesHeld: shares, initialCost: shares * avgPrice,
-        kalLeg, pmLeg, pmOppLeg, kalSide: side, kalCostBasis: avgPrice,
+        kalLeg, kalOppLeg, pmLeg, pmOppLeg, kalSide: side, kalCostBasis: avgPrice,
       };
     }
     return { eligible: false, reason: "kal-only but no usable ticker mapping" };
@@ -590,15 +597,23 @@ function _planAutoHedge(
     let pmLeg: PmLeg | null = null;
     let pmOppLeg: PmLeg | null = null;
     let kalLeg: KalshiLeg | null = null;
+    let kalOppLeg: KalshiLeg | null = null;
     const kalSide: "yes" | "no" = "no"; // PM pmN ↔ KAL kalN NO side (opposite outcomes)
-    if (entry.pm1?.tokenId === tid) { pmLeg = entry.pm1; pmOppLeg = entry.pm2; kalLeg = entry.kal1; }
-    else if (entry.pm2?.tokenId === tid) { pmLeg = entry.pm2; pmOppLeg = entry.pm1; kalLeg = entry.kal2; }
-    else if (entry.pm3?.tokenId === tid) { pmLeg = entry.pm3; pmOppLeg = entry.pm1; kalLeg = entry.kal3 ?? entry.kal1; }
+    const hasSeparateKalMarkets = entry.kal1?.ticker && entry.kal2?.ticker && entry.kal1.ticker !== entry.kal2.ticker;
+    if (entry.pm1?.tokenId === tid) {
+      pmLeg = entry.pm1; pmOppLeg = entry.pm2; kalLeg = entry.kal1;
+      if (hasSeparateKalMarkets) kalOppLeg = entry.kal2;
+    } else if (entry.pm2?.tokenId === tid) {
+      pmLeg = entry.pm2; pmOppLeg = entry.pm1; kalLeg = entry.kal2;
+      if (hasSeparateKalMarkets) kalOppLeg = entry.kal1;
+    } else if (entry.pm3?.tokenId === tid) {
+      pmLeg = entry.pm3; pmOppLeg = entry.pm1; kalLeg = entry.kal3 ?? entry.kal1;
+    }
     if (!pmLeg || !kalLeg) continue;
     return {
-      eligible: true, reason: `PM-only ${p.shares}×${p.outcome} on ${tid.slice(0, 20)}… — auto-create KAL hedge`,
+      eligible: true, reason: `PM-only ${p.shares}×${p.outcome} on ${tid.slice(0, 20)}… — auto-create hedge (gap=${p.shares}, venue=${p.shares >= 5 ? "PM-vs-PM" : "KAL"})`,
       heldExchange: "pm", sharesHeld: p.shares, initialCost: p.shares * p.avgPrice,
-      kalLeg, pmLeg, pmOppLeg, kalSide, pmCostBasis: p.avgPrice,
+      kalLeg, kalOppLeg, pmLeg, pmOppLeg, kalSide, pmCostBasis: p.avgPrice,
     };
   }
   return { eligible: false, reason: "pm-only but no usable token mapping" };
@@ -653,6 +668,7 @@ function _createSyntheticHedge(wpm: WalletPositionsByMatch, plan: AutoHedgePlan,
     pmOppLeg: plan.pmOppLeg ?? null,
     pmCostBasis: plan.pmCostBasis ?? 0,
     kalLeg: plan.kalLeg,
+    kalOppLeg: plan.kalOppLeg ?? null,
     kalCostBasis: plan.kalCostBasis ?? 0,
     kalSide: plan.kalSide ?? "yes",
     sharesHeld: shares,
