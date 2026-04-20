@@ -19,6 +19,7 @@ import { fetchAllKalshiFills, fetchAllKalshiSettlements, fetchKalshiMarket, fetc
 import { ClobClient } from "@polymarket/clob-client";
 import { Wallet } from "@ethersproject/wallet";
 import { resolvePolyApiCreds } from "./polyAuth.js";
+import { takeSessionSnapshot, appendSessionSnapshot } from "./sessionSnapshot.js";
 
 
 const __filename = typeof import.meta?.url === "string" ? fileURLToPath(import.meta.url) : __filename ?? process.argv[1] ?? "";
@@ -44,7 +45,7 @@ const TRADE_MIN_DATE = process.env.DASHBOARD_MIN_DATE || "2026-04-01";
 const AUDIT_CUTOFF_DATE = process.env.AUDIT_CUTOFF_DATE || new Date().toISOString().slice(0, 10);
 
 // -- Multi-user data store (for remote bots pushing via /api/ingest) ----------
-import { readFileSync as _readFs, writeFileSync as _writeFs, appendFileSync } from "fs";
+import { readFileSync as _readFs, writeFileSync as _writeFs, appendFileSync, writeFileSync, renameSync } from "fs";
 
 interface RemoteUserData {
   name: string;
@@ -1440,6 +1441,823 @@ app.get("/api/watchlist", (_req, res) => {
 //   - No estimates, no heuristics, no arb_trades.json dependency.
 //   - Discovery cache is used ONLY for pairing (kalTicker ↔ pmTokenId), not
 //     for any monetary values.
+// /api/daily-pnl — per-match realized P&L grouped by settlement day.
+// Pairs KAL + PM legs using discovery_cache + pair_history, computes revenue - cost - fees
+// per match, aggregates by settledTime date (or lastFillTs if still open).
+app.get("/api/daily-pnl", async (req, res) => {
+  try {
+    const days = Math.max(1, Math.min(90, parseInt(String(req.query.days ?? "14"), 10) || 14));
+    const sinceMs = Date.now() - days * 86400_000;
+
+    // --- 1. Build KAL ticker ↔ PM token map (current watchlist + historical pair_history) ---
+    type PairInfo = { matchName: string; pmTokenIds: string[] };
+    const kalToPair = new Map<string, PairInfo>();      // kalTicker → {matchName, pmTokens[]}
+    const pmTokenToMatch = new Map<string, string>();    // pmTokenId → matchName (for enrichment)
+    try {
+      const cachePath = join(ROOT, "discovery_cache.json");
+      if (existsSync(cachePath)) {
+        const wl = JSON.parse(readFileSync(cachePath, "utf8"))?.watchlist ?? [];
+        for (const w of wl) {
+          const mn = `${w.kal1?.surname ?? ""} vs ${w.kal2?.surname ?? ""}`;
+          const tokens = [w.pm1?.tokenId, w.pm2?.tokenId, w.pm3?.tokenId, w.pm1?.noTokenId, w.pm2?.noTokenId, w.pm3?.noTokenId].filter(Boolean);
+          if (w.kal1?.ticker) kalToPair.set(w.kal1.ticker, { matchName: mn, pmTokenIds: tokens });
+          if (w.kal2?.ticker) kalToPair.set(w.kal2.ticker, { matchName: mn, pmTokenIds: tokens });
+          if (w.kal3?.ticker) kalToPair.set(w.kal3.ticker, { matchName: mn, pmTokenIds: tokens });
+          for (const t of tokens) pmTokenToMatch.set(t, mn);
+        }
+      }
+    } catch { /* non-fatal */ }
+    try {
+      const { loadPairHistory } = await import("./ARB/ttPairHistory.js");
+      const hist = loadPairHistory();
+      for (const [kt, h] of hist) {
+        if (!kalToPair.has(kt)) kalToPair.set(kt, { matchName: h.matchName, pmTokenIds: h.pmTokenId ? [h.pmTokenId] : [] });
+        if (h.pmTokenId && !pmTokenToMatch.has(h.pmTokenId)) pmTokenToMatch.set(h.pmTokenId, h.matchName);
+      }
+    } catch { /* non-fatal */ }
+    // Also enrich PM tokens from data-api /positions (catches untracked tokens)
+    try {
+      const funder = process.env.POLY_FUNDER;
+      if (funder) {
+        const r = await fetch(`https://data-api.polymarket.com/positions?user=${funder}&sizeThreshold=0`);
+        if (r.ok) {
+          const positions = await r.json() as any[];
+          for (const p of positions) {
+            if (p.asset && !pmTokenToMatch.has(p.asset)) pmTokenToMatch.set(p.asset, p.title ?? "");
+          }
+        }
+      }
+    } catch { /* non-fatal */ }
+
+    // --- 2. Fetch data in parallel ---
+    const [kalFills, kalSettlements] = await Promise.all([
+      fetchAllKalshiFills().catch(() => [] as KalFill[]),
+      fetchAllKalshiSettlements().catch(() => [] as any[]),
+    ]);
+
+    // PM fills via CLOB client
+    let pmFills: ClobTrade[] = [];
+    try {
+      const pk = process.env.POLY_WALLET_PRIVATE_KEY;
+      if (pk) {
+        const host = process.env.POLY_CLOB_URL ?? "https://clob.polymarket.com";
+        const chainId = Number(process.env.POLY_CHAIN_ID ?? 137);
+        const sigType = Number(process.env.POLY_SIGNATURE_TYPE ?? 0);
+        const funder = process.env.POLY_FUNDER;
+        const wallet = new Wallet(pk);
+        const creds = await resolvePolyApiCreds({ host, chainId, sigType, wallet });
+        const client = new ClobClient(host, chainId, wallet, creds, sigType, funder);
+        pmFills = (await client.getTrades()) as unknown as ClobTrade[];
+      }
+    } catch { /* non-fatal */ }
+
+    // PM positions (for settled-winner/loser classification and mark-to-market)
+    let pmPositions: any[] = [];
+    // PM redeem activity (to capture on-chain redemptions — positions that vanished
+    // from /positions when user redeemed for USDC). Without this, we lose ~$500/day
+    // of winning-position revenue from our P&L calculation.
+    let pmRedeemEvents: any[] = [];
+    try {
+      const funder = process.env.POLY_FUNDER;
+      if (funder) {
+        const [posRes, actRes] = await Promise.all([
+          fetch(`https://data-api.polymarket.com/positions?user=${funder}&sizeThreshold=0`).then(r => r.ok ? r.json() : []).catch(() => []),
+          fetch(`https://data-api.polymarket.com/activity?user=${funder}&limit=500&type=REDEEM`).then(r => r.ok ? r.json() : []).catch(() => []),
+        ]);
+        pmPositions = posRes as any[];
+        pmRedeemEvents = (actRes as any[]).filter((e: any) => Number(e.usdcSize) > 0 && Number(e.timestamp) * 1000 >= sinceMs);
+      }
+    } catch { /* non-fatal */ }
+    const pmPosByToken = new Map<string, any>();
+    for (const p of pmPositions) { if (p.asset) pmPosByToken.set(p.asset, p); }
+    // Build conditionId → matchName map from positions (for mapping redeem events
+    // to matches — REDEEM events have conditionId but no asset_id).
+    const conditionIdToMatch = new Map<string, string>();
+    for (const p of pmPositions) {
+      if (p.conditionId && p.asset && pmTokenToMatch.has(p.asset)) {
+        conditionIdToMatch.set(p.conditionId, pmTokenToMatch.get(p.asset)!);
+      }
+    }
+
+    // --- 3. Auto-detect Kalshi settlement units (cents vs dollars) ---
+    let settInCents = true;
+    if (kalSettlements.length > 0) {
+      const s0 = kalSettlements[0];
+      const totalC = (s0.yesCount || 0) + (s0.noCount || 0);
+      if (totalC > 0) settInCents = (s0.revenue / totalC) > 1.5;
+    }
+    const settDiv = settInCents ? 100 : 1;
+
+    // --- 4. Build per-match rollups ---
+    type MatchRollup = {
+      matchKey: string;
+      matchName: string;
+      kalTickers: Set<string>;
+      pmTokenIds: Set<string>;
+      firstFillMs: number;
+      lastFillMs: number;
+      kalBuyCost: number; kalSellRevenue: number; kalFees: number;
+      kalSettleRevenue: number; kalSettleCost: number; kalSettleFees: number;
+      kalSettledResults: string[];   // "yes" / "no" for each settled ticker
+      pmBuyCost: number; pmSellRevenue: number; pmFees: number;
+      pmMarkValueOpen: number;       // currentValue of still-open positions → contributes to unrealized
+      pmMarkValueSettled: number;    // currentValue of settled positions still held (~shares×$1 for winners, ~0 for losers) → realized
+      pmRedeemRevenue: number;       // USDC received from on-chain redemptions (from /activity?type=REDEEM)
+      pmStatuses: string[];          // "OPEN" / "WINNER" / "LOSER" per position
+      lastSettledMs: number;
+    };
+    const matches = new Map<string, MatchRollup>();
+    const getMatch = (key: string, name: string): MatchRollup => {
+      let m = matches.get(key);
+      if (!m) {
+        m = {
+          matchKey: key, matchName: name,
+          kalTickers: new Set(), pmTokenIds: new Set(),
+          firstFillMs: Infinity, lastFillMs: 0,
+          kalBuyCost: 0, kalSellRevenue: 0, kalFees: 0,
+          kalSettleRevenue: 0, kalSettleCost: 0, kalSettleFees: 0,
+          kalSettledResults: [],
+          pmBuyCost: 0, pmSellRevenue: 0, pmFees: 0,
+          pmMarkValueOpen: 0, pmMarkValueSettled: 0, pmRedeemRevenue: 0,
+          pmStatuses: [],
+          lastSettledMs: 0,
+        };
+        matches.set(key, m);
+      }
+      return m;
+    };
+
+    // KAL fills → rollup
+    for (const f of kalFills) {
+      const tsMs = new Date(f.ts).getTime();
+      if (!Number.isFinite(tsMs) || tsMs < sinceMs) continue;
+      const pair = kalToPair.get(f.ticker);
+      const matchName = pair?.matchName || f.ticker;
+      const key = pair?.matchName || `kal:${f.ticker}`;
+      const m = getMatch(key, matchName);
+      m.kalTickers.add(f.ticker);
+      m.firstFillMs = Math.min(m.firstFillMs, tsMs);
+      m.lastFillMs = Math.max(m.lastFillMs, tsMs);
+      const priceCents = (f.side === "yes") ? f.yesPrice : f.noPrice;
+      const cost = f.count * (priceCents / 100);
+      m.kalFees += f.feeCost;
+      if (f.action === "buy") m.kalBuyCost += cost; else m.kalSellRevenue += cost;
+    }
+
+    // KAL settlements → rollup
+    for (const s of kalSettlements) {
+      const tsMs = new Date(s.settledTime).getTime();
+      if (!Number.isFinite(tsMs) || tsMs < sinceMs) continue;
+      const pair = kalToPair.get(s.ticker);
+      const matchName = pair?.matchName || s.ticker;
+      const key = pair?.matchName || `kal:${s.ticker}`;
+      const m = getMatch(key, matchName);
+      m.kalTickers.add(s.ticker);
+      m.kalSettleRevenue += (s.revenue || 0) / settDiv;
+      m.kalSettleCost += ((s.yesCost || 0) + (s.noCost || 0)) / settDiv;
+      m.kalSettleFees += (s.feeCost || 0);
+      if (s.marketResult) m.kalSettledResults.push(s.marketResult);
+      m.lastSettledMs = Math.max(m.lastSettledMs, tsMs);
+    }
+
+    // PM fills → rollup
+    for (const t of pmFills) {
+      if (t.trader_side === "MAKER") continue;
+      const mtRaw = t.match_time;
+      const mtMs = (typeof mtRaw === "string" && /^\d+$/.test(mtRaw)) ? Number(mtRaw) * 1000 : new Date(mtRaw).getTime();
+      if (!Number.isFinite(mtMs) || mtMs < sinceMs) continue;
+      const matchName = pmTokenToMatch.get(t.asset_id) || `pm:${t.asset_id.slice(0, 12)}…`;
+      const key = matchName.startsWith("pm:") ? matchName : matchName;
+      const m = getMatch(key, matchName);
+      m.pmTokenIds.add(t.asset_id);
+      m.firstFillMs = Math.min(m.firstFillMs, mtMs);
+      m.lastFillMs = Math.max(m.lastFillMs, mtMs);
+      const size = Number(t.size); const price = Number(t.price);
+      const baseCost = size * price;
+      const feeBps = Number(t.fee_rate_bps ?? 0);
+      const fee = baseCost * (feeBps / 10000);
+      m.pmFees += fee;
+      if ((t.side || "").toLowerCase() === "sell") m.pmSellRevenue += baseCost;
+      else m.pmBuyCost += baseCost;
+    }
+
+    // PM positions → bucket currentValue into settled vs open.
+    // Use raw currentValue (not cashPnl) because cost basis comes from fills — we
+    // don't want PM's built-in cost subtraction applied twice.
+    const nowMs = Date.now();
+    for (const p of pmPositions) {
+      const tokenId = p.asset;
+      if (!tokenId) continue;
+      const matchName = pmTokenToMatch.get(tokenId) || p.title || `pm:${String(tokenId).slice(0, 12)}`;
+      const m = matches.get(matchName);
+      if (!m) continue;
+      const curVal = Number(p.currentValue ?? 0);
+      const size = Number(p.size ?? 0);
+
+      const endMs = p.endDate ? new Date(p.endDate).getTime() : NaN;
+      const endDatePast = Number.isFinite(endMs) && endMs < nowMs;
+      const ratio = size > 0 ? curVal / size : 0;
+      const priceLocked = size > 0 && (ratio > 0.95 || ratio < 0.05);
+      const settled = endDatePast || priceLocked;
+
+      if (settled) {
+        m.pmMarkValueSettled += curVal;
+        if (ratio > 0.95) m.pmStatuses.push("WINNER");
+        else m.pmStatuses.push("LOSER");
+      } else {
+        m.pmMarkValueOpen += curVal;
+        m.pmStatuses.push("OPEN");
+      }
+    }
+
+    // PM REDEEM events → rollup. These capture USDC flowing back when a winning
+    // position was redeemed on-chain (and disappears from /positions). Critical —
+    // without this, ~$500/day of PM redemption revenue is unaccounted for.
+    //
+    // Map each redeem event to an existing match via:
+    //   1. conditionId → matchName (from positions that are still held)
+    //   2. title → matchName (from positions titles, aliased to watchlist names)
+    //   3. eventSlug → matchName (from watchlist pmSlug)
+    //   4. direct title match (if fills created a match keyed by the PM title)
+    // If no mapping → redeem revenue is unattributed (shown in a summary bucket).
+    const titleToMatchName = new Map<string, string>();
+    const slugToMatchName = new Map<string, string>();
+    // From positions: title → whichever matchName the token maps to
+    for (const p of pmPositions) {
+      if (p.title && p.asset && pmTokenToMatch.has(p.asset)) {
+        titleToMatchName.set(p.title, pmTokenToMatch.get(p.asset)!);
+      }
+      if (p.slug && p.asset && pmTokenToMatch.has(p.asset)) {
+        slugToMatchName.set(p.slug, pmTokenToMatch.get(p.asset)!);
+      }
+    }
+    // From discovery watchlist: pmSlug → matchName
+    try {
+      const wlPath = join(ROOT, "discovery_cache.json");
+      if (existsSync(wlPath)) {
+        const wl = JSON.parse(readFileSync(wlPath, "utf8"))?.watchlist ?? [];
+        for (const w of wl) {
+          const mn = `${w.kal1?.surname ?? ""} vs ${w.kal2?.surname ?? ""}`;
+          if (w.pmSlug) slugToMatchName.set(w.pmSlug, mn);
+        }
+      }
+    } catch { /* ignore */ }
+    // Also: titles already used as match keys (when fills had no watchlist match,
+    // we keyed by the PM title → matches.get(title) works directly)
+    for (const mk of matches.keys()) {
+      if (!titleToMatchName.has(mk)) titleToMatchName.set(mk, mk);
+    }
+
+    // Track redemptions that don't map to a match (typically old matches whose
+    // watchlist entry has rotated out). Bucket them by day so daily totals still reflect them.
+    const unmappedRedeemByDay = new Map<string, number>();
+    let unmappedRedeemTotal = 0;
+    let unmappedRedeemCount = 0;
+    for (const e of pmRedeemEvents) {
+      const usd = Number(e.usdcSize);
+      if (!(usd > 0)) continue;
+      let matchName: string | undefined = undefined;
+      if (e.conditionId) matchName = conditionIdToMatch.get(e.conditionId);
+      if (!matchName && e.title) matchName = titleToMatchName.get(e.title);
+      if (!matchName && e.eventSlug) matchName = slugToMatchName.get(e.eventSlug);
+      if (!matchName && e.slug) matchName = slugToMatchName.get(e.slug);
+      const m = matchName ? matches.get(matchName) : undefined;
+      if (m) {
+        m.pmRedeemRevenue += usd;
+        const ts = Number(e.timestamp) * 1000;
+        if (Number.isFinite(ts)) m.lastSettledMs = Math.max(m.lastSettledMs, ts);
+      } else {
+        unmappedRedeemTotal += usd;
+        unmappedRedeemCount++;
+        const ts = Number(e.timestamp) * 1000;
+        const day = new Date(ts).toISOString().slice(0, 10);
+        unmappedRedeemByDay.set(day, (unmappedRedeemByDay.get(day) || 0) + usd);
+      }
+    }
+    if (unmappedRedeemTotal > 0) {
+      console.log(`[DAILY-PNL] Unmapped redeem events: ${unmappedRedeemCount} events totaling $${unmappedRedeemTotal.toFixed(2)} — bucketed by day in daily totals`);
+    }
+
+    // --- 5. Per-match P&L calculation ---
+    // Accounting principle: Kalshi's `settlement` object already includes the cost basis
+    // (yesCost/noCost) for the settled ticker, so we do NOT re-add fills cost for
+    // settled tickers — that would double-count. For unsettled KAL tickers we rely
+    // on fills alone (net buy-sell) plus any current position mark (which we don't
+    // fetch in this endpoint — treated as zero here; use Wallet Arbs for open-position mark).
+    //
+    // PM P&L is: fills net (sell revenue - buy cost - fees) + current mark of still-held
+    // positions. This MISSES on-chain redemption revenue (when a winning PM position is
+    // redeemed, USDC flows back but /positions and getTrades() don't show a "sell" event).
+    // For redeemable positions still held, currentValue ~= shares × $1 which captures
+    // the redemption value correctly. Only fully-redeemed positions that disappeared
+    // from /positions lose revenue — and we approximate those by treating "not in
+    // positions" as "already received $1/share IF match result matched PM outcome".
+    // This approximation is good enough for day-over-day tracking; compare against
+    // wealth delta for ground truth.
+    const settledTickerSet = new Set<string>();
+    for (const s of kalSettlements) settledTickerSet.add(s.ticker);
+
+    type MatchOut = {
+      matchName: string;
+      firstFillTs: string; lastFillTs: string; settledTs: string | null;
+      state: "resolved" | "partially-resolved" | "open";
+      day: string;
+      kalTickers: string[]; pmTokenCount: number;
+      kalCost: number; kalRevenue: number; kalFees: number;
+      pmCost: number; pmRevenue: number; pmFees: number;
+      realizedPnl: number; unrealizedPnl: number;
+      kalSettledResults: string[]; pmStatuses: string[];
+    };
+    const matchOuts: MatchOut[] = [];
+    for (const m of matches.values()) {
+      const kalResolved = m.kalSettledResults.length > 0 && [...m.kalTickers].every(t => settledTickerSet.has(t));
+      const pmResolved = m.pmTokenIds.size === 0 || (m.pmStatuses.length > 0 && m.pmStatuses.every(s => s === "WINNER" || s === "LOSER"));
+      const state: MatchOut["state"] = (kalResolved && pmResolved) ? "resolved" : (kalResolved || pmResolved) ? "partially-resolved" : "open";
+
+      // KAL P&L — mirror the verified-pnl endpoint accounting:
+      //   Settlement `revenue` is GROSS payout (shares × $1 per winning contract).
+      //   Settlement's `yesCost`/`noCost` is INFORMATIONAL only — the user's cost
+      //   basis is already captured in fills' `kalBuyCost`. Don't subtract it again.
+      //
+      //   Split fills by ticker-settled-or-not so we separate realized from unrealized:
+      //     - Settled ticker fills:  buyCost offsets settlement revenue (realized)
+      //     - Unsettled ticker fills: net buy/sell = unrealized (position held or flat)
+      let kalSettledBuyCost = 0, kalSettledSellRev = 0, kalSettledFillFees = 0;
+      let kalUnsettledBuyCost = 0, kalUnsettledSellRev = 0, kalUnsettledFees = 0;
+      for (const f of kalFills) {
+        if (!m.kalTickers.has(f.ticker)) continue;
+        const tsMs = new Date(f.ts).getTime();
+        if (!Number.isFinite(tsMs) || tsMs < sinceMs) continue;
+        const priceCents = (f.side === "yes") ? f.yesPrice : f.noPrice;
+        const cost = f.count * (priceCents / 100);
+        if (settledTickerSet.has(f.ticker)) {
+          kalSettledFillFees += f.feeCost;
+          if (f.action === "buy") kalSettledBuyCost += cost;
+          else kalSettledSellRev += cost;
+        } else {
+          kalUnsettledFees += f.feeCost;
+          if (f.action === "buy") kalUnsettledBuyCost += cost;
+          else kalUnsettledSellRev += cost;
+        }
+      }
+      const kalSettlementPnl = (m.kalSettleRevenue + kalSettledSellRev) - kalSettledBuyCost - kalSettledFillFees - m.kalSettleFees;
+      const kalUnsettledPnl = kalUnsettledSellRev - kalUnsettledBuyCost - kalUnsettledFees;
+      const kalTotalPnl = kalSettlementPnl + kalUnsettledPnl;
+
+      // PM P&L = all revenue sources - all cost - fees, split by settled vs open.
+      //   Revenue sources:
+      //     - pmSellRevenue (from SELL fills)
+      //     - pmMarkValueSettled (currentValue of settled positions still held ~= $1/share winners)
+      //     - pmRedeemRevenue (USDC received from /activity REDEEM events)
+      //     - pmMarkValueOpen (current mark of still-open positions, unrealized)
+      //   Cost: pmBuyCost (from BUY fills) + pmFees
+      //
+      // We split the cost allocation pro-rata between settled and open portions
+      // based on which fills' value we've "settled" vs still hold open:
+      //   settledShare = (pmSellRevenue + pmMarkValueSettled + pmRedeemRevenue)
+      //                  / (pmSellRevenue + pmMarkValueSettled + pmRedeemRevenue + pmMarkValueOpen)
+      // This keeps per-match math consistent while letting the UI show realized vs unrealized.
+      const pmSettledValue = m.pmSellRevenue + m.pmMarkValueSettled + m.pmRedeemRevenue;
+      const pmOpenValue = m.pmMarkValueOpen;
+      const pmTotalValue = pmSettledValue + pmOpenValue;
+      const settledShare = pmTotalValue > 0 ? (pmSettledValue / pmTotalValue) : (m.pmSellRevenue > 0 || m.pmRedeemRevenue > 0 ? 1 : 0);
+      const pmSettledCost = (m.pmBuyCost + m.pmFees) * settledShare;
+      const pmOpenCost = (m.pmBuyCost + m.pmFees) * (1 - settledShare);
+      const pmRealized = pmSettledValue - pmSettledCost;
+      const pmUnrealized = pmOpenValue - pmOpenCost;
+
+      const realizedPnl = kalSettlementPnl + pmRealized;
+      const unrealizedPnl = kalUnsettledPnl + pmUnrealized;
+
+      const anchorMs = m.lastSettledMs || m.lastFillMs;
+      const day = new Date(anchorMs).toISOString().slice(0, 10);
+      matchOuts.push({
+        matchName: m.matchName,
+        firstFillTs: Number.isFinite(m.firstFillMs) ? new Date(m.firstFillMs).toISOString() : "",
+        lastFillTs: new Date(m.lastFillMs).toISOString(),
+        settledTs: m.lastSettledMs ? new Date(m.lastSettledMs).toISOString() : null,
+        state, day,
+        kalTickers: [...m.kalTickers],
+        pmTokenCount: m.pmTokenIds.size,
+        kalCost: m.kalBuyCost + m.kalSettleCost,
+        kalRevenue: m.kalSellRevenue + m.kalSettleRevenue,
+        kalFees: m.kalFees + m.kalSettleFees,
+        pmCost: m.pmBuyCost + m.pmFees,
+        pmRevenue: m.pmSellRevenue + m.pmMarkValueSettled + m.pmMarkValueOpen + m.pmRedeemRevenue,
+        pmFees: m.pmFees,
+        realizedPnl,
+        unrealizedPnl,
+        kalSettledResults: m.kalSettledResults,
+        pmStatuses: m.pmStatuses,
+      });
+    }
+
+    // --- 6. Aggregate by day ---
+    matchOuts.sort((a, b) => (b.lastFillTs > a.lastFillTs ? 1 : -1));
+    const byDay = new Map<string, { date: string; realizedPnl: number; unrealizedPnl: number; matchCount: number; resolvedCount: number }>();
+    let totalRealized = 0, totalUnrealized = 0;
+    for (const m of matchOuts) {
+      totalRealized += m.realizedPnl;
+      totalUnrealized += m.unrealizedPnl;
+      let d = byDay.get(m.day);
+      if (!d) { d = { date: m.day, realizedPnl: 0, unrealizedPnl: 0, matchCount: 0, resolvedCount: 0 }; byDay.set(m.day, d); }
+      d.realizedPnl += m.realizedPnl;
+      d.unrealizedPnl += m.unrealizedPnl;
+      d.matchCount += 1;
+      if (m.state === "resolved") d.resolvedCount += 1;
+    }
+    // Fold unmapped redemption revenue into each day's realized bucket (can't
+    // attribute to a specific match but we know the day and the $ amount).
+    for (const [date, usd] of unmappedRedeemByDay) {
+      let d = byDay.get(date);
+      if (!d) { d = { date, realizedPnl: 0, unrealizedPnl: 0, matchCount: 0, resolvedCount: 0 }; byDay.set(date, d); }
+      d.realizedPnl += usd;
+      totalRealized += usd;
+    }
+    const dayList = [...byDay.values()].sort((a, b) => b.date.localeCompare(a.date));
+
+    // --- 7. Build row-per-trade (wallet-paired) ---
+    // Each trade = one Kalshi BUY fill-cluster on a ticker + all PM BUY trades
+    // on a paired pmTokenId within a 60-minute window. Unhedged (KAL-only or
+    // PM-only) rows emitted for fills with no pair. Revenue is allocated per
+    // trade using (side, shares) accounting, NOT naive pro-rata: a YES-buy
+    // gets full $1/share ONLY when YES won. This avoids the phantom-loss
+    // pattern we hit previously with ticker-wide allocation.
+    type TradeOut = {
+      ts: string; day: string; matchName: string;
+      kalTicker: string; kalSide: "yes" | "no" | null;
+      kalShares: number; kalCost: number; kalFees: number; kalRevenue: number;
+      pmTokenIds: string[]; pmOutcome: string | null;
+      pmShares: number; pmCost: number; pmFees: number; pmRevenue: number;
+      legType: "2-leg" | "kal-only" | "pm-only";
+      state: "resolved" | "partially-resolved" | "open";
+      projectedPnl: number; actualPnl: number;
+    };
+    const trades: TradeOut[] = [];
+    const PAIR_WINDOW_MS = 60 * 60 * 1000;
+    const KAL_CLUSTER_MS = 5_000;
+
+    // Ticker → winning side (from settlements)
+    const tickerWinSide = new Map<string, "yes" | "no">();
+    for (const s of kalSettlements) {
+      if (s.marketResult === "yes" || s.marketResult === "no") {
+        tickerWinSide.set(s.ticker, s.marketResult);
+      }
+    }
+    // Token → position info (for PM settlement status)
+    const tokenPos = new Map<string, { ratio: number; settled: boolean; size: number }>();
+    for (const p of pmPositions) {
+      const size = Number(p.size ?? 0);
+      const curVal = Number(p.currentValue ?? 0);
+      const ratio = size > 0 ? curVal / size : 0;
+      const endMs = p.endDate ? new Date(p.endDate).getTime() : NaN;
+      const endPast = Number.isFinite(endMs) && endMs < nowMs;
+      tokenPos.set(p.asset, { ratio, settled: endPast || ratio > 0.95 || ratio < 0.05, size });
+    }
+
+    // Prepare BUY fill lists within window
+    const kalBuys = kalFills
+      .filter(f => f.action === "buy")
+      .map(f => ({ ...f, tsMs: new Date(f.ts).getTime() }))
+      .filter(f => Number.isFinite(f.tsMs) && f.tsMs >= sinceMs)
+      .sort((a, b) => a.tsMs - b.tsMs);
+    const pmBuys = pmFills
+      .filter(t => t.trader_side !== "MAKER" && String(t.side ?? "").toLowerCase() === "buy")
+      .map(t => {
+        const mtRaw = t.match_time;
+        const mtMs = (typeof mtRaw === "string" && /^\d+$/.test(mtRaw)) ? Number(mtRaw) * 1000 : new Date(mtRaw as string).getTime();
+        return { ...t, mtMs };
+      })
+      .filter(t => Number.isFinite(t.mtMs) && t.mtMs >= sinceMs)
+      .sort((a, b) => a.mtMs - b.mtMs);
+
+    // Per-token total PM BUY shares (for pmRevenue pro-rata within a winning token)
+    const pmBuyTotalByToken = new Map<string, number>();
+    for (const t of pmBuys) {
+      pmBuyTotalByToken.set(t.asset_id, (pmBuyTotalByToken.get(t.asset_id) ?? 0) + Number(t.size));
+    }
+
+    // Cluster KAL buys: same ticker within 5s → same order (multi-fill IOC)
+    type KalCluster = { ticker: string; side: "yes" | "no"; firstMs: number; fills: typeof kalBuys };
+    const kalClusters: KalCluster[] = [];
+    for (const f of kalBuys) {
+      const side = (f.side as "yes" | "no") ?? "yes";
+      const existing = kalClusters.find(c => c.ticker === f.ticker && c.side === side && Math.abs(c.firstMs - f.tsMs) < KAL_CLUSTER_MS);
+      if (existing) existing.fills.push(f);
+      else kalClusters.push({ ticker: f.ticker, side, firstMs: f.tsMs, fills: [f] });
+    }
+
+    // Pair each KAL cluster with PM BUYs on the same match within ±PAIR_WINDOW_MS
+    const pmUsed = new Set<number>();
+    for (const kc of kalClusters) {
+      const pair = kalToPair.get(kc.ticker);
+      const matchName = pair?.matchName || kc.ticker;
+      const pmMatchedIdx: number[] = [];
+      for (let i = 0; i < pmBuys.length; i++) {
+        if (pmUsed.has(i)) continue;
+        const t = pmBuys[i];
+        if (pmTokenToMatch.get(t.asset_id) !== matchName) continue;
+        if (Math.abs(t.mtMs - kc.firstMs) > PAIR_WINDOW_MS) continue;
+        pmMatchedIdx.push(i);
+      }
+      pmMatchedIdx.forEach(i => pmUsed.add(i));
+      const pmMatched = pmMatchedIdx.map(i => pmBuys[i]);
+
+      const kalShares = kc.fills.reduce((s, f) => s + f.count, 0);
+      const kalCost = kc.fills.reduce((s, f) => s + f.count * ((f.side === "yes" ? f.yesPrice : f.noPrice) / 100), 0);
+      const kalFees = kc.fills.reduce((s, f) => s + f.feeCost, 0);
+
+      const pmShares = pmMatched.reduce((s, t) => s + Number(t.size), 0);
+      const pmCost = pmMatched.reduce((s, t) => s + Number(t.size) * Number(t.price), 0);
+      const pmFees = pmMatched.reduce((s, t) => {
+        const base = Number(t.size) * Number(t.price);
+        return s + base * (Number(t.fee_rate_bps ?? 0) / 10000);
+      }, 0);
+      const pmTokenIds = [...new Set(pmMatched.map(t => t.asset_id))];
+
+      // kalRevenue: $1/share if this side won
+      const winSide = tickerWinSide.get(kc.ticker);
+      const kalRevenue = (winSide != null && winSide === kc.side) ? kalShares : 0;
+      const kalSettled = settledTickerSet.has(kc.ticker);
+
+      // pmRevenue: per-token basis — shares × $1 if token is winner, else 0,
+      // split by this trade's share of the token's total BUY pool.
+      let pmRevenue = 0;
+      let pmAllSettled = pmTokenIds.length > 0;
+      let pmOutcome: string | null = null;
+      for (const tid of pmTokenIds) {
+        const pos = tokenPos.get(tid);
+        const thisTradeShares = pmMatched.filter(t => t.asset_id === tid).reduce((s, t) => s + Number(t.size), 0);
+        const tokenTotalBuy = pmBuyTotalByToken.get(tid) ?? thisTradeShares;
+        const sharesPortion = tokenTotalBuy > 0 ? thisTradeShares / tokenTotalBuy : 1;
+        if (!pos || !pos.settled) pmAllSettled = false;
+        if (pos?.settled) {
+          // settled: share value ≈ ratio × size (winner=~size, loser=~0)
+          pmRevenue += Number((pmPositions.find(p => p.asset === tid)?.currentValue) ?? 0) * sharesPortion;
+        } else if (pos) {
+          // open: mark-to-market
+          pmRevenue += Number((pmPositions.find(p => p.asset === tid)?.currentValue) ?? 0) * sharesPortion;
+        }
+        // outcome label from positions
+        if (!pmOutcome) {
+          const p = pmPositions.find(pp => pp.asset === tid);
+          pmOutcome = (p?.outcome as string) ?? (p?.title as string) ?? null;
+        }
+      }
+
+      const state: TradeOut["state"] = (kalSettled && pmAllSettled) ? "resolved" : (kalSettled || pmAllSettled) ? "partially-resolved" : "open";
+
+      // Projected P&L: classical paired-arb math on min(kalShares, pmShares)
+      const paired = Math.min(kalShares, pmShares);
+      const avgKalPx = kalShares > 0 ? kalCost / kalShares : 0;
+      const avgPmPx = pmShares > 0 ? pmCost / pmShares : 0;
+      const pairedKalFee = kalShares > 0 ? kalFees * (paired / kalShares) : 0;
+      const pairedPmFee = pmShares > 0 ? pmFees * (paired / pmShares) : 0;
+      const projectedPnl = paired * 1 - paired * (avgKalPx + avgPmPx) - pairedKalFee - pairedPmFee;
+
+      const actualPnl = (kalRevenue + pmRevenue) - (kalCost + pmCost + kalFees + pmFees);
+      const legType: TradeOut["legType"] = (kalShares > 0 && pmShares > 0) ? "2-leg" : "kal-only";
+      const ts = new Date(kc.firstMs).toISOString();
+      trades.push({
+        ts, day: ts.slice(0, 10), matchName,
+        kalTicker: kc.ticker, kalSide: kc.side, kalShares, kalCost, kalFees, kalRevenue,
+        pmTokenIds, pmOutcome, pmShares, pmCost, pmFees, pmRevenue,
+        legType, state, projectedPnl, actualPnl,
+      });
+    }
+
+    // Orphan PM BUY trades (no KAL pair) → pm-only rows, grouped by (asset, 5s)
+    const pmGroups = new Map<string, typeof pmBuys>();
+    for (let i = 0; i < pmBuys.length; i++) {
+      if (pmUsed.has(i)) continue;
+      const t = pmBuys[i];
+      const key = `${t.asset_id}:${Math.floor(t.mtMs / KAL_CLUSTER_MS)}`;
+      if (!pmGroups.has(key)) pmGroups.set(key, []);
+      pmGroups.get(key)!.push(t);
+    }
+    for (const g of pmGroups.values()) {
+      const first = g[0];
+      const matchName = pmTokenToMatch.get(first.asset_id) || `pm:${String(first.asset_id).slice(0, 12)}…`;
+      const pmShares = g.reduce((s, t) => s + Number(t.size), 0);
+      const pmCost = g.reduce((s, t) => s + Number(t.size) * Number(t.price), 0);
+      const pmFees = g.reduce((s, t) => {
+        const base = Number(t.size) * Number(t.price);
+        return s + base * (Number(t.fee_rate_bps ?? 0) / 10000);
+      }, 0);
+      const pos = tokenPos.get(first.asset_id);
+      const p = pmPositions.find(pp => pp.asset === first.asset_id);
+      const tokenTotalBuy = pmBuyTotalByToken.get(first.asset_id) ?? pmShares;
+      const sharesPortion = tokenTotalBuy > 0 ? pmShares / tokenTotalBuy : 1;
+      const pmRevenue = Number(p?.currentValue ?? 0) * sharesPortion;
+      const state: TradeOut["state"] = pos?.settled ? "resolved" : "open";
+      const ts = new Date(first.mtMs).toISOString();
+      const pmOutcome = (p?.outcome as string) ?? (p?.title as string) ?? null;
+      trades.push({
+        ts, day: ts.slice(0, 10), matchName,
+        kalTicker: "", kalSide: null, kalShares: 0, kalCost: 0, kalFees: 0, kalRevenue: 0,
+        pmTokenIds: [first.asset_id], pmOutcome, pmShares, pmCost, pmFees, pmRevenue,
+        legType: "pm-only", state, projectedPnl: 0, actualPnl: pmRevenue - (pmCost + pmFees),
+      });
+    }
+    trades.sort((a, b) => (b.ts > a.ts ? 1 : -1));
+
+    res.json({
+      ts: new Date().toISOString(),
+      days,
+      sinceMs,
+      totals: {
+        matchCount: matchOuts.length,
+        resolvedCount: matchOuts.filter(m => m.state === "resolved").length,
+        realizedPnl: totalRealized,
+        unrealizedPnl: totalUnrealized,
+        unattributedPmRedemptions: unmappedRedeemTotal,
+        unattributedPmRedemptionCount: unmappedRedeemCount,
+        tradeCount: trades.length,
+      },
+      dayList,
+      matches: matchOuts,
+      trades,
+    });
+  } catch (err) {
+    res.status(500).json({ error: (err as Error).message });
+  }
+});
+
+// /api/live-trades — chronological fill history pulled live from Kalshi + PM.
+// No dependency on arb_trades.json (which only reflects the local bot's trades).
+// Default window: last 24h. Override with ?hours=N.
+app.get("/api/live-trades", async (req, res) => {
+  try {
+    const hours = Math.max(1, Math.min(720, parseInt(String(req.query.hours ?? "24"), 10) || 24));
+    const sinceMs = Date.now() - hours * 3600_000;
+    const sinceSec = Math.floor(sinceMs / 1000);
+
+    // Build token → {matchName, outcome} map from discovery_cache (for PM enrichment)
+    const cachePath = join(ROOT, "discovery_cache.json");
+    const tokenMeta = new Map<string, { matchName: string; outcome: string; pmSlug: string }>();
+    if (existsSync(cachePath)) {
+      try {
+        const wl = JSON.parse(readFileSync(cachePath, "utf8"))?.watchlist ?? [];
+        for (const w of wl) {
+          const mn = `${w.kal1?.surname ?? ""} vs ${w.kal2?.surname ?? ""}`;
+          if (w.pm1?.tokenId) tokenMeta.set(w.pm1.tokenId, { matchName: mn, outcome: w.pm1.outcome ?? "", pmSlug: w.pmSlug ?? "" });
+          if (w.pm2?.tokenId) tokenMeta.set(w.pm2.tokenId, { matchName: mn, outcome: w.pm2.outcome ?? "", pmSlug: w.pmSlug ?? "" });
+          if (w.pm3?.tokenId) tokenMeta.set(w.pm3.tokenId, { matchName: mn, outcome: w.pm3.outcome ?? "", pmSlug: w.pmSlug ?? "" });
+          // NO tokenIds for soccer 3-way
+          if (w.pm1?.noTokenId) tokenMeta.set(w.pm1.noTokenId, { matchName: mn, outcome: (w.pm1.outcome ?? "") + " NO", pmSlug: w.pmSlug ?? "" });
+          if (w.pm2?.noTokenId) tokenMeta.set(w.pm2.noTokenId, { matchName: mn, outcome: (w.pm2.outcome ?? "") + " NO", pmSlug: w.pmSlug ?? "" });
+          if (w.pm3?.noTokenId) tokenMeta.set(w.pm3.noTokenId, { matchName: mn, outcome: (w.pm3.outcome ?? "") + " NO", pmSlug: w.pmSlug ?? "" });
+        }
+      } catch { /* empty tokenMeta is fine */ }
+    }
+
+    // Also enrich from PM data-api /positions (covers tokens not in discovery)
+    try {
+      const funder = process.env.POLY_FUNDER;
+      if (funder) {
+        const r = await fetch(`https://data-api.polymarket.com/positions?user=${funder}&sizeThreshold=0`);
+        if (r.ok) {
+          const positions = await r.json() as any[];
+          for (const p of positions) {
+            if (p.asset && !tokenMeta.has(p.asset)) {
+              tokenMeta.set(p.asset, { matchName: p.title ?? "", outcome: p.outcome ?? "", pmSlug: p.slug ?? "" });
+            }
+          }
+        }
+      }
+    } catch { /* best-effort */ }
+
+    // Fetch fills in parallel
+    type Fill = {
+      exchange: "kal" | "pm";
+      ts: string;          // ISO
+      tsMs: number;
+      ticker: string;      // KAL ticker or PM tokenId truncated
+      match: string;
+      outcome: string;     // KAL yes/no or PM outcome name
+      side: "buy" | "sell";
+      shares: number;
+      price: number;       // dollars
+      cost: number;
+      fee: number;
+      orderId?: string;
+      tradeId?: string;
+    };
+    const fills: Fill[] = [];
+
+    // 1. Kalshi
+    let kalErr: string | undefined;
+    try {
+      const kalFills = await fetchAllKalshiFills();
+      for (const f of kalFills) {
+        const tsMs = new Date(f.ts).getTime();
+        if (!Number.isFinite(tsMs) || tsMs < sinceMs) continue;
+        // KalFill: action="buy"|"sell", side="yes"|"no", count shares,
+        // yesPrice/noPrice in cents (with sub-penny precision as decimal cents).
+        const priceCents = (f.side === "yes") ? f.yesPrice : f.noPrice;
+        const price = priceCents / 100;
+        const shares = f.count;
+        fills.push({
+          exchange: "kal",
+          ts: f.ts,
+          tsMs,
+          ticker: f.ticker,
+          match: f.ticker, // Kalshi ticker is the best identifier we have here
+          outcome: f.side,
+          side: (f.action as "buy" | "sell") || "buy",
+          shares,
+          price,
+          cost: shares * price,
+          fee: f.feeCost || 0,
+        });
+      }
+    } catch (e) {
+      kalErr = (e as Error).message;
+    }
+
+    // 2. Polymarket
+    let pmErr: string | undefined;
+    try {
+      const pk = process.env.POLY_WALLET_PRIVATE_KEY;
+      if (!pk) throw new Error("POLY_WALLET_PRIVATE_KEY not set");
+      const host = process.env.POLY_CLOB_URL ?? "https://clob.polymarket.com";
+      const chainId = Number(process.env.POLY_CHAIN_ID ?? 137);
+      const sigType = Number(process.env.POLY_SIGNATURE_TYPE ?? 0);
+      const funder = process.env.POLY_FUNDER;
+      const wallet = new Wallet(pk);
+      const creds = await resolvePolyApiCreds({ host, chainId, sigType, wallet });
+      const client = new ClobClient(host, chainId, wallet, creds, sigType, funder);
+      const pmFills = (await client.getTrades()) as unknown as ClobTrade[];
+      // Dedup by trade id (API can return per-maker-match duplicates)
+      const seen = new Set<string>();
+      for (const t of pmFills) {
+        if (t.trader_side === "MAKER") continue; // we filter to our taker fills
+        const mtRaw = t.match_time;
+        const mtMs = (typeof mtRaw === "string" && /^\d+$/.test(mtRaw))
+          ? Number(mtRaw) * 1000
+          : new Date(mtRaw).getTime();
+        if (!Number.isFinite(mtMs) || mtMs < sinceMs) continue;
+        const tid = (t as any).id as string | undefined;
+        if (tid) { if (seen.has(tid)) continue; seen.add(tid); }
+        const shares = Number(t.size);
+        const price = Number(t.price);
+        const feeBps = Number(t.fee_rate_bps ?? 0);
+        const baseCost = shares * price;
+        const fee = baseCost * (feeBps / 10000);
+        const meta = tokenMeta.get(t.asset_id);
+        fills.push({
+          exchange: "pm",
+          ts: new Date(mtMs).toISOString(),
+          tsMs: mtMs,
+          ticker: t.asset_id.slice(0, 12) + "…",
+          match: meta?.matchName ?? "(unknown market)",
+          outcome: meta?.outcome ?? t.asset_id.slice(0, 8),
+          side: (t.side?.toLowerCase() === "sell") ? "sell" : "buy",
+          shares,
+          price,
+          cost: baseCost,
+          fee,
+          orderId: t.order_id,
+          tradeId: tid,
+        });
+      }
+    } catch (e) {
+      pmErr = (e as Error).message;
+    }
+
+    // Sort newest first
+    fills.sort((a, b) => b.tsMs - a.tsMs);
+
+    // Summary
+    const kalFills = fills.filter(f => f.exchange === "kal");
+    const pmFills = fills.filter(f => f.exchange === "pm");
+    const sumShares = (arr: Fill[]) => arr.reduce((s, f) => s + f.shares, 0);
+    const sumCost = (arr: Fill[]) => arr.reduce((s, f) => s + f.cost, 0);
+    const sumFee = (arr: Fill[]) => arr.reduce((s, f) => s + f.fee, 0);
+
+    res.json({
+      ts: new Date().toISOString(),
+      hours,
+      sinceMs,
+      summary: {
+        totalFills: fills.length,
+        kalFillCount: kalFills.length,
+        pmFillCount: pmFills.length,
+        kalShares: sumShares(kalFills),
+        pmShares: sumShares(pmFills),
+        kalCost: sumCost(kalFills),
+        pmCost: sumCost(pmFills),
+        kalFees: sumFee(kalFills),
+        pmFees: sumFee(pmFills),
+      },
+      errors: { kal: kalErr, pm: pmErr },
+      fills,
+    });
+  } catch (err) {
+    res.status(500).json({ error: (err as Error).message });
+  }
+});
+
 app.get("/api/wallet-arbs", async (_req, res) => {
   try {
     // 1. Load discovery cache → build pairing maps
@@ -2867,6 +3685,8 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
 <div class="tab-bar">
   <button class="tab-btn" data-tab="trades">Trades</button>
   <button class="tab-btn active" data-tab="walletarbs">Wallet Arbs</button>
+  <button class="tab-btn" data-tab="livetrades">Live Trades</button>
+  <button class="tab-btn" data-tab="dailypnl">Daily P&L</button>
   <button class="tab-btn" data-tab="execution">Execution</button>
   <button class="tab-btn" data-tab="missed">Missed Opps <span class="tab-badge" id="missedBadge" style="display:none">0</span></button>
   <button class="tab-btn" data-tab="orderbook">Orderbooks</button>
@@ -3037,6 +3857,96 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
   <table id="walletArbsIgnoredTable">
     <thead><tr><th>Age</th><th>Source bucket</th><th>Match / Ticker</th><th>Side / Outcome</th><th>Shares</th><th>Avg</th><th>Cost</th><th>Actions</th></tr></thead>
     <tbody id="walletArbsIgnoredBody"><tr><td colspan="8" class="empty">--</td></tr></tbody>
+  </table>
+</div>
+
+<!-- TAB: Live Trades -->
+<div class="tab-panel" id="panel-livetrades">
+  <div class="section-title">
+    Live Trades
+    <span style="font-size:11px;color:#8b949e;font-weight:normal;margin-left:8px">
+      chronological fill history pulled live from Kalshi + Polymarket APIs.
+      Independent of arb_trades.json.
+    </span>
+    <select id="liveTradesHours" style="margin-left:12px;background:#161b22;color:#c9d1d9;border:1px solid #30363d;border-radius:4px;padding:3px 6px;font-size:11px">
+      <option value="6">last 6h</option>
+      <option value="24" selected>last 24h</option>
+      <option value="72">last 3d</option>
+      <option value="168">last 7d</option>
+    </select>
+    <button class="audit-btn" id="liveTradesRefreshBtn" onclick="loadLiveTrades()" style="margin-left:8px">Refresh</button>
+  </div>
+  <div id="liveTradesTotals" style="margin:0 20px 10px;font-size:13px;color:#c9d1d9"></div>
+  <table id="liveTradesTable">
+    <thead>
+      <tr>
+        <th>Time</th>
+        <th>Exch</th>
+        <th>Side</th>
+        <th>Match / Ticker</th>
+        <th>Outcome</th>
+        <th style="text-align:right">Shares</th>
+        <th style="text-align:right">Price</th>
+        <th style="text-align:right">Cost</th>
+        <th style="text-align:right">Fee</th>
+      </tr>
+    </thead>
+    <tbody id="liveTradesBody"><tr><td colspan="9" class="empty">Click Refresh to load</td></tr></tbody>
+  </table>
+</div>
+
+<!-- TAB: Daily P&L -->
+<div class="tab-panel" id="panel-dailypnl">
+  <div class="section-title">
+    Daily P&L
+    <span style="font-size:11px;color:#8b949e;font-weight:normal;margin-left:8px">
+      per-match realized P&L (KAL settlements + PM fills/redemptions), grouped by day.
+      Independent of arb_trades.json.
+    </span>
+    <select id="dailyPnlDays" style="margin-left:12px;background:#161b22;color:#c9d1d9;border:1px solid #30363d;border-radius:4px;padding:3px 6px;font-size:11px">
+      <option value="1">today only</option>
+      <option value="3">last 3d</option>
+      <option value="7" selected>last 7d</option>
+      <option value="14">last 14d</option>
+      <option value="30">last 30d</option>
+    </select>
+    <button class="audit-btn" id="dailyPnlRefreshBtn" onclick="loadDailyPnl()" style="margin-left:8px">Refresh</button>
+  </div>
+  <div id="dailyPnlTotals" style="margin:0 20px 10px;font-size:13px;color:#c9d1d9"></div>
+  <div class="section-title" style="font-size:13px">By day</div>
+  <table id="dailyPnlDaysTable">
+    <thead>
+      <tr>
+        <th>Date</th>
+        <th style="text-align:right">Matches</th>
+        <th style="text-align:right">Resolved</th>
+        <th style="text-align:right">Realized P&L</th>
+        <th style="text-align:right">Unrealized P&L</th>
+      </tr>
+    </thead>
+    <tbody id="dailyPnlDaysBody"><tr><td colspan="5" class="empty">Click Refresh to load</td></tr></tbody>
+  </table>
+  <div class="section-title" style="font-size:13px">Trades <span id="dailyPnlTradesCount" style="font-size:11px;color:#8b949e;font-weight:normal"></span></div>
+  <table id="dailyPnlTradesTable">
+    <thead>
+      <tr>
+        <th class="sortable" data-sort="ts">Time <span class="sort-arrow">&#x25BC;</span></th>
+        <th class="sortable" data-sort="match">Match</th>
+        <th class="sortable" data-sort="legType">Legs</th>
+        <th>KAL leg</th>
+        <th class="sortable" data-sort="kalShares" style="text-align:right">KAL sh</th>
+        <th>PM leg</th>
+        <th class="sortable" data-sort="pmShares" style="text-align:right">PM sh</th>
+        <th class="sortable" data-sort="kalCost" style="text-align:right">KAL cost</th>
+        <th class="sortable" data-sort="pmCost" style="text-align:right">PM cost</th>
+        <th class="sortable" data-sort="kalFees" style="text-align:right">KAL fees</th>
+        <th class="sortable" data-sort="pmFees" style="text-align:right">PM fees</th>
+        <th class="sortable" data-sort="state">State</th>
+        <th class="sortable" data-sort="projectedPnl" style="text-align:right">P&amp;L</th>
+        <th class="sortable" data-sort="actualPnl" style="text-align:right">Actual P&amp;L</th>
+      </tr>
+    </thead>
+    <tbody id="dailyPnlTradesBody"><tr><td colspan="14" class="empty">—</td></tr></tbody>
   </table>
 </div>
 
@@ -3334,6 +4244,8 @@ document.querySelectorAll(".tab-btn").forEach(function(btn) {
     var panel = document.getElementById("panel-" + btn.dataset.tab);
     if (panel) panel.classList.add("active");
     if (btn.dataset.tab === "walletarbs") ensureWalletArbsLoaded();
+    if (btn.dataset.tab === "livetrades") { try { loadLiveTrades(); } catch (e) { /* user can click Refresh */ } }
+    if (btn.dataset.tab === "dailypnl") { try { loadDailyPnl(); } catch (e) { /* user can click Refresh */ } }
   });
 });
 // Wallet Arbs is the default tab — kick its loader as soon as the script runs.
@@ -4385,6 +5297,204 @@ async function loadWalletArbs() {
   }
 }
 
+async function loadLiveTrades() {
+  var btn = $("liveTradesRefreshBtn");
+  var hrs = parseInt(($("liveTradesHours") && $("liveTradesHours").value) || "24", 10);
+  if (btn) btn.textContent = "Loading...";
+  try {
+    var res = await fetch("/api/live-trades?hours=" + hrs);
+    var d = await res.json();
+    if (d.error) { $("liveTradesTotals").textContent = "Error: " + d.error; return; }
+    var s = d.summary || {};
+    var errs = [];
+    if (d.errors && d.errors.kal) errs.push("KAL fetch err: " + d.errors.kal);
+    if (d.errors && d.errors.pm)  errs.push("PM fetch err: "  + d.errors.pm);
+    $("liveTradesTotals").innerHTML =
+      'Fills (' + hrs + 'h): <b>' + s.totalFills + '</b>  &bull;  ' +
+      'KAL: ' + s.kalFillCount + ' fills, ' + (s.kalShares||0).toFixed(2) + ' sh, $' + (s.kalCost||0).toFixed(2) + ' cost, $' + (s.kalFees||0).toFixed(2) + ' fees  &bull;  ' +
+      'PM: '  + s.pmFillCount  + ' fills, ' + (s.pmShares ||0).toFixed(2) + ' sh, $' + (s.pmCost ||0).toFixed(2) + ' cost, $' + (s.pmFees ||0).toFixed(2) + ' fees' +
+      (errs.length ? '<br><span style="color:#f85149;font-size:11px">' + errs.join(" | ") + '</span>' : '');
+    var tb = $("liveTradesBody");
+    if (!d.fills || d.fills.length === 0) {
+      tb.innerHTML = '<tr><td colspan="9" class="empty">No fills in window</td></tr>';
+      return;
+    }
+    tb.innerHTML = d.fills.map(function(f) {
+      var exchBadge = f.exchange === "kal"
+        ? '<span style="color:#58a6ff;font-size:10px;padding:1px 5px;border:1px solid #58a6ff;border-radius:3px">KAL</span>'
+        : '<span style="color:#d29922;font-size:10px;padding:1px 5px;border:1px solid #d29922;border-radius:3px">PM</span>';
+      var sideColor = f.side === "buy" ? "#3fb950" : "#f85149";
+      var sideHtml = '<span style="color:' + sideColor + ';font-size:11px">' + f.side.toUpperCase() + '</span>';
+      var when = new Date(f.ts).toLocaleString();
+      return '<tr>' +
+        '<td style="font-size:11px;color:#8b949e">' + when + '</td>' +
+        '<td>' + exchBadge + '</td>' +
+        '<td>' + sideHtml + '</td>' +
+        '<td>' + (f.match || "—") + ' <span style="font-size:10px;color:#6e7681">(' + (f.ticker||"") + ')</span></td>' +
+        '<td style="font-size:11px">' + (f.outcome || "—") + '</td>' +
+        '<td style="text-align:right">' + Number(f.shares).toFixed(2) + '</td>' +
+        '<td style="text-align:right">$' + Number(f.price).toFixed(4) + '</td>' +
+        '<td style="text-align:right">$' + Number(f.cost).toFixed(2) + '</td>' +
+        '<td style="text-align:right;color:#8b949e">$' + Number(f.fee).toFixed(3) + '</td>' +
+        '</tr>';
+    }).join("");
+  } catch (e) {
+    $("liveTradesTotals").textContent = "Failed: " + e.message;
+  } finally {
+    if (btn) btn.textContent = "Refresh";
+  }
+}
+
+async function loadDailyPnl() {
+  var btn = $("dailyPnlRefreshBtn");
+  var days = parseInt(($("dailyPnlDays") && $("dailyPnlDays").value) || "7", 10);
+  if (btn) btn.textContent = "Loading...";
+  try {
+    var res = await fetch("/api/daily-pnl?days=" + days);
+    var d = await res.json();
+    if (d.error) { $("dailyPnlTotals").textContent = "Error: " + d.error; return; }
+    var t = d.totals || {};
+    var realColor = t.realizedPnl > 0 ? "#3fb950" : t.realizedPnl < 0 ? "#f85149" : "#8b949e";
+    var unrealColor = t.unrealizedPnl > 0 ? "#3fb950" : t.unrealizedPnl < 0 ? "#f85149" : "#8b949e";
+    $("dailyPnlTotals").innerHTML =
+      'Window: <b>' + days + 'd</b>  &bull;  ' +
+      'Matches: <b>' + t.matchCount + '</b> (' + t.resolvedCount + ' resolved)  &bull;  ' +
+      'Realized: <b style="color:' + realColor + '">$' + (t.realizedPnl||0).toFixed(2) + '</b>  &bull;  ' +
+      'Unrealized (open): <b style="color:' + unrealColor + '">$' + (t.unrealizedPnl||0).toFixed(2) + '</b>';
+
+    // --- Days table ---
+    var dtb = $("dailyPnlDaysBody");
+    if (!d.dayList || d.dayList.length === 0) {
+      dtb.innerHTML = '<tr><td colspan="5" class="empty">No matches in window</td></tr>';
+    } else {
+      dtb.innerHTML = d.dayList.map(function(day) {
+        var rc = day.realizedPnl > 0 ? "#3fb950" : day.realizedPnl < 0 ? "#f85149" : "#8b949e";
+        var uc = day.unrealizedPnl > 0 ? "#3fb950" : day.unrealizedPnl < 0 ? "#f85149" : "#8b949e";
+        return '<tr>' +
+          '<td><b>' + day.date + '</b></td>' +
+          '<td style="text-align:right">' + day.matchCount + '</td>' +
+          '<td style="text-align:right">' + day.resolvedCount + '</td>' +
+          '<td style="text-align:right;color:' + rc + '">$' + day.realizedPnl.toFixed(2) + '</td>' +
+          '<td style="text-align:right;color:' + uc + '">$' + day.unrealizedPnl.toFixed(2) + '</td>' +
+          '</tr>';
+      }).join("");
+    }
+
+    // --- Trades table (row-per-trade, wallet-paired) ---
+    _dailyPnlTrades = d.trades || [];
+    renderDailyPnlTrades();
+  } catch (e) {
+    $("dailyPnlTotals").textContent = "Failed: " + e.message;
+  } finally {
+    if (btn) btn.textContent = "Refresh";
+  }
+}
+
+// Sort state for Daily P&L trades table — mirrors Trades tab pattern.
+var _dailyPnlTrades = [];
+var _dailyPnlSort = { key: "ts", dir: "desc" };
+
+function _dailyPnlSortKey(t, k) {
+  switch (k) {
+    case "ts": return t.ts || "";
+    case "match": return (t.matchName || "").toLowerCase();
+    case "legType": return t.legType || "";
+    case "kalShares": return Number(t.kalShares) || 0;
+    case "pmShares": return Number(t.pmShares) || 0;
+    case "kalCost": return Number(t.kalCost) || 0;
+    case "pmCost": return Number(t.pmCost) || 0;
+    case "kalFees": return Number(t.kalFees) || 0;
+    case "pmFees": return Number(t.pmFees) || 0;
+    case "state": return t.state || "";
+    case "projectedPnl": return Number(t.projectedPnl) || 0;
+    case "actualPnl": return Number(t.actualPnl) || 0;
+    default: return "";
+  }
+}
+
+function renderDailyPnlTrades() {
+  var tb = $("dailyPnlTradesBody");
+  var rows = (_dailyPnlTrades || []).slice();
+  var k = _dailyPnlSort.key, dir = _dailyPnlSort.dir === "asc" ? 1 : -1;
+  rows.sort(function(a, b) {
+    var va = _dailyPnlSortKey(a, k), vb = _dailyPnlSortKey(b, k);
+    if (va < vb) return -1 * dir;
+    if (va > vb) return 1 * dir;
+    return 0;
+  });
+  var countEl = $("dailyPnlTradesCount");
+  if (countEl) countEl.textContent = "(" + rows.length + " trades)";
+  if (rows.length === 0) {
+    tb.innerHTML = '<tr><td colspan="14" class="empty">No trades in window</td></tr>';
+    return;
+  }
+  tb.innerHTML = rows.map(function(t) {
+    var stateColor = t.state === "resolved" ? "#3fb950" : t.state === "partially-resolved" ? "#d29922" : "#58a6ff";
+    var stateBadge = '<span style="color:' + stateColor + ';font-size:10px;padding:1px 4px;border:1px solid ' + stateColor + ';border-radius:3px">' + t.state + '</span>';
+    var legColor = t.legType === "2-leg" ? "#3fb950" : t.legType === "kal-only" ? "#d29922" : "#a371f7";
+    var legBadge = '<span style="color:' + legColor + ';font-size:10px;padding:1px 4px;border:1px solid ' + legColor + ';border-radius:3px">' + t.legType + '</span>';
+    var pc = t.projectedPnl > 0 ? "#3fb950" : t.projectedPnl < 0 ? "#f85149" : "#8b949e";
+    var ac = t.actualPnl > 0 ? "#3fb950" : t.actualPnl < 0 ? "#f85149" : "#8b949e";
+    var tsShort = (t.ts || "").replace("T", " ").slice(0, 19);
+    var kalLeg = t.kalTicker ? (esc(t.kalTicker) + (t.kalSide ? ' <span style="color:#8b949e">' + t.kalSide + '</span>' : '')) : '—';
+    var pmLeg = t.pmOutcome ? esc(t.pmOutcome) : (t.pmTokenIds && t.pmTokenIds[0] ? '<span title="' + esc(t.pmTokenIds[0]) + '" style="font-size:10px;color:#8b949e">token ' + esc(String(t.pmTokenIds[0]).slice(0,10)) + '…</span>' : '—');
+    return '<tr>' +
+      '<td style="font-size:11px;color:#8b949e">' + esc(tsShort) + '</td>' +
+      '<td>' + esc(t.matchName) + '</td>' +
+      '<td>' + legBadge + '</td>' +
+      '<td style="font-size:11px">' + kalLeg + '</td>' +
+      '<td style="text-align:right">' + (t.kalShares || 0) + '</td>' +
+      '<td style="font-size:11px">' + pmLeg + '</td>' +
+      '<td style="text-align:right">' + (Number(t.pmShares) || 0).toFixed(2) + '</td>' +
+      '<td style="text-align:right">$' + Number(t.kalCost || 0).toFixed(2) + '</td>' +
+      '<td style="text-align:right">$' + Number(t.pmCost || 0).toFixed(2) + '</td>' +
+      '<td style="text-align:right;color:#8b949e">$' + Number(t.kalFees || 0).toFixed(2) + '</td>' +
+      '<td style="text-align:right;color:#8b949e">$' + Number(t.pmFees || 0).toFixed(2) + '</td>' +
+      '<td>' + stateBadge + '</td>' +
+      '<td style="text-align:right;color:' + pc + '">$' + Number(t.projectedPnl || 0).toFixed(2) + '</td>' +
+      '<td style="text-align:right;color:' + ac + ';font-weight:bold">$' + Number(t.actualPnl || 0).toFixed(2) + '</td>' +
+      '</tr>';
+  }).join("");
+  // Update sort arrows on headers
+  var ths = document.querySelectorAll('#dailyPnlTradesTable th.sortable');
+  ths.forEach(function(th) {
+    var k2 = th.getAttribute("data-sort");
+    var arrow = th.querySelector(".sort-arrow");
+    if (!arrow) {
+      arrow = document.createElement("span");
+      arrow.className = "sort-arrow";
+      th.appendChild(document.createTextNode(" "));
+      th.appendChild(arrow);
+    }
+    if (k2 === _dailyPnlSort.key) {
+      arrow.innerHTML = _dailyPnlSort.dir === "asc" ? "&#x25B2;" : "&#x25BC;";
+      arrow.style.opacity = "1";
+    } else {
+      arrow.innerHTML = "&#x25BC;";
+      arrow.style.opacity = "0.3";
+    }
+  });
+}
+
+// Wire up click handlers on Daily P&L sortable headers
+document.addEventListener("DOMContentLoaded", function() {
+  var table = document.getElementById("dailyPnlTradesTable");
+  if (!table) return;
+  table.querySelectorAll("th.sortable").forEach(function(th) {
+    th.style.cursor = "pointer";
+    th.addEventListener("click", function() {
+      var k = th.getAttribute("data-sort");
+      if (_dailyPnlSort.key === k) {
+        _dailyPnlSort.dir = _dailyPnlSort.dir === "asc" ? "desc" : "asc";
+      } else {
+        _dailyPnlSort.key = k;
+        _dailyPnlSort.dir = (k === "match" || k === "legType" || k === "state") ? "asc" : "desc";
+      }
+      renderDailyPnlTrades();
+    });
+  });
+});
+
 async function runVerifiedPnl() {
   var btn = $("verifiedRunBtn");
   var status = $("verifiedStatus");
@@ -4785,4 +5895,56 @@ try { loadEventsFromDisk(); } catch (e) { console.warn(`[DASHBOARD] Event log lo
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`Dashboard running at http://0.0.0.0:${PORT}`);
   console.log(`Accessible on Tailscale network at this machine's Tailscale IP:${PORT}`);
+  startHourlyWealthSnapshot();
 });
+
+// ── Hourly wealth snapshots ───────────────────────────────────────────────────
+// Captures the wallet state every hour (Kalshi cash + PM USDC + PM positions
+// mark) and appends to both data/session_snapshots.json (rich format) and
+// data/balance_log.json (simpler — used by auditBalances.ts daily table).
+// Ensures the audit has continuous coverage regardless of whether the bot is
+// running. Runs one snapshot 30s after dashboard boot, then every 3600s.
+async function captureWealthSnapshot(): Promise<void> {
+  try {
+    const funder = process.env.POLY_FUNDER;
+    if (!funder) return;
+    const snap = await takeSessionSnapshot(funder);
+    appendSessionSnapshot(snap);
+    // Also append to balance_log.json in its legacy shape.
+    // `pm` historically = USDC + positions mark (total PM wealth, not cash).
+    try {
+      const balLogPath = join(ROOT, "data", "balance_log.json");
+      const existing: { ts: string; kalshi: number; pm: number; total: number }[] =
+        existsSync(balLogPath) ? JSON.parse(readFileSync(balLogPath, "utf8")) : [];
+      // `kalshi` column = cash + positions mark (true Kalshi wealth, matches UI total).
+      // `pm` column    = USDC + positions mark (true PM wealth).
+      // `total` = the full wealth (sum of both).
+      // Prior to this snapshot, `kalshi` in balance_log was cash-only — the audit's
+      // daily wealth column will now jump higher with the first snapshot after this
+      // change, then remain accurate going forward.
+      existing.push({
+        ts: snap.ts,
+        kalshi: Math.round((Math.max(0, snap.kalshi) + snap.kalshiPositionsMark) * 100) / 100,
+        pm: Math.round((Math.max(0, snap.pmUsdc) + snap.pmPositionsMark) * 100) / 100,
+        total: snap.totalWealth,
+      });
+      // Keep the last 2000 entries (~83 days of hourly data) to bound file size.
+      const trimmed = existing.length > 2000 ? existing.slice(-2000) : existing;
+      const tmp = balLogPath + ".tmp";
+      writeFileSync(tmp, JSON.stringify(trimmed, null, 2));
+      renameSync(tmp, balLogPath);
+    } catch (e) {
+      console.warn(`[SNAPSHOT] balance_log write failed: ${(e as Error).message}`);
+    }
+    console.log(`[SNAPSHOT] wealth $${snap.totalWealth.toFixed(2)} (kal cash $${snap.kalshi.toFixed(2)} + kal pos $${snap.kalshiPositionsMark.toFixed(2)} + pm cash $${snap.pmUsdc.toFixed(2)} + pm pos $${snap.pmPositionsMark.toFixed(2)})`);
+  } catch (e) {
+    console.warn(`[SNAPSHOT] capture failed: ${(e as Error).message}`);
+  }
+}
+function startHourlyWealthSnapshot(): void {
+  // First snapshot 30s after startup so the dashboard finishes booting.
+  setTimeout(captureWealthSnapshot, 30_000);
+  // Then every hour.
+  setInterval(captureWealthSnapshot, 3600_000);
+  console.log("[SNAPSHOT] hourly wealth capture started — first snapshot in 30s, then every 60min");
+}
