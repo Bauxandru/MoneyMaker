@@ -512,12 +512,12 @@ type AutoHedgePlan = {
 function _planAutoHedge(
   wpm: WalletPositionsByMatch,
   existingStates: HedgeState[],
-  existingTradesByKalTicker: Map<string, string>,
-  existingTradesByPmTokenId: Map<string, string>,
 ): AutoHedgePlan {
-  if (!wpm.entry) return { eligible: false, reason: "no-watchlist-entry" };
+  if (!wpm.entry) return { eligible: false, reason: "no-watchlist-entry (run FORCE_DISCOVER=true to populate)" };
 
-  // trust + add: skip if any existing hedge_state already covers this match's legs
+  // trust + add: skip if any IN-FLIGHT hedge_state already covers this match's legs.
+  // (arb_trades.json duplicate check REMOVED per user 2026-04-20: they want to
+  // hedge even if journal entries exist; overlap risk is accepted.)
   for (const hs of existingStates) {
     const ht = hs.position.kalLeg?.ticker;
     const pt = hs.position.pmLeg?.tokenId;
@@ -525,98 +525,121 @@ function _planAutoHedge(
     if (pt && wpm.pmByTokenId.has(pt)) return { eligible: false, reason: `already tracked by hedge_state ${hs.position.tradeId.slice(0, 40)}` };
   }
 
-  // BUGFIX 2026-04-20: also check arb_trades.json for ANY trade (resolved or
-  // hedging) touching this kalTicker or pmTokenId. Resolved trades are purged
-  // from hedge_state (Phase 4), so the old check alone missed them and created
-  // synthetic duplicates for already-paired positions. If wallet shares exceed
-  // what the trade(s) account for (genuine over-fill), the extra exposure
-  // will land in the manual-flag path downstream — NOT auto-hedged, because
-  // we can't tell over-fill from an intentional stacked bet.
-  for (const kt of wpm.kalByTicker.keys()) {
-    const tradeId = existingTradesByKalTicker.get(kt);
-    if (tradeId) return { eligible: false, reason: `already tracked by arb_trades ${tradeId.slice(0, 40)}` };
-  }
-  for (const pt of wpm.pmByTokenId.keys()) {
-    const tradeId = existingTradesByPmTokenId.get(pt);
-    if (tradeId) return { eligible: false, reason: `already tracked by arb_trades ${tradeId.slice(0, 40)}` };
-  }
-
-  const kalSize = wpm.kalByTicker.size;
-  const pmSize = wpm.pmByTokenId.size;
-  if (kalSize > 0 && pmSize > 0) return { eligible: false, reason: "both-sides-present (manual review)" };
-  if (kalSize === 0 && pmSize === 0) return { eligible: false, reason: "no-wallet-positions" };
-
   const entry = wpm.entry;
+  if (wpm.kalByTicker.size === 0 && wpm.pmByTokenId.size === 0) {
+    return { eligible: false, reason: "no-wallet-positions" };
+  }
+  const hasSeparateKalMarkets = entry.kal1?.ticker && entry.kal2?.ticker && entry.kal1.ticker !== entry.kal2.ticker;
 
-  if (kalSize > 0) {
-    // KAL-only — one ticker, determine which side (yes/no)
-    for (const [ticker, kp] of wpm.kalByTicker) {
-      const side: "yes" | "no" = kp.yesCount > 0 ? "yes" : "no";
-      const shares = side === "yes" ? kp.yesCount : kp.noCount;
-      if (shares <= 0) continue;
-      const avgPrice = kp.avgPriceCents / 100;
-      let kalLeg: KalshiLeg | null = null;
-      let kalOppLeg: KalshiLeg | null = null;
-      let pmLeg: PmLeg | null = null;
-      let pmOppLeg: PmLeg | null = null;
-      // Arb mapping:
-      //   YES on kalN → opposite PM = pm[other]  (pair wins on either outcome)
-      //   NO  on kalN → same-index PM = pmN      (pair wins on either outcome)
-      // kalOppLeg = the OTHER Kalshi ticker on the same match. Only meaningful for
-      // 2-way moneyline where kal1.ticker !== kal2.ticker (distinct markets per
-      // player). For isBinary totals/spreads, kal1 === kal2 so no paired ticker.
-      const hasSeparateKalMarkets = entry.kal1?.ticker && entry.kal2?.ticker && entry.kal1.ticker !== entry.kal2.ticker;
-      if (entry.kal1?.ticker === ticker) {
-        kalLeg = entry.kal1;
-        if (hasSeparateKalMarkets) kalOppLeg = entry.kal2;
-        pmLeg = side === "yes" ? entry.pm2 : entry.pm1;
-        pmOppLeg = side === "yes" ? entry.pm1 : entry.pm2;
-      } else if (entry.kal2?.ticker === ticker) {
-        kalLeg = entry.kal2;
-        if (hasSeparateKalMarkets) kalOppLeg = entry.kal1;
-        pmLeg = side === "yes" ? entry.pm1 : entry.pm2;
-        pmOppLeg = side === "yes" ? entry.pm2 : entry.pm1;
-      } else if (entry.kal3?.ticker === ticker && entry.pm3) {
-        kalLeg = entry.kal3;
-        // 3-way draw market — no single "opposite" Kalshi ticker, so no kalOppLeg
-        pmLeg = side === "yes" ? entry.pm1 : entry.pm3;
-        pmOppLeg = side === "yes" ? entry.pm3 : entry.pm1;
-      }
-      if (!kalLeg || !pmLeg) continue;
-      return {
-        eligible: true, reason: `KAL-only ${shares}×${side} on ${ticker} — auto-create hedge (gap=${shares}, venue=${shares < 5 ? "KAL-vs-KAL" : "PM"})`,
-        heldExchange: "kal", sharesHeld: shares, initialCost: shares * avgPrice,
-        kalLeg, kalOppLeg, pmLeg, pmOppLeg, kalSide: side, kalCostBasis: avgPrice,
-      };
-    }
-    return { eligible: false, reason: "kal-only but no usable ticker mapping" };
+  // Compute $-payout per outcome across all wallet positions.
+  // Returns the outcomes sorted by payout DESC, with hedge-target metadata.
+  type OutcomeRow = {
+    idx: 1 | 2 | 3;
+    outcome: string;
+    payout: number;
+    buyPmLeg: PmLeg | null;       // PM token to BUY to increase this outcome's payout
+    buyKalLeg: KalshiLeg | null;  // KAL ticker to BUY YES on to increase this outcome's payout
+  };
+  const k1 = wpm.kalByTicker.get(entry.kal1?.ticker) ?? { yesCount: 0, noCount: 0, avgPriceCents: 0 };
+  const k2 = hasSeparateKalMarkets
+    ? (wpm.kalByTicker.get(entry.kal2!.ticker) ?? { yesCount: 0, noCount: 0, avgPriceCents: 0 })
+    : { yesCount: 0, noCount: 0, avgPriceCents: 0 };
+  const k3 = entry.kal3?.ticker
+    ? (wpm.kalByTicker.get(entry.kal3.ticker) ?? { yesCount: 0, noCount: 0, avgPriceCents: 0 })
+    : { yesCount: 0, noCount: 0, avgPriceCents: 0 };
+  const p1 = wpm.pmByTokenId.get(entry.pm1?.tokenId ?? "")?.shares ?? 0;
+  const p2 = wpm.pmByTokenId.get(entry.pm2?.tokenId ?? "")?.shares ?? 0;
+  const p3 = entry.pm3?.tokenId ? (wpm.pmByTokenId.get(entry.pm3.tokenId)?.shares ?? 0) : 0;
+
+  const outcomes: OutcomeRow[] = [];
+  if (entry.is3Way && entry.kal3 && entry.pm3) {
+    // Home/Draw/Away — pays A if: kal1.yes OR kal2.no OR kal3.no OR pm1
+    outcomes.push({ idx: 1, outcome: entry.pm1?.outcome ?? "A", payout: k1.yesCount + k2.noCount + k3.noCount + p1, buyPmLeg: entry.pm1 ?? null, buyKalLeg: entry.kal1 ?? null });
+    outcomes.push({ idx: 2, outcome: entry.pm2?.outcome ?? "B", payout: k1.noCount + k2.yesCount + k3.noCount + p2, buyPmLeg: entry.pm2 ?? null, buyKalLeg: entry.kal2 ?? null });
+    outcomes.push({ idx: 3, outcome: entry.pm3?.outcome ?? "Draw", payout: k1.noCount + k2.noCount + k3.yesCount + p3, buyPmLeg: entry.pm3 ?? null, buyKalLeg: entry.kal3 ?? null });
+  } else if (entry.isBinary || !hasSeparateKalMarkets) {
+    // Single Kalshi ticker (totals/spreads). kal1 YES = pm1 (Over/YES); kal1 NO = pm2 (Under/NO).
+    outcomes.push({ idx: 1, outcome: entry.pm1?.outcome ?? "YES", payout: k1.yesCount + p1, buyPmLeg: entry.pm1 ?? null, buyKalLeg: entry.kal1 ?? null });
+    outcomes.push({ idx: 2, outcome: entry.pm2?.outcome ?? "NO", payout: k1.noCount + p2, buyPmLeg: entry.pm2 ?? null, buyKalLeg: entry.kal1 ?? null });
+  } else {
+    // 2-way moneyline (distinct kal1/kal2 tickers)
+    outcomes.push({ idx: 1, outcome: entry.pm1?.outcome ?? "A", payout: k1.yesCount + k2.noCount + p1, buyPmLeg: entry.pm1 ?? null, buyKalLeg: entry.kal1 ?? null });
+    outcomes.push({ idx: 2, outcome: entry.pm2?.outcome ?? "B", payout: k1.noCount + k2.yesCount + p2, buyPmLeg: entry.pm2 ?? null, buyKalLeg: entry.kal2 ?? null });
   }
 
-  // PM-only
-  for (const [tid, p] of wpm.pmByTokenId) {
-    let pmLeg: PmLeg | null = null;
-    let pmOppLeg: PmLeg | null = null;
-    let kalLeg: KalshiLeg | null = null;
-    let kalOppLeg: KalshiLeg | null = null;
-    const kalSide: "yes" | "no" = "no"; // PM pmN ↔ KAL kalN NO side (opposite outcomes)
-    const hasSeparateKalMarkets = entry.kal1?.ticker && entry.kal2?.ticker && entry.kal1.ticker !== entry.kal2.ticker;
-    if (entry.pm1?.tokenId === tid) {
-      pmLeg = entry.pm1; pmOppLeg = entry.pm2; kalLeg = entry.kal1;
-      if (hasSeparateKalMarkets) kalOppLeg = entry.kal2;
-    } else if (entry.pm2?.tokenId === tid) {
-      pmLeg = entry.pm2; pmOppLeg = entry.pm1; kalLeg = entry.kal2;
-      if (hasSeparateKalMarkets) kalOppLeg = entry.kal1;
-    } else if (entry.pm3?.tokenId === tid) {
-      pmLeg = entry.pm3; pmOppLeg = entry.pm1; kalLeg = entry.kal3 ?? entry.kal1;
-    }
-    if (!pmLeg || !kalLeg) continue;
-    return {
-      eligible: true, reason: `PM-only ${p.shares}×${p.outcome} on ${tid.slice(0, 20)}… — auto-create hedge (gap=${p.shares}, venue=${p.shares >= 5 ? "PM-vs-PM" : "KAL"})`,
-      heldExchange: "pm", sharesHeld: p.shares, initialCost: p.shares * p.avgPrice,
-      kalLeg, kalOppLeg, pmLeg, pmOppLeg, kalSide, pmCostBasis: p.avgPrice,
-    };
+  const nonZero = outcomes.filter(o => o.payout > 0);
+  if (nonZero.length === 0) return { eligible: false, reason: "no payout on any outcome (likely all settled)" };
+
+  // Gap across ALL outcomes. If only one outcome has wallet exposure, min=0 → gap = payout of that outcome.
+  const max = Math.max(...outcomes.map(o => o.payout));
+  const min = Math.min(...outcomes.map(o => o.payout));
+  const gap = max - min;
+  if (gap < GAP_TOLERANCE_USD) return { eligible: false, reason: `balanced (gap=$${gap.toFixed(2)})` };
+
+  // Short outcome = the one with LEAST payout. Bot needs to buy more of its tokens.
+  const shortOutcome = outcomes.reduce((lo, o) => o.payout < lo.payout ? o : lo, outcomes[0]);
+  const longOutcome = outcomes.reduce((hi, o) => o.payout > hi.payout ? o : hi, outcomes[0]);
+  if (!shortOutcome.buyPmLeg || !shortOutcome.buyKalLeg) {
+    return { eligible: false, reason: `short outcome ${shortOutcome.outcome} has no buy target (watchlist incomplete)` };
   }
-  return { eligible: false, reason: "pm-only but no usable token mapping" };
+
+  const sharesToHedge = Math.max(1, Math.round(gap));
+
+  // Determine heldExchange for hedge_state bookkeeping: whichever exchange
+  // holds more of the LONG side's payout. Doesn't affect what the bot buys
+  // (that's driven by pmOppLeg / kalOppLeg) — just which breakeven
+  // formula the hedge cycle uses.
+  const longPmShares = longOutcome.buyPmLeg?.tokenId ? (wpm.pmByTokenId.get(longOutcome.buyPmLeg.tokenId)?.shares ?? 0) : 0;
+  let longKalShares = 0;
+  if (longOutcome.idx === 1) longKalShares = k1.yesCount + k2.noCount + k3.noCount;
+  else if (longOutcome.idx === 2) longKalShares = k1.noCount + k2.yesCount + k3.noCount;
+  else longKalShares = k1.noCount + k2.noCount + k3.yesCount;
+  const heldExchange: "pm" | "kal" = longPmShares >= longKalShares ? "pm" : "kal";
+
+  // Cost-basis approximations (for hedge-cycle breakeven). Use whichever is
+  // available — prefer PM avg price if we hold PM on the long side.
+  const longPmAvgPrice = longOutcome.buyPmLeg?.tokenId
+    ? (wpm.pmByTokenId.get(longOutcome.buyPmLeg.tokenId)?.avgPrice ?? 0.5)
+    : 0.5;
+  const longKalAvgCents = (k1.avgPriceCents || k2.avgPriceCents || k3.avgPriceCents || 50);
+  const kalCostBasis = longKalAvgCents / 100;
+  const pmCostBasis = longPmAvgPrice;
+
+  // The bot's hedge cycle for PM-held buys `pmOppLeg`, so pmOppLeg points at
+  // the SHORT outcome's PM token. pmLeg tracks the LONG side (what we "hold").
+  // For KAL-vs-KAL small-gap hedge, kalOppLeg points at the SHORT outcome's
+  // ticker on a separate-markets match.
+  const pmLeg = longOutcome.buyPmLeg ?? entry.pm1 ?? entry.pm2;
+  const pmOppLeg = shortOutcome.buyPmLeg ?? entry.pm2 ?? entry.pm1;
+  const kalLeg = longOutcome.buyKalLeg ?? entry.kal1 ?? entry.kal2;
+  const kalOppLeg = hasSeparateKalMarkets ? (shortOutcome.buyKalLeg ?? null) : null;
+  // kalSide reflects what the HELD side is on the Kalshi ticker. For isBinary,
+  // it's the LONG outcome's side of kal1 (YES if long is outcome 1; NO if long is outcome 2).
+  let kalSide: "yes" | "no" = "yes";
+  if (entry.isBinary || !hasSeparateKalMarkets) {
+    kalSide = longOutcome.idx === 1 ? "yes" : "no";
+  } else {
+    // 2-way moneyline — longOutcome.buyKalLeg is the LONG side's ticker; kalSide YES on it.
+    kalSide = "yes";
+  }
+
+  const reason = `Imbalance: ${shortOutcome.outcome} payout $${shortOutcome.payout.toFixed(2)} vs ${longOutcome.outcome} $${longOutcome.payout.toFixed(2)}` +
+    ` (gap=$${gap.toFixed(2)}, buying ${sharesToHedge}x ${shortOutcome.outcome} on ${sharesToHedge < 5 ? "Kalshi" : "PM"})`;
+
+  return {
+    eligible: true,
+    reason,
+    heldExchange,
+    sharesHeld: sharesToHedge,
+    initialCost: sharesToHedge * (heldExchange === "pm" ? pmCostBasis : kalCostBasis),
+    kalLeg: kalLeg ?? null as unknown as KalshiLeg,
+    kalOppLeg,
+    pmLeg: pmLeg ?? null as unknown as PmLeg,
+    pmOppLeg,
+    kalSide,
+    kalCostBasis,
+    pmCostBasis,
+  };
 }
 
 // Create a synthetic arb_trade + hedge_state entry for an auto-hedge-eligible
@@ -784,17 +807,11 @@ export async function scanWalletAndFlagHedgeTargets(opts: { dryRun?: boolean } =
   const existingFlags = loadManualHedgeFlags();
   const existingById = new Map(existingFlags.map(f => [f.id, f]));
   const existingStates = loadHedgeStates();
-  // Also index arb_trades.json (resolved + hedging) so _planAutoHedge can
-  // skip positions that are already paired via a journaled trade. Without
-  // this, resolved trades — which get purged from hedge_state by Phase 4 —
-  // produce duplicate synthetic entries in Phase 5 (bug observed 2026-04-20).
-  const existingTrades = loadArbTrades();
-  const existingTradesByKalTicker = new Map<string, string>();
-  const existingTradesByPmTokenId = new Map<string, string>();
-  for (const t of existingTrades) {
-    if (t.kalTicker && !existingTradesByKalTicker.has(t.kalTicker)) existingTradesByKalTicker.set(t.kalTicker, t.id);
-    if (t.pmTokenId && !existingTradesByPmTokenId.has(t.pmTokenId)) existingTradesByPmTokenId.set(t.pmTokenId, t.id);
-  }
+  // Note 2026-04-20: previously also indexed arb_trades.json to skip
+  // already-journaled matches. Removed per user request — they want to
+  // hedge everything regardless of journal state (including Arsenal-style
+  // "already-tracked" cases and over-fills that were flagged-only before).
+  // The in-flight hedge_state check above is the only duplicate guard now.
   const now = Date.now();
   const nextFlags: ManualHedgeFlag[] = [];
   const newTrades: ArbTradeRecord[] = [];
@@ -847,12 +864,13 @@ export async function scanWalletAndFlagHedgeTargets(opts: { dryRun?: boolean } =
       }
     }
 
-    // AUTO-HEDGE path: for clean one-sided imbalances (KAL-only or PM-only)
-    // with a watchlist entry, create a synthetic arb_trade + hedge_state so
-    // the regular hedge cycle picks it up and places GTC bids to close the
-    // gap. Skip: over-fills, no-watchlist, both-sides-present, pre-ignored.
-    if (classification === "imbalance") {
-      const plan = _planAutoHedge(wpm, [...existingStates, ...newStates], existingTradesByKalTicker, existingTradesByPmTokenId);
+    // AUTO-HEDGE path: per user 2026-04-20, try auto-hedge for ANY non-balanced
+    // watchlisted match (including over-fills — the plan now computes the
+    // gap and targets the short side). Only no-watchlist matches fall through
+    // to manual flag; for those the user runs FORCE_DISCOVER=true on next
+    // startup to refresh the watchlist.
+    if (classification === "imbalance" || classification === "over-fill") {
+      const plan = _planAutoHedge(wpm, [...existingStates, ...newStates]);
       if (plan.eligible) {
         const created = _createSyntheticHedge(wpm, plan, id);
         if (created) {
