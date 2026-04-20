@@ -1876,13 +1876,13 @@ app.get("/api/daily-pnl", async (req, res) => {
     }
     const dayList = [...byDay.values()].sort((a, b) => b.date.localeCompare(a.date));
 
-    // --- 7. Build row-per-trade (wallet-paired) ---
-    // Each trade = one Kalshi BUY fill-cluster on a ticker + all PM BUY trades
-    // on a paired pmTokenId within a 60-minute window. Unhedged (KAL-only or
-    // PM-only) rows emitted for fills with no pair. Revenue is allocated per
-    // trade using (side, shares) accounting, NOT naive pro-rata: a YES-buy
-    // gets full $1/share ONLY when YES won. This avoids the phantom-loss
-    // pattern we hit previously with ticker-wide allocation.
+    // --- 7. Build row-per-trade ─────────────────────────────────────────────
+    // Pairing: sourced from exchange_events.jsonl (the bot's own authoritative
+    // tradeId-linked log — see block below). Financial values (shares, cost,
+    // fees, revenue): sourced from wallet data (Kalshi fills, CLOB trades,
+    // positions, redemptions). kalRevenue uses (side, shares) accounting —
+    // a YES-buy gets $1/share only when YES won, avoiding the phantom-loss
+    // pattern that ticker-wide pro-rata produces when both YES+NO legs exist.
     type TradeOut = {
       ts: string; day: string; matchName: string;
       kalTicker: string; kalSide: "yes" | "no" | null;
@@ -1894,7 +1894,6 @@ app.get("/api/daily-pnl", async (req, res) => {
       projectedPnl: number; actualPnl: number;
     };
     const trades: TradeOut[] = [];
-    const PAIR_WINDOW_MS = 60 * 60 * 1000;
     const KAL_CLUSTER_MS = 5_000;
 
     // Ticker → winning side (from settlements)
@@ -1937,68 +1936,106 @@ app.get("/api/daily-pnl", async (req, res) => {
       pmBuyTotalByToken.set(t.asset_id, (pmBuyTotalByToken.get(t.asset_id) ?? 0) + Number(t.size));
     }
 
-    // Cluster KAL buys: same ticker within 5s → same order (multi-fill IOC)
-    type KalCluster = { ticker: string; side: "yes" | "no"; firstMs: number; fills: typeof kalBuys };
-    const kalClusters: KalCluster[] = [];
-    for (const f of kalBuys) {
-      const side = (f.side as "yes" | "no") ?? "yes";
-      const existing = kalClusters.find(c => c.ticker === f.ticker && c.side === side && Math.abs(c.firstMs - f.tsMs) < KAL_CLUSTER_MS);
-      if (existing) existing.fills.push(f);
-      else kalClusters.push({ ticker: f.ticker, side, firstMs: f.tsMs, fills: [f] });
+    // ── Pair wallet fills using the bot's own event log (exchange_events.jsonl) ──
+    // The bot stamps every arb execution with a `tradeId` and writes two
+    // `order-placed` events under it (one KAL, one PM). That pairing is
+    // authoritative — it's what the bot actually executed as a pair, no
+    // name-matching heuristics required. We use events ONLY for the
+    // kalTicker↔pmTokenId dictionary and timestamps; all financial values
+    // (shares, cost, fees, revenue) still come from wallet data.
+    //
+    // Edge case: trades older than the event log retention (~2-3 weeks per
+    // CLAUDE.md) lose their pairing entry → they fall through to the orphan
+    // pass below as kal-only / pm-only rows.
+    type EventPair = { tradeId: string; kalTicker?: string; pmTokenId?: string; kalSide?: "yes" | "no"; earliestTs: number };
+    const eventTrades = new Map<string, EventPair>();
+    for (const e of getAllEvents()) {
+      if (e.type !== "order-placed") continue;
+      const tsMs = new Date(e.ts).getTime();
+      if (!Number.isFinite(tsMs) || tsMs < sinceMs) continue;
+      let tp = eventTrades.get(e.tradeId);
+      if (!tp) {
+        tp = { tradeId: e.tradeId, earliestTs: tsMs };
+        eventTrades.set(e.tradeId, tp);
+      }
+      tp.earliestTs = Math.min(tp.earliestTs, tsMs);
+      if (e.exchange === "kal" && e.ticker && !tp.kalTicker) {
+        tp.kalTicker = e.ticker;
+        if (e.side === "yes" || e.side === "no") tp.kalSide = e.side;
+      }
+      if (e.exchange === "pm" && e.tokenId && !tp.pmTokenId) {
+        tp.pmTokenId = e.tokenId;
+      }
     }
 
-    // Pair each KAL cluster with PM BUYs on the same match within ±PAIR_WINDOW_MS
+    // Wallet fills arrive within seconds of order placement; ±2 min window is
+    // safely wide and prevents mis-attribution when the same ticker was
+    // re-arbed later in the day.
+    const PAIR_WALLET_WINDOW_MS = 2 * 60 * 1000;
+    const kalUsed = new Set<number>();
     const pmUsed = new Set<number>();
-    for (const kc of kalClusters) {
-      const pair = kalToPair.get(kc.ticker);
-      const matchName = pair?.matchName || kc.ticker;
-      const pmMatchedIdx: number[] = [];
-      for (let i = 0; i < pmBuys.length; i++) {
-        if (pmUsed.has(i)) continue;
-        const t = pmBuys[i];
-        if (pmTokenToMatch.get(t.asset_id) !== matchName) continue;
-        if (Math.abs(t.mtMs - kc.firstMs) > PAIR_WINDOW_MS) continue;
-        pmMatchedIdx.push(i);
+
+    for (const tp of eventTrades.values()) {
+      const kalMatched: number[] = [];
+      if (tp.kalTicker) {
+        for (let i = 0; i < kalBuys.length; i++) {
+          if (kalUsed.has(i)) continue;
+          const f = kalBuys[i];
+          if (f.ticker !== tp.kalTicker) continue;
+          if (Math.abs(f.tsMs - tp.earliestTs) > PAIR_WALLET_WINDOW_MS) continue;
+          kalMatched.push(i);
+        }
       }
+      const pmMatchedIdx: number[] = [];
+      if (tp.pmTokenId) {
+        for (let i = 0; i < pmBuys.length; i++) {
+          if (pmUsed.has(i)) continue;
+          const b = pmBuys[i];
+          if (b.asset_id !== tp.pmTokenId) continue;
+          if (Math.abs(b.mtMs - tp.earliestTs) > PAIR_WALLET_WINDOW_MS) continue;
+          pmMatchedIdx.push(i);
+        }
+      }
+      if (kalMatched.length === 0 && pmMatchedIdx.length === 0) continue;
+      kalMatched.forEach(i => kalUsed.add(i));
       pmMatchedIdx.forEach(i => pmUsed.add(i));
-      const pmMatched = pmMatchedIdx.map(i => pmBuys[i]);
 
-      const kalShares = kc.fills.reduce((s, f) => s + f.count, 0);
-      const kalCost = kc.fills.reduce((s, f) => s + f.count * ((f.side === "yes" ? f.yesPrice : f.noPrice) / 100), 0);
-      const kalFees = kc.fills.reduce((s, f) => s + f.feeCost, 0);
+      const kfills = kalMatched.map(i => kalBuys[i]);
+      const pMatched = pmMatchedIdx.map(i => pmBuys[i]);
 
-      const pmShares = pmMatched.reduce((s, t) => s + Number(t.size), 0);
-      const pmCost = pmMatched.reduce((s, t) => s + Number(t.size) * Number(t.price), 0);
-      const pmFees = pmMatched.reduce((s, t) => {
+      const kalSide: "yes" | "no" | null = tp.kalSide ?? (kfills[0]?.side as "yes" | "no" | undefined) ?? null;
+      const kalShares = kfills.reduce((s, f) => s + f.count, 0);
+      const kalCost = kfills.reduce((s, f) => s + f.count * ((f.side === "yes" ? f.yesPrice : f.noPrice) / 100), 0);
+      const kalFees = kfills.reduce((s, f) => s + f.feeCost, 0);
+
+      const pmShares = pMatched.reduce((s, t) => s + Number(t.size), 0);
+      const pmCost = pMatched.reduce((s, t) => s + Number(t.size) * Number(t.price), 0);
+      const pmFees = pMatched.reduce((s, t) => {
         const base = Number(t.size) * Number(t.price);
         return s + base * (Number(t.fee_rate_bps ?? 0) / 10000);
       }, 0);
-      const pmTokenIds = [...new Set(pmMatched.map(t => t.asset_id))];
+      const pmTokenIds = [...new Set(pMatched.map(t => t.asset_id))];
 
-      // kalRevenue: $1/share if this side won
-      const winSide = tickerWinSide.get(kc.ticker);
-      const kalRevenue = (winSide != null && winSide === kc.side) ? kalShares : 0;
-      const kalSettled = settledTickerSet.has(kc.ticker);
+      // kalRevenue: $1/share if this side won, 0 otherwise. (side, shares) math —
+      // not ticker-wide pro-rata; that mis-allocates when both YES and NO legs
+      // exist on the same ticker.
+      const winSide = tp.kalTicker ? tickerWinSide.get(tp.kalTicker) : undefined;
+      const kalRevenue = (winSide && kalSide && winSide === kalSide) ? kalShares : 0;
+      const kalSettled = tp.kalTicker ? settledTickerSet.has(tp.kalTicker) : false;
 
-      // pmRevenue: per-token basis — shares × $1 if token is winner, else 0,
-      // split by this trade's share of the token's total BUY pool.
+      // pmRevenue: allocate each paired token's currentValue by this trade's
+      // share of the token's total BUY pool in window (handles over-fills
+      // correctly — the extra PM shares boost this trade's Actual P&L).
       let pmRevenue = 0;
       let pmAllSettled = pmTokenIds.length > 0;
       let pmOutcome: string | null = null;
       for (const tid of pmTokenIds) {
         const pos = tokenPos.get(tid);
-        const thisTradeShares = pmMatched.filter(t => t.asset_id === tid).reduce((s, t) => s + Number(t.size), 0);
-        const tokenTotalBuy = pmBuyTotalByToken.get(tid) ?? thisTradeShares;
-        const sharesPortion = tokenTotalBuy > 0 ? thisTradeShares / tokenTotalBuy : 1;
+        const thisShares = pMatched.filter(t => t.asset_id === tid).reduce((s, t) => s + Number(t.size), 0);
+        const tokenTotalBuy = pmBuyTotalByToken.get(tid) ?? thisShares;
+        const sharesPortion = tokenTotalBuy > 0 ? thisShares / tokenTotalBuy : 1;
         if (!pos || !pos.settled) pmAllSettled = false;
-        if (pos?.settled) {
-          // settled: share value ≈ ratio × size (winner=~size, loser=~0)
-          pmRevenue += Number((pmPositions.find(p => p.asset === tid)?.currentValue) ?? 0) * sharesPortion;
-        } else if (pos) {
-          // open: mark-to-market
-          pmRevenue += Number((pmPositions.find(p => p.asset === tid)?.currentValue) ?? 0) * sharesPortion;
-        }
-        // outcome label from positions
+        pmRevenue += Number((pmPositions.find(p => p.asset === tid)?.currentValue) ?? 0) * sharesPortion;
         if (!pmOutcome) {
           const p = pmPositions.find(pp => pp.asset === tid);
           pmOutcome = (p?.outcome as string) ?? (p?.title as string) ?? null;
@@ -2007,7 +2044,6 @@ app.get("/api/daily-pnl", async (req, res) => {
 
       const state: TradeOut["state"] = (kalSettled && pmAllSettled) ? "resolved" : (kalSettled || pmAllSettled) ? "partially-resolved" : "open";
 
-      // Projected P&L: classical paired-arb math on min(kalShares, pmShares)
       const paired = Math.min(kalShares, pmShares);
       const avgKalPx = kalShares > 0 ? kalCost / kalShares : 0;
       const avgPmPx = pmShares > 0 ? pmCost / pmShares : 0;
@@ -2016,26 +2052,70 @@ app.get("/api/daily-pnl", async (req, res) => {
       const projectedPnl = paired * 1 - paired * (avgKalPx + avgPmPx) - pairedKalFee - pairedPmFee;
 
       const actualPnl = (kalRevenue + pmRevenue) - (kalCost + pmCost + kalFees + pmFees);
-      const legType: TradeOut["legType"] = (kalShares > 0 && pmShares > 0) ? "2-leg" : "kal-only";
-      const ts = new Date(kc.firstMs).toISOString();
+      const legType: TradeOut["legType"] = (kalShares > 0 && pmShares > 0) ? "2-leg" : kalShares > 0 ? "kal-only" : "pm-only";
+
+      // Display-only match name. Prefer watchlist/pair_history matchName (when
+      // populated), fall back to data-api title, then raw KAL ticker. None of
+      // this affects pairing — pairing already happened via tradeId above.
+      let matchName = tp.kalTicker ? (kalToPair.get(tp.kalTicker)?.matchName || "") : "";
+      if (!matchName) {
+        for (const tid of pmTokenIds) {
+          const mn = pmTokenToMatch.get(tid);
+          if (mn) { matchName = mn; break; }
+        }
+      }
+      if (!matchName) matchName = tp.kalTicker || (pmTokenIds[0] ? `pm:${pmTokenIds[0].slice(0, 12)}…` : "unknown");
+
+      const ts = new Date(tp.earliestTs).toISOString();
       trades.push({
         ts, day: ts.slice(0, 10), matchName,
-        kalTicker: kc.ticker, kalSide: kc.side, kalShares, kalCost, kalFees, kalRevenue,
+        kalTicker: tp.kalTicker ?? "", kalSide, kalShares, kalCost, kalFees, kalRevenue,
         pmTokenIds, pmOutcome, pmShares, pmCost, pmFees, pmRevenue,
         legType, state, projectedPnl, actualPnl,
       });
     }
 
-    // Orphan PM BUY trades (no KAL pair) → pm-only rows, grouped by (asset, 5s)
-    const pmGroups = new Map<string, typeof pmBuys>();
+    // ── Orphan wallet fills (no event-trade pairing) ─────────────────────────
+    // Caused by: pre-retention trades (>2-3 weeks old), crashes before event
+    // log write, or manual wallet activity. Group by (identity, 5s cluster)
+    // so multi-fill orders collapse into one row.
+    const kalOrphanGroups = new Map<string, typeof kalBuys>();
+    for (let i = 0; i < kalBuys.length; i++) {
+      if (kalUsed.has(i)) continue;
+      const f = kalBuys[i];
+      const key = `${f.ticker}:${f.side}:${Math.floor(f.tsMs / KAL_CLUSTER_MS)}`;
+      if (!kalOrphanGroups.has(key)) kalOrphanGroups.set(key, []);
+      kalOrphanGroups.get(key)!.push(f);
+    }
+    for (const g of kalOrphanGroups.values()) {
+      const first = g[0];
+      const matchName = kalToPair.get(first.ticker)?.matchName || first.ticker;
+      const kalShares = g.reduce((s, f) => s + f.count, 0);
+      const kalCost = g.reduce((s, f) => s + f.count * ((f.side === "yes" ? f.yesPrice : f.noPrice) / 100), 0);
+      const kalFees = g.reduce((s, f) => s + f.feeCost, 0);
+      const winSide = tickerWinSide.get(first.ticker);
+      const kalRevenue = (winSide && winSide === first.side) ? kalShares : 0;
+      const kalSettled = settledTickerSet.has(first.ticker);
+      const state: TradeOut["state"] = kalSettled ? "resolved" : "open";
+      const ts = new Date(first.tsMs).toISOString();
+      trades.push({
+        ts, day: ts.slice(0, 10), matchName,
+        kalTicker: first.ticker, kalSide: (first.side as "yes" | "no"),
+        kalShares, kalCost, kalFees, kalRevenue,
+        pmTokenIds: [], pmOutcome: null, pmShares: 0, pmCost: 0, pmFees: 0, pmRevenue: 0,
+        legType: "kal-only", state, projectedPnl: 0,
+        actualPnl: kalRevenue - (kalCost + kalFees),
+      });
+    }
+    const pmOrphanGroups = new Map<string, typeof pmBuys>();
     for (let i = 0; i < pmBuys.length; i++) {
       if (pmUsed.has(i)) continue;
       const t = pmBuys[i];
       const key = `${t.asset_id}:${Math.floor(t.mtMs / KAL_CLUSTER_MS)}`;
-      if (!pmGroups.has(key)) pmGroups.set(key, []);
-      pmGroups.get(key)!.push(t);
+      if (!pmOrphanGroups.has(key)) pmOrphanGroups.set(key, []);
+      pmOrphanGroups.get(key)!.push(t);
     }
-    for (const g of pmGroups.values()) {
+    for (const g of pmOrphanGroups.values()) {
       const first = g[0];
       const matchName = pmTokenToMatch.get(first.asset_id) || `pm:${String(first.asset_id).slice(0, 12)}…`;
       const pmShares = g.reduce((s, t) => s + Number(t.size), 0);
