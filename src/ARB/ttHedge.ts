@@ -100,6 +100,28 @@ import {
 
 import { appendEvent, type OrderPlacedEvent, type FillDetectedEvent, type OrderCancelledEvent, type PositionSnapshotEvent } from "./ttEventLog.js";
 
+// ── On-chain reconciliation throttling ───────────────────────────────────────
+// When an on-chain balance shows a trade is "resolved" but CLOB attribution
+// returns only partial fills (common for hedge-completed trades where fills
+// dribble in over time), the reconciliation block at ~line 2147 would re-enter
+// every hedge cycle and call client.getTrades() — an unthrottled full trade
+// history fetch that bypasses our polyClobFetch rate limiter and drives 429s
+// on clob.polymarket.com. The cooldown below limits re-entry per-position;
+// the module-level cache deduplicates getTrades() calls made by different
+// positions inside the same short window.
+const RECONCILE_COOLDOWN_MS = 60_000;
+const RECONCILE_TRADES_CACHE_TTL_MS = 15_000;
+let _reconcileTradesCache: { data: unknown[]; ts: number } | null = null;
+async function _getCachedClobTradesForReconcile(): Promise<unknown[]> {
+  if (_reconcileTradesCache && Date.now() - _reconcileTradesCache.ts < RECONCILE_TRADES_CACHE_TTL_MS) {
+    return _reconcileTradesCache.data;
+  }
+  const { client } = await createPmClient();
+  const trades = (await client.getTrades()) as unknown as unknown[];
+  _reconcileTradesCache = { data: Array.isArray(trades) ? trades : [], ts: Date.now() };
+  return _reconcileTradesCache.data;
+}
+
 import {
   createPmClient,
   placePmGTCBid,
@@ -2144,7 +2166,8 @@ export async function runHedgeCycle(state: HedgeState, clobBase: string): Promis
         // PM tokens from OTHER trades on the same slug get mis-attributed to this trade,
         // resolving it at the wrong cost (e.g. 52c when our max was 26c).
         const hasOwnPmFills = pos.hedgeFillCostPm > 0;
-        if (availableForThisTrade >= sharesNeeded && hasOwnPmFills) {
+        const reconcileCooldownUntil = state._reconcileNextAttemptAt ?? 0;
+        if (availableForThisTrade >= sharesNeeded && hasOwnPmFills && Date.now() >= reconcileCooldownUntil) {
           console.log(
             `\n[HEDGE] [OK] On-chain reconciliation: wallet holds ${availableForThisTrade}x available PM ${pos.pmLeg.outcome}` +
             ` (need ${sharesNeeded}). Hedge already has PM fills. Resolving.\n`
@@ -2154,9 +2177,8 @@ export async function runHedgeCycle(state: HedgeState, clobBase: string): Promis
           let fillCost = 0;
           let attributedShares = 0; // ACTUAL shares attributed from CLOB — NEVER substitute pos.initialShares
           try {
-            const { client } = await createPmClient();
             type ClobFill = { asset_id: string; size: string; price: string; fee_rate_bps: string; side: string; status: string; match_time: string; id?: string };
-            const clobTrades = (await client.getTrades()) as unknown as ClobFill[];
+            const clobTrades = (await _getCachedClobTradesForReconcile()) as ClobFill[];
             const fills = clobTrades.filter(
               (ct: ClobFill) => ct.asset_id === pos.pmLeg.tokenId && ct.side === "BUY" && ct.status === "CONFIRMED"
             );
@@ -2250,6 +2272,7 @@ export async function runHedgeCycle(state: HedgeState, clobBase: string): Promis
             pos.hedgeFillCost += fillCost;
             pos.hedgeFillCostPm += fillCost;
             pos.sharesHeld = 0;
+            state._reconcileNextAttemptAt = Date.now() + RECONCILE_COOLDOWN_MS;
             saveHedgeState(state);
             return;
           }
@@ -2268,6 +2291,7 @@ export async function runHedgeCycle(state: HedgeState, clobBase: string): Promis
               price: 0, context: { note: "CLOB getTrades() returned no matches; cannot compute pmCost from real data" },
             });
             // Leave sharesHeld unchanged; don't write phantom pmCost.
+            state._reconcileNextAttemptAt = Date.now() + RECONCILE_COOLDOWN_MS;
             saveHedgeState(state);
             return;
           }
@@ -2294,6 +2318,7 @@ export async function runHedgeCycle(state: HedgeState, clobBase: string): Promis
             pos.hedgeFillCostPm += fillCost;
             // Keep sharesHeld reflecting what's still unaccounted for
             pos.sharesHeld = Math.max(0, pos.initialShares - attributedShares);
+            state._reconcileNextAttemptAt = Date.now() + RECONCILE_COOLDOWN_MS;
             saveHedgeState(state);
             return;
           }

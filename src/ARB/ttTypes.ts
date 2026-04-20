@@ -235,6 +235,7 @@ export type HedgeState = {
   pmOnlyCycles: number;                 // consecutive cycles with no PM fill
   _pendingTradeRecord?: ArbTradeRecord; // set by detection functions; caller logs only for non-duplicate positions
   _hedgeStartTs?: number;               // timestamp: when hedge mode started (for KAL window timeout)
+  _reconcileNextAttemptAt?: number;     // timestamp: don't re-enter the on-chain reconciliation branch until after this (prevents per-cycle client.getTrades() spam on stuck trades). Runtime-only — not persisted by saveHedgeStates; fresh after restart.
 };
 
 export type PersistedHedgeEntry = {
